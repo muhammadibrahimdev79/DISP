@@ -1,0 +1,14 @@
+fn fibonacci(value: int) -> int {
+    if value <= 1 {
+        return value
+    }
+    return fibonacci(value - 1) + fibonacci(value - 2)
+}
+
+fn main() {
+    var marker = 0
+    for value in 0..10 {
+        marker += value
+    }
+    print(fibonacci(20) + marker)
+}

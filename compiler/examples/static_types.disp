@@ -1,0 +1,51 @@
+struct Box<T> {
+    value: T
+}
+
+enum Maybe<T> {
+    Present(T)
+    Absent
+}
+
+trait Describe {
+    type Output
+    fn describe(self: Self) -> int
+}
+
+impl<T> Describe for Box<T> {
+    type Output = int
+    fn describe(self: Self) -> int {
+        return 1
+    }
+}
+
+fn identity<T>(value: T) -> T {
+    return value
+}
+
+fn narrow(value: int) -> Result<i8, ConversionError> {
+    return Ok(i8.try_from(value)?)
+}
+
+fn main() {
+    let maximum: u128 = 340282366920938463463374607431768211455
+    print(maximum.wrapping_add(1))
+
+    let byte: i8 = 127
+    print(byte.saturating_add(1))
+
+    let boxed = Box { value: identity(42) }
+    print(boxed.value)
+    print(boxed.describe())
+
+    let maybe = Maybe.Present(9)
+    print(match maybe {
+        Maybe.Present(value) => value
+        Maybe.Absent => 0
+    })
+
+    print(match narrow(500) {
+        Ok(value) => int(value)
+        Err(_) => -1
+    })
+}

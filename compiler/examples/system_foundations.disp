@@ -1,0 +1,22 @@
+fn exercise_files() -> Result<Unit, IoError> {
+    folder = Path("disp-pass5-example")
+    Directory.create_all(folder)?
+
+    file = folder.join("message.txt")
+    File.write_text(file, "Data Intelligence System Page")?
+    text = File.read_text(file)?
+    print(text)
+    print(File.exists(file))
+
+    File.remove(file)?
+    return Directory.remove(folder)
+}
+
+fn main() {
+    print(exercise_files())
+
+    started = Time.now()
+    Time.sleep(Duration.from_millis(1))
+    print(started.elapsed().millis() >= 1)
+    print(Time.unix_seconds() > 0)
+}

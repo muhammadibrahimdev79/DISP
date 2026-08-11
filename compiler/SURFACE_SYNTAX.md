@@ -1,0 +1,111 @@
+# DISP surface syntax
+
+DISP keeps one checked language model while offering two compatible notation levels.
+Ordinary code uses inference and safe implicit operations; explicit types, references,
+and allocation controls remain available when a program needs them.
+
+## Inferred bindings
+
+The first plain assignment in a scope declares a mutable, statically typed local:
+
+```disp
+score = 10
+score += 5
+```
+
+Its type never changes. `score = true` is a compile-time error. `let`, `var`, `const`,
+and type annotations remain supported for code that wants the distinction to be visible.
+
+## Collections and text
+
+```disp
+names = List.of("Ari", "Mina")
+names.add("Sam")
+print(names.count())
+
+scores = Map.of("Ari": 95, "Mina": 98)
+scores.set("Sam", 91)
+
+tags = Set.of("safe", "fast", "safe")
+tags.add("easy")
+
+title = "Data Intelligence System Page"
+word = title.slice(5, 17)
+print(word)
+```
+
+`slice` creates a checked shared view. `slice_mut` creates an exclusive mutable view.
+Both are zero-copy and retain the same ownership and lifetime rules as explicit DISP
+references.
+
+Shared function parameters also borrow named storage automatically:
+
+```disp
+fn count<T>(values: &List<T>) -> uint = (*values).len()
+print(count(names))
+```
+
+Mutable references remain explicit because mutation must be visible at the call site.
+
+## Paths, files, and time
+
+Paths are nominal owned values rather than ordinary strings. This prevents accidentally
+passing arbitrary text to filesystem operations:
+
+```disp
+folder = Path("reports")
+file = folder.join("summary.txt")
+File.write_text(file, "ready")?
+text = File.read_text(file)?
+```
+
+Filesystem failures use `Result<_, IoError>` and therefore work with normal `?`
+propagation. `Directory.remove` removes only an empty directory; recursive deletion is
+intentionally not implicit. All native file and directory handles are closed before an
+operation returns.
+
+Time uses a monotonic `Instant` for elapsed measurements and an explicit `Duration`:
+
+```disp
+started = Time.now()
+Time.sleep(Duration.from_millis(10))
+print(started.elapsed().millis())
+```
+
+`Time.unix_seconds()` is the wall-clock operation. Keeping it separate prevents clock
+adjustments from corrupting elapsed-time measurements.
+
+## Collection loops
+
+```disp
+for name in names {
+    print(name)
+}
+```
+
+Copyable elements are read by value. Owned non-Copy elements are borrowed for the
+iteration, and mutation or movement of the collection is rejected while that loan is
+active.
+
+The same loop works for sets and borrowed collection views. Maps expose `keys()` and
+`values()` views so the loop stays unambiguous:
+
+```disp
+for name in scores.keys() {
+    print(name)
+}
+```
+
+Map keys and Set elements currently accept integers, `bool`, `char`, `String`, and
+`str`. This makes equality deterministic without exposing hashing or allocator details
+in ordinary code.
+
+## Concise functions and data
+
+```disp
+struct Point { x: int, y: int }
+fn point(x: int, y: int) -> Point = Point { x, y }
+```
+
+The expression after `=` is an ordinary checked return expression. Field shorthand is
+only accepted when a local with the same name supplies that field.

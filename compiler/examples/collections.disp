@@ -1,0 +1,20 @@
+fn main() {
+    var scores = Map.of("Ali": 95, "Sara": 88)
+    print(scores.len())
+    print(scores.has("Ali"))
+    scores.set("Mina", 100)
+    print(scores.len())
+
+    var tags = Set.of("safe", "fast", "safe")
+    print(tags.len())
+    print(tags.has("fast"))
+    tags.add("easy")
+    print(tags.len())
+
+    numbers = Set.of(2, 3, 5)
+    var total = 0
+    for number in numbers {
+        total += number
+    }
+    print(total)
+}

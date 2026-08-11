@@ -1,0 +1,24 @@
+struct Project {
+    name: String,
+    passes: int,
+}
+
+fn make_project(name: String, passes: int) -> Project = Project { name, passes }
+fn count<T>(values: &List<T>) -> uint = (*values).len()
+
+fn main() {
+    project = make_project("DISP", 3)
+    print(project.name)
+
+    areas = List.of("Data", "Intelligence", "System", "Page")
+    areas.add("Science")
+    for area in areas {
+        print(area)
+    }
+    print(count(areas))
+
+    title = "Data Intelligence System Page"
+    word = title.slice(5, 17)
+    print(word)
+    print(project.passes)
+}

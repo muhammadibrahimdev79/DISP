@@ -1,0 +1,10 @@
+fn main() {
+    var values: List<int> = List.with_capacity(2)
+    values.push(10)
+    values.push(20)
+    values.push(30)
+
+    print(values.len())
+    print(values.capacity())
+    print(values[1])
+}

@@ -1,0 +1,9 @@
+fn main() {
+    let text = "Data Intelligence Systems Page"
+    let view: &str = &text
+
+    print((*view).len())
+    print((*view).contains("Intelligence"))
+    print((*view).starts_with("Data"))
+    print((*view).ends_with("Page"))
+}

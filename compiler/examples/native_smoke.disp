@@ -1,0 +1,5 @@
+struct Pair { left: int, right: int }
+fn main() {
+    let pair = Pair { left: 20, right: 22 }
+    print(pair.left + pair.right)
+}

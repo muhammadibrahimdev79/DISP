@@ -1,0 +1,102 @@
+use std::{fs, process::Command};
+
+fn disp(arguments: &[&str]) -> Option<std::process::Output> {
+    for attempt in 0..4 {
+        match Command::new(env!("CARGO_BIN_EXE_disp"))
+            .args(arguments)
+            .output()
+        {
+            Ok(output) => return Some(output),
+            Err(error) if error.raw_os_error() == Some(4551) && attempt < 3 => continue,
+            Err(error) if error.raw_os_error() == Some(4551) => return None,
+            Err(error) => panic!("disp should execute: {error}"),
+        }
+    }
+    unreachable!()
+}
+
+fn source_file(name: &str, source: &str) -> std::path::PathBuf {
+    let directory = std::env::temp_dir().join(format!("disp-tests-{}", std::process::id()));
+    fs::create_dir_all(&directory).expect("temporary directory should be created");
+    let path = directory.join(name);
+    fs::write(&path, source).expect("temporary source should be written");
+    path
+}
+
+#[test]
+fn run_and_check_commands_use_the_full_pipeline() {
+    let source = source_file(
+        "valid.disp",
+        "fn double(x: int) -> int { return x * 2 } fn main() { print(double(21)) }",
+    );
+    let Some(run) = disp(&["run", source.to_str().unwrap()]) else {
+        return;
+    };
+    if !run.status.success() && String::from_utf8_lossy(&run.stderr).contains("os error 4551") {
+        return;
+    }
+    assert!(run.status.success());
+    assert_eq!(String::from_utf8(run.stdout).unwrap().trim(), "42");
+
+    let Some(check) = disp(&["check", source.to_str().unwrap()]) else {
+        return;
+    };
+    assert!(check.status.success());
+    assert!(check.stdout.is_empty());
+
+    let Some(build) = disp(&["build", "--emit-obj", source.to_str().unwrap()]) else {
+        return;
+    };
+    assert!(build.status.success());
+    let executable = source.parent().unwrap().join("build").join("valid.exe");
+    let object = source
+        .parent()
+        .unwrap()
+        .join("build")
+        .join("valid")
+        .join("valid.o");
+    assert!(executable.exists());
+    assert!(object.exists());
+}
+
+#[test]
+fn compile_fail_reports_stage_and_location() {
+    let source = source_file("invalid.disp", "fn main() { print(missing) }");
+    let Some(output) = disp(&["check", source.to_str().unwrap()]) else {
+        return;
+    };
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("resolver error"));
+    assert!(stderr.contains("unknown name `missing`"));
+    assert!(stderr.contains("invalid.disp:1:"));
+}
+
+#[test]
+fn rejects_non_disp_sources() {
+    let source = source_file("invalid.txt", "fn main() {}");
+    let Some(output) = disp(&[source.to_str().unwrap()]) else {
+        return;
+    };
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("must end with `.disp`")
+    );
+}
+
+#[test]
+fn developer_hir_and_mir_dumps_are_available() {
+    let source = source_file("dump.disp", "fn main() { let value = 1 print(value) }");
+    let Some(hir) = disp(&["check", "--dump-hir", source.to_str().unwrap()]) else {
+        return;
+    };
+    let Some(mir) = disp(&["check", "--dump-mir", source.to_str().unwrap()]) else {
+        return;
+    };
+    assert!(hir.status.success() && mir.status.success());
+    assert!(String::from_utf8(hir.stdout).unwrap().contains("fn0 main"));
+    let mir = String::from_utf8(mir.stdout).unwrap();
+    assert!(mir.contains("mir fn0 main") && mir.contains("bb0:"));
+}

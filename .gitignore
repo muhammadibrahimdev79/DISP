@@ -1,0 +1,17 @@
+# Compiler and fuzz build outputs
+.targets/
+target/
+**/target/
+**/build/
+
+# Generated native artifacts
+*.exe
+*.obj
+*.pdb
+
+# Local editor and operating-system files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+

@@ -1,0 +1,15 @@
+fn sum_to(limit: int) -> int {
+    var total = 0
+    var current = 0
+
+    while current <= limit {
+        total += current
+        current += 1
+    }
+
+    return total
+}
+
+fn main() {
+    print(sum_to(10))
+}

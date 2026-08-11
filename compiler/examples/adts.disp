@@ -1,0 +1,62 @@
+struct User {
+    id: int
+    name: String
+}
+
+enum Status {
+    Active
+    Disabled(String)
+}
+
+enum LoadError {
+    Missing
+    Invalid(String)
+}
+
+fn describe(status: Status) -> String {
+    return match status {
+        Status.Active => "active"
+        Status.Disabled(reason) => reason
+    }
+}
+
+fn find_user(found: bool) -> Option<User> {
+    if found {
+        return Some(User {
+            id: 7
+            name: "Ada"
+        })
+    }
+
+    return None
+}
+
+fn load_user(valid: bool) -> Result<User, LoadError> {
+    if valid {
+        return Ok(User {
+            id: 7
+            name: "Ada"
+        })
+    }
+
+    return Err(LoadError.Missing)
+}
+
+fn load_name(valid: bool) -> Result<String, LoadError> {
+    let user = load_user(valid)?
+    return Ok(user.name)
+}
+
+fn main() {
+    print(describe(Status.Disabled("maintenance")))
+
+    match find_user(true) {
+        Some(user) => print(user.name)
+        None => print("not found")
+    }
+
+    match load_name(true) {
+        Ok(name) => print(name)
+        Err(error) => print("load failed")
+    }
+}

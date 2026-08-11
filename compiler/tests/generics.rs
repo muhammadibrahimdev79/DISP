@@ -1,0 +1,231 @@
+use disp::{check_source, run_source};
+
+#[test]
+fn generic_functions_and_structs_infer_and_execute() {
+    let source = r#"
+struct Box<T> { value: T }
+
+fn identity<T>(value: T) -> T { return value }
+
+fn main() {
+    let boxed = Box { value: identity(42) }
+    print(boxed.value)
+}
+"#;
+    assert_eq!(run_source(source).unwrap(), ["42"]);
+}
+
+#[test]
+fn generic_instantiation_rejects_conflicting_inference() {
+    let source = r#"
+fn choose<T>(left: T, right: T) -> T { return left }
+fn main() { print(choose(1, true)) }
+"#;
+    let error = check_source(source).unwrap_err();
+    assert!(error.message.contains("conflicting inferred types"));
+}
+
+#[test]
+fn generic_enums_substitute_payload_types() {
+    let source = r#"
+enum Maybe<T> { Present(T), Absent }
+fn unwrap_or<T>(value: Maybe<T>, fallback: T) -> T {
+    return match value { Maybe.Present(inner) => inner, Maybe.Absent => fallback }
+}
+fn main() { print(unwrap_or(Maybe.Present(7), 0)) }
+"#;
+    assert_eq!(run_source(source).unwrap(), ["7"]);
+}
+
+#[test]
+fn trait_methods_dispatch_statically() {
+    let source = r#"
+struct Counter { value: int }
+trait Value { fn value(self: Self) -> int }
+impl Value for Counter {
+    fn value(self: Self) -> int { return self.value }
+}
+fn main() { let counter = Counter { value: 9 } print(counter.value()) }
+"#;
+    assert_eq!(run_source(source).unwrap(), ["9"]);
+}
+
+#[test]
+fn generic_constraints_are_enforced() {
+    let valid = r#"
+struct Counter { value: int }
+trait Value { fn value(self: Self) -> int }
+impl Value for Counter { fn value(self: Self) -> int { return self.value } }
+fn read<T: Value>(item: T) -> int { return item.value() }
+fn main() { print(read(Counter { value: 11 })) }
+"#;
+    assert_eq!(run_source(valid).unwrap(), ["11"]);
+
+    let invalid = r#"
+trait Value { fn value(self: Self) -> int }
+fn read<T: Value>(item: T) -> T { return item }
+fn main() { print(read(1)) }
+"#;
+    let error = check_source(invalid).unwrap_err();
+    assert!(error.message.contains("does not satisfy constraint"));
+}
+
+#[test]
+fn conflicting_implementations_and_bad_methods_fail() {
+    let conflict = r#"
+struct Item { value: int }
+trait Value { fn value(self: Self) -> int }
+impl Value for Item { fn value(self: Self) -> int { return self.value } }
+impl Value for Item { fn value(self: Self) -> int { return self.value } }
+fn main() {}
+"#;
+    assert!(
+        check_source(conflict)
+            .unwrap_err()
+            .message
+            .contains("conflicting implementation")
+    );
+
+    let mismatch = r#"
+struct Item { value: int }
+trait Value { fn value(self: Self) -> int }
+impl Value for Item { fn value(self: Self) -> bool { return true } }
+fn main() {}
+"#;
+    assert!(
+        check_source(mismatch)
+            .unwrap_err()
+            .message
+            .contains("does not match trait")
+    );
+}
+
+#[test]
+fn generic_trait_implementations_instantiate_and_overlap_is_rejected() {
+    let valid = r#"
+struct Box<T> { value: T }
+trait Extract { fn extract(self: Self) -> int }
+impl<T> Extract for Box<T> { fn extract(self: Self) -> int { return 1 } }
+fn main() { print(Box { value: true }.extract()) }
+"#;
+    assert_eq!(run_source(valid).unwrap(), ["1"]);
+
+    let overlap = r#"
+struct Box<T> { value: T }
+trait Extract { fn extract(self: Self) -> int }
+impl<T> Extract for Box<T> { fn extract(self: Self) -> int { return 1 } }
+impl Extract for Box<int> { fn extract(self: Self) -> int { return 2 } }
+fn main() {}
+"#;
+    assert!(
+        check_source(overlap)
+            .unwrap_err()
+            .message
+            .contains("conflicting implementation")
+    );
+}
+
+#[test]
+fn associated_type_definitions_are_complete() {
+    let valid = r#"
+struct Item { value: int }
+trait Source { type Output fn get(self: Self) -> int }
+impl Source for Item { type Output = int fn get(self: Self) -> int { return self.value } }
+fn main() { print(Item { value: 3 }.get()) }
+"#;
+    assert_eq!(run_source(valid).unwrap(), ["3"]);
+
+    let missing = r#"
+struct Item { value: int }
+trait Source { type Output fn get(self: Self) -> int }
+impl Source for Item { fn get(self: Self) -> int { return self.value } }
+fn main() {}
+"#;
+    assert!(
+        check_source(missing)
+            .unwrap_err()
+            .message
+            .contains("associated types")
+    );
+}
+
+#[test]
+fn ambiguous_and_invalid_method_resolution_fail() {
+    let ambiguous = r#"
+struct Item { value: int }
+trait Left { fn get(self: Self) -> int }
+trait Right { fn get(self: Self) -> int }
+impl Left for Item { fn get(self: Self) -> int { return 1 } }
+impl Right for Item { fn get(self: Self) -> int { return 2 } }
+fn main() { print(Item { value: 0 }.get()) }
+"#;
+    assert!(
+        check_source(ambiguous)
+            .unwrap_err()
+            .message
+            .contains("ambiguous method")
+    );
+
+    let invalid = "struct Item { value: int } fn main() { Item { value: 0 }.missing() }";
+    assert!(
+        check_source(invalid)
+            .unwrap_err()
+            .message
+            .contains("no method `missing`")
+    );
+}
+
+#[test]
+fn constrained_generic_adts_reject_invalid_instantiation() {
+    let source = r#"
+trait Mark { fn mark(self: Self) -> int }
+struct Box<T: Mark> { value: T }
+fn main() { let invalid = Box { value: 1 } }
+"#;
+    assert!(
+        check_source(source)
+            .unwrap_err()
+            .message
+            .contains("does not satisfy constraint")
+    );
+}
+
+#[test]
+fn malformed_generic_and_trait_declarations_fail_with_spans() {
+    let cases = [
+        (
+            "struct Pair<T, T> { value: T } fn main() {}",
+            "duplicate generic parameter",
+        ),
+        (
+            "struct Box<T> { value: T } fn main() { let x: Box<int, bool> = Box { value: 1 } }",
+            "expects 1 type arguments",
+        ),
+        (
+            "fn id<T: Missing>(x: T) -> T { return x } fn main() {}",
+            "unknown trait",
+        ),
+        (
+            "struct Item { value: int } trait Get { fn get(self: Self) -> int } impl Get for Item {} fn main() {}",
+            "must define exactly",
+        ),
+    ];
+    for (source, expected) in cases {
+        let error = check_source(source).unwrap_err();
+        assert!(error.message.contains(expected), "{}", error.message);
+        assert!(error.span.start.line > 0 && error.span.start.column > 0);
+    }
+}
+
+#[test]
+fn generic_trait_arguments_substitute_into_methods() {
+    let source = r#"
+struct Accumulator { value: int }
+trait Add<T> { fn add(self: Self, value: T) -> int }
+impl Add<int> for Accumulator {
+    fn add(self: Self, value: int) -> int { return self.value + value }
+}
+fn main() { print(Accumulator { value: 5 }.add(7)) }
+"#;
+    assert_eq!(run_source(source).unwrap(), ["12"]);
+}

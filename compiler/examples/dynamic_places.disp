@@ -1,0 +1,19 @@
+fn next(counter: &mut int) -> int {
+    *counter += 1
+    return 1
+}
+
+fn main() {
+    var calls = 0
+    var values = [10, 20, 30, 40]
+    values[next(&mut calls)] = 25
+
+    let left = &mut values[0..2];
+    (*left)[0] = 15
+
+    let right = &values[2..4];
+    print(values[1])
+    print((*right)[0])
+    print((*right).len())
+    print(calls)
+}

@@ -1,0 +1,53 @@
+struct Document {
+    title: String,
+    revisions: int,
+}
+
+trait DocumentOps {
+    fn revision(&self) -> int
+    fn revise(&mut self)
+}
+
+impl DocumentOps for Document {
+    fn revision(&self) -> int {
+        return self.revisions
+    }
+
+    fn revise(&mut self) {
+        self.revisions += 1
+    }
+}
+
+fn inspect<T>(value: &T) -> &T {
+    return value
+}
+
+fn required(value: &Option<int>) -> Result<int, String> {
+    return match *value {
+        Some(number) => Ok(number),
+        None => Err("missing revision"),
+    }
+}
+
+fn propagate(value: &Option<int>) -> Result<int, String> {
+    let revision = required(value)?
+    return Ok(revision)
+}
+
+fn main() {
+    var document = Document { title: "DISP ownership", revisions: 1 }
+    let shared = &document
+    print(shared.title)
+    let viewed = inspect(&document)
+    print(viewed.revisions)
+
+    document.revise()
+    print(document.revisions)
+
+    let revision = Some(document.revisions)
+    print(propagate(&revision))
+
+    let title = move document.title
+    print(title)
+    print(document.revisions)
+}
