@@ -33,6 +33,10 @@ pub enum Type {
     List(Box<Type>),
     Map(Box<Type>, Box<Type>),
     Set(Box<Type>),
+    Thread(Box<Type>),
+    Mutex(Box<Type>),
+    MutexGuard(Box<Type>),
+    AtomicInt,
     Int { signed: bool, width: Option<u16> },
     Float { width: u16 },
     Reference { mutable: bool, inner: Box<Type> },
@@ -71,6 +75,10 @@ impl Type {
             | Self::List(_)
             | Self::Map(_, _)
             | Self::Set(_)
+            | Self::Thread(_)
+            | Self::Mutex(_)
+            | Self::MutexGuard(_)
+            | Self::AtomicInt
             | Self::Generic(_)
             | Self::Function(_, _)
             | Self::Unknown => false,
@@ -261,6 +269,7 @@ pub enum ExprKind {
         arms: Vec<MatchArm>,
     },
     Try(Box<Expr>),
+    Spawn(Call),
     Move(Place),
     Borrow {
         mutable: bool,
@@ -665,6 +674,25 @@ impl<'a> Lowering<'a> {
                     .map(|x| self.lower_type(x))
                     .unwrap_or(Type::Unknown),
             )),
+            "Thread" => Type::Thread(Box::new(
+                ty.arguments
+                    .first()
+                    .map(|x| self.lower_type(x))
+                    .unwrap_or(Type::Unknown),
+            )),
+            "Mutex" => Type::Mutex(Box::new(
+                ty.arguments
+                    .first()
+                    .map(|x| self.lower_type(x))
+                    .unwrap_or(Type::Unknown),
+            )),
+            "MutexGuard" => Type::MutexGuard(Box::new(
+                ty.arguments
+                    .first()
+                    .map(|x| self.lower_type(x))
+                    .unwrap_or(Type::Unknown),
+            )),
+            "AtomicInt" => Type::AtomicInt,
             name if name.starts_with("[;") && name.ends_with(']') => Type::Array(
                 Box::new(
                     ty.arguments
@@ -1218,6 +1246,7 @@ impl FunctionLowering<'_, '_> {
                 let (ty, raw) = match &x.ty {
                     Type::Reference { inner, .. } => ((**inner).clone(), false),
                     Type::RawPointer { inner, .. } => ((**inner).clone(), true),
+                    Type::MutexGuard(inner) => ((**inner).clone(), false),
                     _ => (Type::Unknown, false),
                 };
                 (ExprKind::Dereference(Box::new(x), raw), ty)
@@ -1303,6 +1332,25 @@ impl FunctionLowering<'_, '_> {
                 };
                 (ExprKind::Try(Box::new(x)), ty)
             }
+            ast::Expression::Spawn(task) => {
+                let ast::Expression::Call { callee, arguments } = &task.node else {
+                    return Err(Diagnostic::new(
+                        DiagnosticKind::Internal,
+                        "HIR lowering received a non-call `spawn` operand",
+                        task.span,
+                    ));
+                };
+                let lowered = self.lower_call(callee, arguments, task.span)?;
+                let result = lowered.ty;
+                let ExprKind::Call(call) = lowered.kind else {
+                    return Err(Diagnostic::new(
+                        DiagnosticKind::Internal,
+                        "HIR lowering received an invalid `spawn` target",
+                        task.span,
+                    ));
+                };
+                (ExprKind::Spawn(call), Type::Thread(Box::new(result)))
+            }
         };
         Ok(Expr {
             kind,
@@ -1352,6 +1400,42 @@ impl FunctionLowering<'_, '_> {
                             substitutions: vec![],
                         }),
                         ty: Type::List(Box::new(element)),
+                        span,
+                    });
+                }
+                if owner == "Mutex" {
+                    let args = arguments
+                        .iter()
+                        .map(|x| self.lower_expr(x))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let value = args
+                        .first()
+                        .map(|value| value.ty.clone())
+                        .unwrap_or(Type::Unknown);
+                    return Ok(Expr {
+                        kind: ExprKind::Call(Call {
+                            target: CallTarget::Intrinsic(format!("Mutex.{field}")),
+                            arguments: args,
+                            receiver: None,
+                            substitutions: vec![value.clone()],
+                        }),
+                        ty: Type::Mutex(Box::new(value)),
+                        span,
+                    });
+                }
+                if owner == "AtomicInt" {
+                    let args = arguments
+                        .iter()
+                        .map(|x| self.lower_expr(x))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    return Ok(Expr {
+                        kind: ExprKind::Call(Call {
+                            target: CallTarget::Intrinsic(format!("AtomicInt.{field}")),
+                            arguments: args,
+                            receiver: None,
+                            substitutions: vec![],
+                        }),
+                        ty: Type::AtomicInt,
                         span,
                     });
                 }
@@ -1754,6 +1838,69 @@ impl FunctionLowering<'_, '_> {
                         substitutions: vec![],
                     }),
                     ty,
+                    span,
+                });
+            }
+            if let Type::Thread(result) = receiver.ty.clone()
+                && field == "join"
+            {
+                return Ok(Expr {
+                    kind: ExprKind::Call(Call {
+                        target: CallTarget::Intrinsic("Thread.join".into()),
+                        arguments: vec![receiver],
+                        receiver: Some(ReceiverMode::Move),
+                        substitutions: vec![],
+                    }),
+                    ty: *result,
+                    span,
+                });
+            }
+            if let Type::Mutex(value) = receiver.ty.clone()
+                && matches!(field.as_str(), "share" | "lock")
+            {
+                return Ok(Expr {
+                    kind: ExprKind::Call(Call {
+                        target: CallTarget::Intrinsic(format!("Mutex.{field}")),
+                        arguments: vec![receiver],
+                        receiver: Some(ReceiverMode::Shared),
+                        substitutions: vec![(*value).clone()],
+                    }),
+                    ty: if field == "share" {
+                        Type::Mutex(value)
+                    } else {
+                        Type::MutexGuard(value)
+                    },
+                    span,
+                });
+            }
+            if matches!(receiver.ty, Type::AtomicInt)
+                && matches!(
+                    field.as_str(),
+                    "share" | "load" | "store" | "add" | "fetch_add"
+                )
+            {
+                let mut args = vec![receiver];
+                args.extend(
+                    arguments
+                        .iter()
+                        .map(|x| self.lower_expr(x))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+                return Ok(Expr {
+                    kind: ExprKind::Call(Call {
+                        target: CallTarget::Intrinsic(format!("AtomicInt.{field}")),
+                        arguments: args,
+                        receiver: Some(ReceiverMode::Shared),
+                        substitutions: vec![],
+                    }),
+                    ty: match field.as_str() {
+                        "share" => Type::AtomicInt,
+                        "store" => Type::Unit,
+                        _ => Type::Int {
+                            signed: true,
+                            width: None,
+                        },
+                    },
                     span,
                 });
             }
@@ -2480,6 +2627,10 @@ fn surface_type_is_copy(ty: &Type) -> bool {
         | Type::List(_)
         | Type::Map(_, _)
         | Type::Set(_)
+        | Type::Thread(_)
+        | Type::Mutex(_)
+        | Type::MutexGuard(_)
+        | Type::AtomicInt
         | Type::Struct(_, _)
         | Type::Enum(_, _)
         | Type::Generic(_)
@@ -2589,6 +2740,9 @@ fn infer_named_type(
         | Type::Slice(element)
         | Type::List(element)
         | Type::Option(element) => std::slice::from_ref(element),
+        Type::Thread(element) | Type::Mutex(element) | Type::MutexGuard(element) => {
+            std::slice::from_ref(element)
+        }
         _ => &[],
     };
     for (template, actual) in template.arguments.iter().zip(actual_arguments) {
@@ -2631,6 +2785,10 @@ fn infer_hir_type(pattern: &Type, concrete: &Type, inferred: &mut HashMap<String
             infer_hir_type(ak, bk, inferred) && infer_hir_type(av, bv, inferred)
         }
         (Type::Set(x), Type::Set(y)) => infer_hir_type(x, y, inferred),
+        (Type::Thread(x), Type::Thread(y)) => infer_hir_type(x, y, inferred),
+        (Type::Mutex(x), Type::Mutex(y)) | (Type::MutexGuard(x), Type::MutexGuard(y)) => {
+            infer_hir_type(x, y, inferred)
+        }
         (
             Type::Reference {
                 mutable: a,
@@ -2697,6 +2855,11 @@ fn substitute_type(ty: &Type, substitutions: &HashMap<String, Type>) -> Type {
             Box::new(substitute_type(value, substitutions)),
         ),
         Type::Set(inner) => Type::Set(Box::new(substitute_type(inner, substitutions))),
+        Type::Thread(inner) => Type::Thread(Box::new(substitute_type(inner, substitutions))),
+        Type::Mutex(inner) => Type::Mutex(Box::new(substitute_type(inner, substitutions))),
+        Type::MutexGuard(inner) => {
+            Type::MutexGuard(Box::new(substitute_type(inner, substitutions)))
+        }
         Type::Result(ok, error) => Type::Result(
             Box::new(substitute_type(ok, substitutions)),
             Box::new(substitute_type(error, substitutions)),
@@ -2737,6 +2900,9 @@ fn fill_unknown(actual: &mut Type, expected: &Type) {
             fill_unknown(av, ev);
         }
         (Type::Set(actual), Type::Set(expected)) => fill_unknown(actual, expected),
+        (Type::Thread(actual), Type::Thread(expected)) => fill_unknown(actual, expected),
+        (Type::Mutex(actual), Type::Mutex(expected))
+        | (Type::MutexGuard(actual), Type::MutexGuard(expected)) => fill_unknown(actual, expected),
         (Type::Result(actual_ok, actual_error), Type::Result(expected_ok, expected_error)) => {
             fill_unknown(actual_ok, expected_ok);
             fill_unknown(actual_error, expected_error);
@@ -2880,7 +3046,7 @@ fn validate_semantics_expr(expr: &Expr, functions: usize) -> Result<(), Diagnost
             validate_semantics_expr(start, functions)?;
             validate_semantics_expr(end, functions)?;
         }
-        ExprKind::Call(call) => {
+        ExprKind::Call(call) | ExprKind::Spawn(call) => {
             if let CallTarget::Function(target) = call.target
                 && target.0 >= functions
             {
@@ -2937,7 +3103,8 @@ fn contains_unknown(ty: &Type) -> bool {
         | Type::RawPointer { inner, .. }
         | Type::Option(inner)
         | Type::Slice(inner)
-        | Type::List(inner) => contains_unknown(inner),
+        | Type::List(inner)
+        | Type::Thread(inner) => contains_unknown(inner),
         Type::Map(key, value) => contains_unknown(key) || contains_unknown(value),
         Type::Set(inner) => contains_unknown(inner),
         Type::Result(ok, error) => contains_unknown(ok) || contains_unknown(error),
@@ -3098,7 +3265,7 @@ fn validate_expr(expr: &Expr, locals: usize) -> Result<(), Diagnostic> {
                 validate_expr(&arm.value, locals)?;
             }
         }
-        ExprKind::Call(call) => {
+        ExprKind::Call(call) | ExprKind::Spawn(call) => {
             for argument in &call.arguments {
                 validate_expr(argument, locals)?;
             }

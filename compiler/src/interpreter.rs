@@ -4,12 +4,215 @@ use crate::ast::{
 };
 use crate::diagnostics::{Diagnostic, DiagnosticKind, Span};
 use std::{
+    any::Any,
     collections::HashMap,
     fs,
     path::PathBuf,
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, AtomicI64, Ordering},
+    },
     thread,
     time::{Duration as StdDuration, Instant as StdInstant, SystemTime, UNIX_EPOCH},
 };
+
+#[derive(Clone)]
+struct RuntimeThread(Arc<ThreadState>);
+
+type ThreadResult = Result<Box<dyn Any + Send>, Diagnostic>;
+type ThreadHandle = thread::JoinHandle<ThreadResult>;
+
+struct ThreadState {
+    handle: StdMutex<Option<ThreadHandle>>,
+}
+
+impl RuntimeThread {
+    fn new(handle: ThreadHandle) -> Self {
+        Self(Arc::new(ThreadState {
+            handle: StdMutex::new(Some(handle)),
+        }))
+    }
+
+    fn join(&self, span: Span) -> Result<Value, Diagnostic> {
+        let handle = self
+            .0
+            .handle
+            .lock()
+            .map_err(|_| {
+                Diagnostic::new(DiagnosticKind::Runtime, "thread state is poisoned", span)
+            })?
+            .take()
+            .ok_or_else(|| {
+                Diagnostic::new(
+                    DiagnosticKind::Runtime,
+                    "thread has already been joined",
+                    span,
+                )
+            })?;
+        let value = handle.join().map_err(|_| {
+            Diagnostic::new(DiagnosticKind::Runtime, "spawned thread panicked", span)
+        })??;
+        value.downcast::<Value>().map(|value| *value).map_err(|_| {
+            Diagnostic::new(
+                DiagnosticKind::Runtime,
+                "thread returned an invalid value",
+                span,
+            )
+        })
+    }
+}
+
+impl Drop for ThreadState {
+    fn drop(&mut self) {
+        if let Ok(slot) = self.handle.get_mut()
+            && let Some(handle) = slot.take()
+        {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl std::fmt::Debug for RuntimeThread {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("Thread")
+            .field(&Arc::as_ptr(&self.0))
+            .finish()
+    }
+}
+
+impl PartialEq for RuntimeThread {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeMutex(Arc<RuntimeMutexState>);
+
+struct RuntimeMutexState {
+    locked: AtomicBool,
+    value: StdMutex<Box<dyn Any + Send>>,
+}
+
+impl RuntimeMutex {
+    fn new(value: Value) -> Self {
+        Self(Arc::new(RuntimeMutexState {
+            locked: AtomicBool::new(false),
+            value: StdMutex::new(Box::new(value)),
+        }))
+    }
+
+    fn lock(&self) -> RuntimeMutexGuard {
+        while self
+            .0
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            thread::yield_now();
+        }
+        RuntimeMutexGuard(Arc::new(RuntimeMutexGuardState {
+            mutex: Arc::clone(&self.0),
+        }))
+    }
+}
+
+impl std::fmt::Debug for RuntimeMutex {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("Mutex")
+            .field(&Arc::as_ptr(&self.0))
+            .finish()
+    }
+}
+
+impl PartialEq for RuntimeMutex {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeMutexGuard(Arc<RuntimeMutexGuardState>);
+
+struct RuntimeMutexGuardState {
+    mutex: Arc<RuntimeMutexState>,
+}
+
+impl RuntimeMutexGuard {
+    fn read(&self) -> Option<Value> {
+        self.0
+            .mutex
+            .value
+            .lock()
+            .ok()?
+            .downcast_ref::<Value>()
+            .cloned()
+    }
+
+    fn write(&self, value: Value) -> Option<()> {
+        *self.0.mutex.value.lock().ok()? = Box::new(value);
+        Some(())
+    }
+}
+
+impl Drop for RuntimeMutexGuardState {
+    fn drop(&mut self) {
+        self.mutex.locked.store(false, Ordering::Release);
+    }
+}
+
+impl std::fmt::Debug for RuntimeMutexGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("MutexGuard")
+            .field(&Arc::as_ptr(&self.0))
+            .finish()
+    }
+}
+
+impl PartialEq for RuntimeMutexGuard {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeAtomicInt(Arc<AtomicI64>);
+
+impl RuntimeAtomicInt {
+    fn add(&self, delta: i64, span: Span) -> Result<(i64, i64), Diagnostic> {
+        let mut current = self.0.load(Ordering::SeqCst);
+        loop {
+            let next = current.checked_add(delta).ok_or_else(|| {
+                Diagnostic::new(DiagnosticKind::Runtime, "AtomicInt overflow", span)
+            })?;
+            match self
+                .0
+                .compare_exchange_weak(current, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(previous) => return Ok((previous, next)),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for RuntimeAtomicInt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("AtomicInt")
+            .field(&Arc::as_ptr(&self.0))
+            .finish()
+    }
+}
+
+impl PartialEq for RuntimeAtomicInt {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 struct RuntimeString {
@@ -114,6 +317,10 @@ enum Value {
     Path(PathBuf),
     Instant(StdInstant),
     Duration(StdDuration),
+    Thread(RuntimeThread),
+    Mutex(RuntimeMutex),
+    MutexGuard(RuntimeMutexGuard),
+    AtomicInt(RuntimeAtomicInt),
     Array(Vec<Value>),
     Slice(Vec<Value>),
     List {
@@ -161,6 +368,7 @@ enum PlaceSegment {
     Index(usize),
     MapValue(usize),
     Subslice(usize, usize),
+    MutexValue,
 }
 
 enum RuntimeFault {
@@ -169,6 +377,7 @@ enum RuntimeFault {
 }
 
 type RuntimeResult<T> = Result<T, RuntimeFault>;
+const INTERPRETER_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 enum Flow {
     Normal,
@@ -180,7 +389,7 @@ enum Flow {
 pub struct Interpreter {
     scopes: Vec<HashMap<String, Value>>,
     scope_orders: Vec<Vec<String>>,
-    output: Vec<String>,
+    output: Arc<StdMutex<Vec<String>>>,
     call_depth: usize,
 }
 
@@ -189,15 +398,41 @@ impl Interpreter {
         Self {
             scopes: Vec::new(),
             scope_orders: Vec::new(),
-            output: Vec::new(),
+            output: Arc::new(StdMutex::new(Vec::new())),
             call_depth: 0,
         }
     }
 
     pub fn run(&mut self, program: &Program) -> Result<Vec<String>, Diagnostic> {
+        thread::scope(|scope| {
+            let worker = thread::Builder::new()
+                .name("disp-interpreter".into())
+                .stack_size(INTERPRETER_STACK_BYTES)
+                .spawn_scoped(scope, || self.run_inner(program))
+                .map_err(|error| {
+                    Diagnostic::new(
+                        DiagnosticKind::Runtime,
+                        format!("could not start interpreter: {error}"),
+                        Span::point(1, 1),
+                    )
+                })?;
+            worker.join().map_err(|_| {
+                Diagnostic::new(
+                    DiagnosticKind::Runtime,
+                    "interpreter worker panicked",
+                    Span::point(1, 1),
+                )
+            })?
+        })
+    }
+
+    fn run_inner(&mut self, program: &Program) -> Result<Vec<String>, Diagnostic> {
         self.scopes.clear();
         self.scope_orders.clear();
-        self.output.clear();
+        self.output
+            .lock()
+            .expect("interpreter output lock poisoned")
+            .clear();
         self.call_depth = 0;
         let main = program
             .functions
@@ -207,7 +442,12 @@ impl Interpreter {
             .clone();
         self.call_function(program, &main, Vec::new(), main.name_span)
             .map_err(RuntimeFault::into_diagnostic)?;
-        Ok(std::mem::take(&mut self.output))
+        Ok(std::mem::take(
+            &mut *self
+                .output
+                .lock()
+                .expect("interpreter output lock poisoned"),
+        ))
     }
 
     fn call_function(
@@ -217,6 +457,8 @@ impl Interpreter {
         arguments: Vec<Value>,
         call_span: Span,
     ) -> RuntimeResult<Value> {
+        // Keep the semantic oracle below the smallest supported test-thread stack.
+        // Native DISP programs use the platform stack and are not capped here.
         const MAX_CALL_DEPTH: usize = 32;
         if function.parameters.len() != arguments.len() {
             return Err(self.error(
@@ -772,6 +1014,25 @@ impl Interpreter {
                 self.evaluate_binary(*operator, left, right, expression.span)
             }
             Expression::Call { callee, arguments } => {
+                if let Expression::FieldAccess { object, field, .. } = &callee.node
+                    && matches!(&object.node, Expression::Identifier(name) if name == "AtomicInt")
+                    && field == "new"
+                {
+                    let Value::Int(value) = self.evaluate(program, &arguments[0])? else {
+                        unreachable!("type checking validates AtomicInt.new")
+                    };
+                    return Ok(Value::AtomicInt(RuntimeAtomicInt(Arc::new(
+                        AtomicI64::new(value),
+                    ))));
+                }
+                if let Expression::FieldAccess { object, field, .. } = &callee.node
+                    && matches!(&object.node, Expression::Identifier(name) if name == "Mutex")
+                    && field == "new"
+                {
+                    return Ok(Value::Mutex(RuntimeMutex::new(
+                        self.consume(program, &arguments[0])?,
+                    )));
+                }
                 if matches!(&callee.node, Expression::Identifier(name) if name == "String") {
                     return Ok(Value::String(RuntimeString::with_capacity(0)));
                 }
@@ -1310,6 +1571,58 @@ impl Interpreter {
                 if let Expression::FieldAccess { object, field, .. } = &callee.node
                     && !matches!(&object.node, Expression::Identifier(name) if program.enums.iter().any(|declaration| declaration.name == *name))
                 {
+                    if field == "lock" && arguments.is_empty() {
+                        let Value::Mutex(mutex) = self.evaluate(program, object)? else {
+                            return Err(self.error("Mutex method requires a Mutex", object.span));
+                        };
+                        return Ok(Value::MutexGuard(mutex.lock()));
+                    }
+                    if field == "share" && arguments.is_empty() {
+                        return match self.evaluate(program, object)? {
+                            Value::Mutex(mutex) => Ok(Value::Mutex(mutex)),
+                            Value::AtomicInt(atomic) => Ok(Value::AtomicInt(atomic)),
+                            _ => {
+                                Err(self.error("share requires a Mutex or AtomicInt", object.span))
+                            }
+                        };
+                    }
+                    if matches!(
+                        field.as_str(),
+                        "share" | "load" | "store" | "add" | "fetch_add"
+                    ) && let Value::AtomicInt(atomic) = self.evaluate(program, object)?
+                    {
+                        return match field.as_str() {
+                            "share" => Ok(Value::AtomicInt(atomic)),
+                            "load" => Ok(Value::Int(atomic.0.load(Ordering::SeqCst))),
+                            "store" => {
+                                let Value::Int(value) = self.evaluate(program, &arguments[0])?
+                                else {
+                                    unreachable!("type checking validates AtomicInt.store")
+                                };
+                                atomic.0.store(value, Ordering::SeqCst);
+                                Ok(Value::Unit)
+                            }
+                            "add" | "fetch_add" => {
+                                let Value::Int(value) = self.evaluate(program, &arguments[0])?
+                                else {
+                                    unreachable!("type checking validates AtomicInt.add")
+                                };
+                                let (previous, next) = atomic
+                                    .add(value, expression.span)
+                                    .map_err(RuntimeFault::Error)?;
+                                Ok(Value::Int(if field == "add" { next } else { previous }))
+                            }
+                            _ => unreachable!(),
+                        };
+                    }
+                    if field == "join" && arguments.is_empty() {
+                        let Value::Thread(handle) = self.consume(program, object)? else {
+                            return Err(
+                                self.error("Thread.join requires a Thread value", object.span)
+                            );
+                        };
+                        return handle.join(expression.span).map_err(RuntimeFault::Error);
+                    }
                     if let Value::Path(path) = self.evaluate(program, object)? {
                         return match field.as_str() {
                             "join" => {
@@ -1762,7 +2075,12 @@ impl Interpreter {
                             .ok_or_else(|| self.error("dangling reference", arguments[0].span))?,
                         value => value,
                     };
-                    self.output.push(display_value(value));
+                    self.output
+                        .lock()
+                        .map_err(|_| {
+                            self.error("interpreter output lock is poisoned", expression.span)
+                        })?
+                        .push(display_value(value));
                     return Ok(Value::Unit);
                 }
                 let callee_value = self.evaluate(program, callee)?;
@@ -1854,6 +2172,7 @@ impl Interpreter {
                     _ => Err(self.error("`?` requires Option or Result", expression.span)),
                 }
             }
+            Expression::Spawn(task) => self.spawn_task(program, task, expression.span),
             Expression::Borrow { mutable, target } => {
                 let place = self
                     .dynamic_place(program, target)?
@@ -1864,6 +2183,9 @@ impl Interpreter {
                 Value::Reference(place, _) => self
                     .read_place(&place)
                     .ok_or_else(|| self.error("dangling or invalid pointer", expression.span)),
+                Value::MutexGuard(guard) => guard
+                    .read()
+                    .ok_or_else(|| self.error("invalid Mutex guard", expression.span)),
                 _ => Err(self.error("value cannot be dereferenced", expression.span)),
             },
             Expression::Move(target) => {
@@ -1878,6 +2200,45 @@ impl Interpreter {
                 Ok(value)
             }
         }
+    }
+
+    fn spawn_task(&mut self, program: &Program, task: &Expr, span: Span) -> RuntimeResult<Value> {
+        let Expression::Call { callee, arguments } = &task.node else {
+            return Err(self.error("`spawn` requires a direct function call", task.span));
+        };
+        let Expression::Identifier(name) = &callee.node else {
+            return Err(self.error("`spawn` requires a named DISP function", callee.span));
+        };
+        let function = program
+            .functions
+            .iter()
+            .find(|function| function.name == *name)
+            .ok_or_else(|| self.error("unknown spawned function", callee.span))?
+            .clone();
+        let mut values = Vec::with_capacity(arguments.len());
+        for argument in arguments {
+            values.push(self.consume(program, argument)?);
+        }
+        let child_program = program.clone();
+        let output = Arc::clone(&self.output);
+        let call_span = task.span;
+        let handle = thread::Builder::new()
+            .name(format!("disp-{name}"))
+            .stack_size(INTERPRETER_STACK_BYTES)
+            .spawn(move || {
+                let mut child = Interpreter {
+                    scopes: Vec::new(),
+                    scope_orders: Vec::new(),
+                    output,
+                    call_depth: 0,
+                };
+                child
+                    .call_function(&child_program, &function, values, call_span)
+                    .map(|value| Box::new(value) as Box<dyn Any + Send>)
+                    .map_err(RuntimeFault::into_diagnostic)
+            })
+            .map_err(|error| self.error(format!("could not spawn thread: {error}"), span))?;
+        Ok(Value::Thread(RuntimeThread::new(handle)))
     }
 
     fn push_scope(&mut self, values: HashMap<String, Value>) {
@@ -2084,6 +2445,17 @@ impl Interpreter {
             Expression::Dereference(target) => match &target.node {
                 Expression::Identifier(name) => match self.lookup(name)? {
                     Value::Reference(place, _) => Some(place),
+                    Value::MutexGuard(_) => {
+                        let scope = self
+                            .scopes
+                            .iter()
+                            .rposition(|scope| scope.contains_key(name))?;
+                        Some(Place {
+                            scope,
+                            name: name.clone(),
+                            fields: vec![PlaceSegment::MutexValue],
+                        })
+                    }
                     _ => None,
                 },
                 _ => None,
@@ -2214,6 +2586,18 @@ fn write_value_path(target: &mut Value, fields: &[PlaceSegment], value: Value) -
                 _ => None,
             }
         }
+        PlaceSegment::MutexValue => {
+            let Value::MutexGuard(guard) = target else {
+                return None;
+            };
+            if fields.len() == 1 {
+                guard.write(value)
+            } else {
+                let mut inner = guard.read()?;
+                write_value_path(&mut inner, &fields[1..], value)?;
+                guard.write(inner)
+            }
+        }
     }
 }
 
@@ -2275,6 +2659,12 @@ fn read_value_path(target: &Value, fields: &[PlaceSegment]) -> Option<Value> {
                 }
                 _ => None,
             }
+        }
+        PlaceSegment::MutexValue => {
+            let Value::MutexGuard(guard) = target else {
+                return None;
+            };
+            read_value_path(&guard.read()?, &fields[1..])
         }
     }
 }
@@ -2413,6 +2803,10 @@ fn value_type_name(value: &Value) -> &str {
         Value::Path(_) => "Path",
         Value::Instant(_) => "Instant",
         Value::Duration(_) => "Duration",
+        Value::Thread(_) => "Thread",
+        Value::Mutex(_) => "Mutex",
+        Value::MutexGuard(_) => "MutexGuard",
+        Value::AtomicInt(_) => "AtomicInt",
         Value::Array(_) => "Array",
         Value::Slice(_) => "Slice",
         Value::List { .. } => "List",
@@ -2462,6 +2856,10 @@ fn value_is_copy(program: &Program, value: &Value) -> bool {
         Value::List { .. }
         | Value::Map { .. }
         | Value::Set { .. }
+        | Value::Thread(_)
+        | Value::Mutex(_)
+        | Value::MutexGuard(_)
+        | Value::AtomicInt(_)
         | Value::Path(_)
         | Value::String(_)
         | Value::Uninitialized => false,
@@ -2812,6 +3210,10 @@ fn display_value(value: Value) -> String {
         Value::Path(value) => value.to_string_lossy().into_owned(),
         Value::Instant(_) => "<Instant>".into(),
         Value::Duration(value) => format!("{}ns", value.as_nanos()),
+        Value::Thread(_) => "<Thread>".into(),
+        Value::Mutex(_) => "<Mutex>".into(),
+        Value::MutexGuard(_) => "<MutexGuard>".into(),
+        Value::AtomicInt(_) => "<AtomicInt>".into(),
         Value::Array(values) => format!(
             "[{}]",
             values

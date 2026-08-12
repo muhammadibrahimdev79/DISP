@@ -9,7 +9,10 @@ use super::{
     runtime::C_RUNTIME,
 };
 use crate::{ast, diagnostics::Diagnostic, hir, mir};
-use std::{collections::HashMap, fmt::Write};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fmt::Write,
+};
 
 pub fn generate(
     program: &mir::Program,
@@ -41,6 +44,9 @@ pub fn generate(
         .unwrap();
         prototype(program, instance, &mut output);
     }
+    for target in thread_targets(program, instances)? {
+        thread_wrapper(program, &target, &mut output);
+    }
     for instance in &instances.instances {
         function(program, instance, &mut output)?;
     }
@@ -52,6 +58,84 @@ pub fn generate(
     )
     .unwrap();
     Ok(Some(output))
+}
+
+fn thread_targets(
+    program: &mir::Program,
+    instances: &mono::MonoProgram,
+) -> Result<BTreeSet<mono::FunctionInstance>, Diagnostic> {
+    let mut targets = BTreeSet::new();
+    for caller in &instances.instances {
+        let function = &program.functions[caller.function.0];
+        for block in &function.blocks {
+            if let mir::Terminator::Spawn {
+                target,
+                arguments,
+                substitutions,
+                ..
+            } = &block.terminator
+            {
+                let target = mono::resolve_target(
+                    program,
+                    function,
+                    caller,
+                    &hir::CallTarget::Function(*target),
+                    substitutions,
+                    arguments,
+                )?
+                .expect("a validated spawn target must resolve");
+                targets.insert(target);
+            }
+        }
+    }
+    Ok(targets)
+}
+
+fn thread_context_name(program: &mir::Program, target: &mono::FunctionInstance) -> String {
+    format!("disp_thread_ctx_{}", mono::mangle(program, target))
+}
+
+fn thread_entry_name(program: &mir::Program, target: &mono::FunctionInstance) -> String {
+    format!("disp_thread_entry_{}", mono::mangle(program, target))
+}
+
+fn thread_wrapper(program: &mir::Program, target: &mono::FunctionInstance, output: &mut String) {
+    let function = &program.functions[target.function.0];
+    let substitutions = mono::mapping(function, target);
+    let context = thread_context_name(program, target);
+    let entry = thread_entry_name(program, target);
+    let result_ty = substitute(&function.locals[function.return_local.0].ty, &substitutions);
+    writeln!(output, "typedef struct {context} {{").unwrap();
+    for index in 0..function.argument_count {
+        let local = mir::LocalId(index + 1);
+        writeln!(
+            output,
+            "{} a{};",
+            c_local_type(function, local, &substitutions),
+            index + 1
+        )
+        .unwrap();
+    }
+    writeln!(output, "{} *result;", native_types::c_type(&result_ty)).unwrap();
+    writeln!(output, "}} {context};").unwrap();
+    writeln!(
+        output,
+        "static void {entry}(void *raw){{{context} *context=({context}*)raw;"
+    )
+    .unwrap();
+    write!(
+        output,
+        "*(context->result)={}(",
+        mono::mangle(program, target)
+    )
+    .unwrap();
+    for index in 0..function.argument_count {
+        if index > 0 {
+            output.push(',');
+        }
+        write!(output, "context->a{}", index + 1).unwrap();
+    }
+    writeln!(output, ");disp_dealloc(context);}}").unwrap();
 }
 
 pub fn supported(program: &mir::Program, ty: &hir::Type) -> bool {
@@ -66,6 +150,9 @@ pub fn supported(program: &mir::Program, ty: &hir::Type) -> bool {
         | hir::Type::Duration
         | hir::Type::Int { .. }
         | hir::Type::Float { .. } => true,
+        hir::Type::AtomicInt => true,
+        hir::Type::Thread(result) => supported(program, result),
+        hir::Type::Mutex(value) | hir::Type::MutexGuard(value) => supported(program, value),
         hir::Type::Struct(id, arguments) => {
             let declaration = &program.structs[id.0];
             let substitutions = declaration
@@ -380,6 +467,115 @@ fn terminator(
                     match ty {
                         hir::Type::Array(_, length) => (length == 0).to_string(),
                         hir::Type::Slice(_) => format!("({value}).len==0"),
+                        _ => unreachable!(),
+                    }
+                }
+                hir::CallTarget::Intrinsic(name) if name == "Thread.join" => {
+                    let thread_ty = operand_ty(program, function, &arguments[0], substitutions);
+                    let value =
+                        operand(program, function, &arguments[0], &thread_ty, substitutions);
+                    let result_c = native_types::c_type(&destination_ty);
+                    format!(
+                        "({{disp_native_thread _thread={value};disp_thread_wait(&_thread);{result_c} _result=*({result_c}*)_thread.result;disp_dealloc(_thread.result);_result;}})"
+                    )
+                }
+                hir::CallTarget::Intrinsic(name) if name == "Mutex.new" => {
+                    let hir::Type::Mutex(value_ty) = &destination_ty else {
+                        unreachable!()
+                    };
+                    let value = operand(program, function, &arguments[0], value_ty, substitutions);
+                    let value_c = native_types::c_type(value_ty);
+                    format!(
+                        "({{{value_c} *_data=({value_c}*)disp_alloc(sizeof({value_c}),_Alignof({value_c}));*_data={value};(disp_native_mutex){{.state=disp_mutex_create(_data)}};}})"
+                    )
+                }
+                hir::CallTarget::Intrinsic(name)
+                    if matches!(name.as_str(), "Mutex.share" | "Mutex.lock") =>
+                {
+                    let receiver_ty = operand_ty(program, function, &arguments[0], substitutions);
+                    let receiver = operand(
+                        program,
+                        function,
+                        &arguments[0],
+                        &receiver_ty,
+                        substitutions,
+                    );
+                    if name == "Mutex.share" {
+                        format!(
+                            "({{disp_mutex_retain(({receiver})->state);(disp_native_mutex){{.state=({receiver})->state}};}})"
+                        )
+                    } else {
+                        format!(
+                            "disp_mutex_lock(({receiver})->state,{},{})",
+                            span.start.line, span.start.column
+                        )
+                    }
+                }
+                hir::CallTarget::Intrinsic(name) if name == "AtomicInt.new" => {
+                    let value = operand(
+                        program,
+                        function,
+                        &arguments[0],
+                        &hir::Type::Int {
+                            signed: true,
+                            width: None,
+                        },
+                        substitutions,
+                    );
+                    format!(
+                        "(disp_native_atomic_int){{.state=disp_atomic_int_create((int64_t)({value}))}}"
+                    )
+                }
+                hir::CallTarget::Intrinsic(name) if name.starts_with("AtomicInt.") => {
+                    let receiver_ty = operand_ty(program, function, &arguments[0], substitutions);
+                    let receiver = operand(
+                        program,
+                        function,
+                        &arguments[0],
+                        &receiver_ty,
+                        substitutions,
+                    );
+                    match name.as_str() {
+                        "AtomicInt.share" => format!(
+                            "({{disp_atomic_int_retain(({receiver})->state);(disp_native_atomic_int){{.state=({receiver})->state}};}})"
+                        ),
+                        "AtomicInt.load" => format!("disp_atomic_int_load(({receiver})->state)"),
+                        "AtomicInt.store" => {
+                            let value = operand(
+                                program,
+                                function,
+                                &arguments[1],
+                                &hir::Type::Int {
+                                    signed: true,
+                                    width: None,
+                                },
+                                substitutions,
+                            );
+                            format!(
+                                "(disp_atomic_int_store(({receiver})->state,(int64_t)({value})),(disp_native_unit){{0}})"
+                            )
+                        }
+                        "AtomicInt.fetch_add" | "AtomicInt.add" => {
+                            let value = operand(
+                                program,
+                                function,
+                                &arguments[1],
+                                &hir::Type::Int {
+                                    signed: true,
+                                    width: None,
+                                },
+                                substitutions,
+                            );
+                            let fetch = format!(
+                                "disp_atomic_int_fetch_add(({receiver})->state,(int64_t)({value}),{},{})",
+                                span.start.line, span.start.column
+                            );
+                            if name == "AtomicInt.add" {
+                                format!("({fetch}+(int64_t)({value}))")
+                            } else {
+                                fetch
+                            }
+                        }
                         _ => unreachable!(),
                     }
                 }
@@ -882,6 +1078,53 @@ fn terminator(
             writeln!(
                 output,
                 "{}={call};goto bb{};",
+                place_expr(program, function, destination, substitutions),
+                next.0
+            )
+            .unwrap();
+        }
+        mir::Terminator::Spawn {
+            target,
+            arguments,
+            destination,
+            next,
+            substitutions: call_substitutions,
+            span,
+        } => {
+            let destination_ty = place_ty(program, function, destination, substitutions);
+            let hir::Type::Thread(result_ty) = &destination_ty else {
+                unreachable!("spawn destination must be Thread<T>")
+            };
+            let target = mono::resolve_target(
+                program,
+                function,
+                instance,
+                &hir::CallTarget::Function(*target),
+                call_substitutions,
+                arguments,
+            )?
+            .expect("validated spawn target must resolve");
+            let target_function = &program.functions[target.function.0];
+            let target_map = mono::mapping(target_function, &target);
+            let context = thread_context_name(program, &target);
+            let entry = thread_entry_name(program, &target);
+            let stores = arguments
+                .iter()
+                .enumerate()
+                .map(|(index, argument)| {
+                    let expected = substitute(&target_function.locals[index + 1].ty, &target_map);
+                    let value = operand(program, function, argument, &expected, substitutions);
+                    format!("_context->a{}={value};", index + 1)
+                })
+                .collect::<String>();
+            let result_c = native_types::c_type(result_ty);
+            let expression = format!(
+                "({{{result_c} *_result=({result_c}*)disp_alloc_zeroed(1,sizeof({result_c}),_Alignof({result_c}));{context} *_context=({context}*)disp_alloc(sizeof({context}),_Alignof({context}));{stores}_context->result=_result;disp_native_thread _thread={{.handle=disp_thread_start({entry},_context,{},{}) ,.result=_result}};_thread;}})",
+                span.start.line, span.start.column
+            );
+            writeln!(
+                output,
+                "{}={expression};goto bb{};",
                 place_expr(program, function, destination, substitutions),
                 next.0
             )
@@ -1684,6 +1927,7 @@ fn place_ty(
         ty = match projection {
             mir::Projection::SafeDereference | mir::Projection::RawDereference => match ty {
                 hir::Type::Reference { inner, .. } | hir::Type::RawPointer { inner, .. } => *inner,
+                hir::Type::MutexGuard(inner) => *inner,
                 _ => unreachable!(),
             },
             mir::Projection::Field(index) => aggregate_field_ty(program, &ty, None, *index),
@@ -1717,6 +1961,45 @@ fn drop_value_depth(program: &mir::Program, value: &str, ty: &hir::Type, depth: 
     match ty {
         hir::Type::String => format!("disp_string_drop(&({value}));"),
         hir::Type::Path => format!("disp_path_drop(&({value}));"),
+        hir::Type::Thread(result) => {
+            let result_c = native_types::c_type(result);
+            let result_drop = drop_value_depth(
+                program,
+                &format!("*({result_c}*)({value}).result"),
+                result,
+                depth + 1,
+            );
+            format!(
+                "{{disp_thread_wait(&({value}));if(({value}).result){{{result_drop}disp_dealloc(({value}).result);({value}).result=NULL;}}}}"
+            )
+        }
+        hir::Type::Mutex(value_ty) => {
+            let value_c = native_types::c_type(value_ty);
+            let value_drop = drop_value_depth(
+                program,
+                &format!("*({value_c}*)({value}).state->data"),
+                value_ty,
+                depth + 1,
+            );
+            format!(
+                "{{if(({value}).state&&disp_mutex_release(({value}).state)){{{value_drop}disp_dealloc(({value}).state->data);disp_dealloc(({value}).state);}}({value}).state=NULL;}}"
+            )
+        }
+        hir::Type::MutexGuard(value_ty) => {
+            let value_c = native_types::c_type(value_ty);
+            let value_drop = drop_value_depth(
+                program,
+                &format!("*({value_c}*)({value}).state->data"),
+                value_ty,
+                depth + 1,
+            );
+            format!(
+                "{{if(({value}).state){{disp_mutex_unlock(({value}).state);if(disp_mutex_release(({value}).state)){{{value_drop}disp_dealloc(({value}).state->data);disp_dealloc(({value}).state);}}({value}).state=NULL;}}}}"
+            )
+        }
+        hir::Type::AtomicInt => format!(
+            "{{if(({value}).state&&disp_atomic_int_release(({value}).state))disp_dealloc(({value}).state);({value}).state=NULL;}}"
+        ),
         hir::Type::List(element) => {
             let index = format!("_drop_i{depth}");
             let element_drop = drop_value_depth(
@@ -1861,9 +2144,16 @@ fn place_expr(
     for projection in &place.projections {
         match projection {
             mir::Projection::SafeDereference | mir::Projection::RawDereference => {
-                expression = format!("(*({expression}))");
                 ty = match ty {
                     hir::Type::Reference { inner, .. } | hir::Type::RawPointer { inner, .. } => {
+                        expression = format!("(*({expression}))");
+                        *inner
+                    }
+                    hir::Type::MutexGuard(inner) => {
+                        expression = format!(
+                            "(*({}*)({expression}).state->data)",
+                            native_types::c_type(&inner)
+                        );
                         *inner
                     }
                     _ => unreachable!(),

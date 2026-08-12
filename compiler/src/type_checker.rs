@@ -26,6 +26,10 @@ pub enum Type {
     List(Box<Type>),
     Map(Box<Type>, Box<Type>),
     Set(Box<Type>),
+    Thread(Box<Type>),
+    Mutex(Box<Type>),
+    MutexGuard(Box<Type>),
+    AtomicInt,
     Char,
     Bool,
     ConversionError,
@@ -953,6 +957,67 @@ impl TypeChecker {
             }
             Expression::Character(_) => Ok(Type::Char),
             Expression::Bool(_) => Ok(Type::Bool),
+            Expression::Spawn(task) => {
+                let Expression::Call { callee, arguments } = &task.node else {
+                    return Err(Diagnostic::new(
+                        DiagnosticKind::Type,
+                        "`spawn` requires a direct function call",
+                        task.span,
+                    ));
+                };
+                let Expression::Identifier(name) = &callee.node else {
+                    return Err(Diagnostic::new(
+                        DiagnosticKind::Type,
+                        "`spawn` currently requires a named DISP function",
+                        callee.span,
+                    ));
+                };
+                let Some(signature) = self.functions.get(name).cloned() else {
+                    return Err(Diagnostic::new(
+                        DiagnosticKind::Type,
+                        "`spawn` target must be a DISP function",
+                        callee.span,
+                    ));
+                };
+                if signature
+                    .parameters
+                    .iter()
+                    .any(type_crosses_thread_by_borrow)
+                {
+                    return Err(Diagnostic::new(
+                        DiagnosticKind::Type,
+                        "spawned functions cannot accept references, borrowed views, or raw pointers",
+                        callee.span,
+                    )
+                    .with_help("pass owned data to the spawned function"));
+                }
+                let result = self.check_expression(task)?;
+                for argument in arguments {
+                    let ty = self.check_expression(argument)?;
+                    if !self.type_is_send(&ty, &mut HashSet::new()) {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            format!(
+                                "{} cannot be transferred to another thread",
+                                self.format_type(&ty)
+                            ),
+                            argument.span,
+                        )
+                        .with_help("move owned values into the thread; references and raw pointers cannot cross a thread boundary"));
+                    }
+                }
+                if !self.type_is_send(&result, &mut HashSet::new()) {
+                    return Err(Diagnostic::new(
+                        DiagnosticKind::Type,
+                        format!(
+                            "thread result {} cannot cross a thread boundary",
+                            self.format_type(&result)
+                        ),
+                        task.span,
+                    ));
+                }
+                Ok(Type::Thread(Box::new(result)))
+            }
             Expression::StructConstruct { name, fields, .. } => {
                 let Some(Type::Struct(id, _)) = self.types.get(name).cloned() else {
                     return Err(Diagnostic::new(
@@ -1171,6 +1236,7 @@ impl TypeChecker {
             }
             Expression::Dereference(target) => match self.check_expression(target)? {
                 Type::Reference(inner, _) => Ok(*inner),
+                Type::MutexGuard(inner) => Ok(*inner),
                 Type::RawPointer(inner, _) if self.unsafe_depth > 0 => Ok(*inner),
                 Type::RawPointer(_, _) => Err(Diagnostic::new(
                     DiagnosticKind::Type,
@@ -1414,6 +1480,44 @@ impl TypeChecker {
                             ));
                         }
                     }
+                }
+                if let Expression::FieldAccess { object, field, .. } = &callee.node
+                    && matches!(&object.node, Expression::Identifier(name) if name == "Mutex")
+                {
+                    if field == "new" && arguments.len() == 1 {
+                        let value = materialize_literal(self.check_expression(&arguments[0])?);
+                        return Ok(Type::Mutex(Box::new(value)));
+                    }
+                    return Err(Diagnostic::new(
+                        DiagnosticKind::Type,
+                        format!(
+                            "no Mutex constructor `{field}` with {} arguments",
+                            arguments.len()
+                        ),
+                        expression.span,
+                    ));
+                }
+                if let Expression::FieldAccess { object, field, .. } = &callee.node
+                    && matches!(&object.node, Expression::Identifier(name) if name == "AtomicInt")
+                {
+                    if field == "new" && arguments.len() == 1 {
+                        let value = self.check_expression(&arguments[0])?;
+                        self.require_same(
+                            &Type::Int,
+                            &value,
+                            arguments[0].span,
+                            "AtomicInt value",
+                        )?;
+                        return Ok(Type::AtomicInt);
+                    }
+                    return Err(Diagnostic::new(
+                        DiagnosticKind::Type,
+                        format!(
+                            "no AtomicInt constructor `{field}` with {} arguments",
+                            arguments.len()
+                        ),
+                        expression.span,
+                    ));
                 }
                 if let Expression::FieldAccess { object, field, .. } = &callee.node
                     && matches!(&object.node, Expression::Identifier(name) if name == "Map")
@@ -1768,6 +1872,46 @@ impl TypeChecker {
                                 return Ok(Type::Bool);
                             }
                             "clear" if arguments.is_empty() => return Ok(Type::Unit),
+                            _ => {}
+                        }
+                    }
+                    if let Type::Thread(result) = &receiver
+                        && field == "join"
+                        && arguments.is_empty()
+                    {
+                        return Ok((**result).clone());
+                    }
+                    if let Type::Mutex(value) = &receiver {
+                        if field == "share" && arguments.is_empty() {
+                            return Ok(Type::Mutex(value.clone()));
+                        }
+                        if field == "lock" && arguments.is_empty() {
+                            return Ok(Type::MutexGuard(value.clone()));
+                        }
+                    }
+                    if matches!(receiver, Type::AtomicInt) {
+                        match field.as_str() {
+                            "share" | "load" if arguments.is_empty() => {
+                                return Ok(if field == "share" {
+                                    Type::AtomicInt
+                                } else {
+                                    Type::Int
+                                });
+                            }
+                            "store" | "add" | "fetch_add" if arguments.len() == 1 => {
+                                let value = self.check_expression(&arguments[0])?;
+                                self.require_same(
+                                    &Type::Int,
+                                    &value,
+                                    arguments[0].span,
+                                    "AtomicInt value",
+                                )?;
+                                return Ok(if field == "store" {
+                                    Type::Unit
+                                } else {
+                                    Type::Int
+                                });
+                            }
                             _ => {}
                         }
                     }
@@ -2512,6 +2656,7 @@ impl TypeChecker {
             "Instant" if ty.arguments.is_empty() => Type::Instant,
             "Duration" if ty.arguments.is_empty() => Type::Duration,
             "IoError" if ty.arguments.is_empty() => Type::IoError,
+            "AtomicInt" if ty.arguments.is_empty() => Type::AtomicInt,
             "[]" if ty.arguments.len() == 1 => {
                 Type::Slice(Box::new(self.resolve_type(&ty.arguments[0])?))
             }
@@ -2524,6 +2669,15 @@ impl TypeChecker {
             ),
             "Set" if ty.arguments.len() == 1 => {
                 Type::Set(Box::new(self.resolve_type(&ty.arguments[0])?))
+            }
+            "Thread" if ty.arguments.len() == 1 => {
+                Type::Thread(Box::new(self.resolve_type(&ty.arguments[0])?))
+            }
+            "Mutex" if ty.arguments.len() == 1 => {
+                Type::Mutex(Box::new(self.resolve_type(&ty.arguments[0])?))
+            }
+            "MutexGuard" if ty.arguments.len() == 1 => {
+                Type::MutexGuard(Box::new(self.resolve_type(&ty.arguments[0])?))
             }
             name if name.starts_with("[;") && name.ends_with(']') && ty.arguments.len() == 1 => {
                 let length = name[2..name.len() - 1].parse::<usize>().map_err(|_| {
@@ -2643,6 +2797,9 @@ impl TypeChecker {
                 self.require_constraints(&self.enums[id].constraints, arguments, span)
             }
             Type::Option(value) => self.validate_instantiated_type(value, span),
+            Type::Thread(value) | Type::Mutex(value) | Type::MutexGuard(value) => {
+                self.validate_instantiated_type(value, span)
+            }
             Type::Result(ok, error) => {
                 self.validate_instantiated_type(ok, span)?;
                 self.validate_instantiated_type(error, span)
@@ -2680,6 +2837,65 @@ impl TypeChecker {
                     && matches!(implementation.target, Type::Enum(other, _) if other == *id)
             }),
             _ => false,
+        }
+    }
+
+    fn type_is_send(&self, ty: &Type, visiting: &mut HashSet<TypeId>) -> bool {
+        match ty {
+            Type::Reference(_, _)
+            | Type::RawPointer(_, _)
+            | Type::MutexGuard(_)
+            | Type::Slice(_)
+            | Type::Str
+            | Type::Function(_, _) => false,
+            Type::Generic(_) | Type::Infer => false,
+            Type::Array(element, _)
+            | Type::List(element)
+            | Type::Set(element)
+            | Type::Option(element)
+            | Type::Thread(element)
+            | Type::Mutex(element) => self.type_is_send(element, visiting),
+            Type::Map(key, value) | Type::Result(key, value) => {
+                self.type_is_send(key, visiting) && self.type_is_send(value, visiting)
+            }
+            Type::Struct(id, arguments) => {
+                if !visiting.insert(*id) {
+                    return true;
+                }
+                let info = &self.structs[id];
+                let substitutions = info
+                    .generics
+                    .iter()
+                    .cloned()
+                    .zip(arguments.iter().cloned())
+                    .collect();
+                let send = info
+                    .fields
+                    .values()
+                    .all(|field| self.type_is_send(&substitute(field, &substitutions), visiting));
+                visiting.remove(id);
+                send
+            }
+            Type::Enum(id, arguments) => {
+                if !visiting.insert(*id) {
+                    return true;
+                }
+                let info = &self.enums[id];
+                let substitutions = info
+                    .generics
+                    .iter()
+                    .cloned()
+                    .zip(arguments.iter().cloned())
+                    .collect();
+                let send = info.variants.values().all(|variant| {
+                    variant.payload.iter().all(|payload| {
+                        self.type_is_send(&substitute(payload, &substitutions), visiting)
+                    })
+                });
+                visiting.remove(id);
+                send
+            }
+            _ => true,
         }
     }
 
@@ -2753,6 +2969,10 @@ impl TypeChecker {
                 self.format_type(value)
             ),
             Type::Set(element) => format!("Set<{}>", self.format_type(element)),
+            Type::Thread(result) => format!("Thread<{}>", self.format_type(result)),
+            Type::Mutex(value) => format!("Mutex<{}>", self.format_type(value)),
+            Type::MutexGuard(value) => format!("MutexGuard<{}>", self.format_type(value)),
+            Type::AtomicInt => "AtomicInt".into(),
             Type::Char => "Char".into(),
             Type::Bool => "Bool".into(),
             Type::ConversionError => "ConversionError".into(),
@@ -2835,6 +3055,7 @@ impl TypeChecker {
                         .all(|arm| self.is_constant_expression(&arm.value))
             }
             Expression::Try(_)
+            | Expression::Spawn(_)
             | Expression::Call { .. }
             | Expression::Move(_)
             | Expression::Borrow { .. }
@@ -3069,6 +3290,11 @@ fn infer_substitutions(
         (Type::List(x), Type::List(y)) => {
             infer_substitutions(x, y, substitutions, span)?;
         }
+        (Type::Thread(x), Type::Thread(y))
+        | (Type::Mutex(x), Type::Mutex(y))
+        | (Type::MutexGuard(x), Type::MutexGuard(y)) => {
+            infer_substitutions(x, y, substitutions, span)?;
+        }
         (Type::Map(ak, av), Type::Map(bk, bv)) => {
             infer_substitutions(ak, bk, substitutions, span)?;
             infer_substitutions(av, bv, substitutions, span)?;
@@ -3112,6 +3338,9 @@ fn substitute(ty: &Type, substitutions: &HashMap<String, Type>) -> Type {
             Box::new(substitute(value, substitutions)),
         ),
         Type::Set(x) => Type::Set(Box::new(substitute(x, substitutions))),
+        Type::Thread(x) => Type::Thread(Box::new(substitute(x, substitutions))),
+        Type::Mutex(x) => Type::Mutex(Box::new(substitute(x, substitutions))),
+        Type::MutexGuard(x) => Type::MutexGuard(Box::new(substitute(x, substitutions))),
         Type::Result(a, b) => Type::Result(
             Box::new(substitute(a, substitutions)),
             Box::new(substitute(b, substitutions)),
@@ -3146,6 +3375,9 @@ fn types_overlap(left: &Type, right: &Type) -> bool {
         (Type::Array(x, a), Type::Array(y, b)) => a == b && types_overlap(x, y),
         (Type::Slice(x), Type::Slice(y)) => types_overlap(x, y),
         (Type::List(x), Type::List(y)) => types_overlap(x, y),
+        (Type::Thread(x), Type::Thread(y))
+        | (Type::Mutex(x), Type::Mutex(y))
+        | (Type::MutexGuard(x), Type::MutexGuard(y)) => types_overlap(x, y),
         (Type::Map(ak, av), Type::Map(bk, bv)) => types_overlap(ak, bk) && types_overlap(av, bv),
         (Type::Set(x), Type::Set(y)) => types_overlap(x, y),
         (Type::Result(a, b), Type::Result(x, y)) => types_overlap(a, x) && types_overlap(b, y),
@@ -3157,9 +3389,12 @@ fn contains_infer(ty: &Type) -> bool {
     match ty {
         Type::Infer => true,
         Type::Option(value) => contains_infer(value),
-        Type::Array(element, _) | Type::Slice(element) | Type::List(element) => {
-            contains_infer(element)
-        }
+        Type::Array(element, _)
+        | Type::Slice(element)
+        | Type::List(element)
+        | Type::Thread(element)
+        | Type::Mutex(element)
+        | Type::MutexGuard(element) => contains_infer(element),
         Type::Map(key, value) => contains_infer(key) || contains_infer(value),
         Type::Set(element) => contains_infer(element),
         Type::Result(ok, error) => contains_infer(ok) || contains_infer(error),
@@ -3167,6 +3402,26 @@ fn contains_infer(ty: &Type) -> bool {
             parameters.iter().any(contains_infer) || contains_infer(result)
         }
         Type::Reference(inner, _) | Type::RawPointer(inner, _) => contains_infer(inner),
+        _ => false,
+    }
+}
+
+fn type_crosses_thread_by_borrow(ty: &Type) -> bool {
+    match ty {
+        Type::Reference(_, _)
+        | Type::RawPointer(_, _)
+        | Type::Slice(_)
+        | Type::Str
+        | Type::MutexGuard(_) => true,
+        Type::Array(inner, _)
+        | Type::List(inner)
+        | Type::Set(inner)
+        | Type::Option(inner)
+        | Type::Thread(inner)
+        | Type::Mutex(inner) => type_crosses_thread_by_borrow(inner),
+        Type::Map(key, value) | Type::Result(key, value) => {
+            type_crosses_thread_by_borrow(key) || type_crosses_thread_by_borrow(value)
+        }
         _ => false,
     }
 }
@@ -3181,6 +3436,13 @@ fn merge_types(left: &Type, right: &Type) -> Type {
             Type::Array(Box::new(merge_types(left, right)), *length)
         }
         (Type::List(left), Type::List(right)) => Type::List(Box::new(merge_types(left, right))),
+        (Type::Thread(left), Type::Thread(right)) => {
+            Type::Thread(Box::new(merge_types(left, right)))
+        }
+        (Type::Mutex(left), Type::Mutex(right)) => Type::Mutex(Box::new(merge_types(left, right))),
+        (Type::MutexGuard(left), Type::MutexGuard(right)) => {
+            Type::MutexGuard(Box::new(merge_types(left, right)))
+        }
         (Type::Map(lk, lv), Type::Map(rk, rv)) => {
             Type::Map(Box::new(merge_types(lk, rk)), Box::new(merge_types(lv, rv)))
         }

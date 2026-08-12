@@ -709,6 +709,12 @@ impl Parser {
         let mut expression = operand(self)?;
         let mut operator_count = 0usize;
         while let Some((_, operator)) = operators.iter().find(|(kind, _)| self.check(kind)) {
+            if self.check(&TokenKind::Star)
+                && self.peek().span.start.line > expression.span.end.line
+                && self.looks_like_dereference_assignment()
+            {
+                break;
+            }
             operator_count += 1;
             if operator_count > 256 {
                 return Err(Diagnostic::new(
@@ -730,6 +736,33 @@ impl Parser {
             };
         }
         Ok(expression)
+    }
+
+    fn looks_like_dereference_assignment(&self) -> bool {
+        let mut index = self.current + 1;
+        if !matches!(
+            self.tokens.get(index).map(|token| &token.kind),
+            Some(TokenKind::Identifier(_))
+        ) {
+            return false;
+        }
+        index += 1;
+        while matches!(
+            self.tokens.get(index).map(|token| &token.kind),
+            Some(TokenKind::Dot)
+        ) {
+            index += 1;
+            if !matches!(
+                self.tokens.get(index).map(|token| &token.kind),
+                Some(TokenKind::Identifier(_))
+            ) {
+                return false;
+            }
+            index += 1;
+        }
+        self.tokens
+            .get(index)
+            .is_some_and(|token| is_assignment(&token.kind))
     }
 
     fn parse_or(&mut self) -> Result<Expr, Diagnostic> {
@@ -787,6 +820,14 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, Diagnostic> {
+        if self.match_token(&TokenKind::Spawn) {
+            let start = self.previous().span;
+            let task = self.with_recursion(Self::parse_unary)?;
+            return Ok(Spanned {
+                span: start.through(task.span),
+                node: Expression::Spawn(Box::new(task)),
+            });
+        }
         if self.match_token(&TokenKind::Move) {
             let start = self.previous().span;
             let operand = self.with_recursion(Self::parse_unary)?;
@@ -1276,6 +1317,16 @@ fn is_type_style(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_dereference_assignment() {
+        let tokens = crate::lexer::Lexer::new(
+            "fn main(){ mutex=Mutex.new(0) guard=mutex.lock()\n*guard += 1 }",
+        )
+        .tokenize()
+        .unwrap();
+        Parser::new(tokens).parse().unwrap();
+    }
     use crate::lexer::Lexer;
 
     fn parse(source: &str) -> Result<Program, Diagnostic> {
@@ -1356,6 +1407,16 @@ mod tests {
 
     #[test]
     fn rejects_pathological_nesting_without_panicking() {
+        std::thread::Builder::new()
+            .name("disp-parser-depth-test".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(rejects_pathological_nesting_inner)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn rejects_pathological_nesting_inner() {
         let source = format!(
             "fn main() {{ let x = {}1{} }}",
             "(".repeat(100),

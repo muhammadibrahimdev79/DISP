@@ -2,6 +2,7 @@ pub const C_RUNTIME: &str = r#"
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,9 +15,68 @@ pub const C_RUNTIME: &str = r#"
 #include <direct.h>
 #else
 #include <dirent.h>
+#include <pthread.h>
 #include <unistd.h>
 #endif
+
 static void dv_panic(const char *message,int line,int column);
+struct disp_mutex_state {
+    atomic_size_t refs;
+    void *data;
+#ifdef _WIN32
+    CRITICAL_SECTION native;
+#else
+    pthread_mutex_t native;
+#endif
+};
+static disp_mutex_state *disp_mutex_create(void *data){disp_mutex_state *state=(disp_mutex_state*)disp_alloc(sizeof(disp_mutex_state),_Alignof(disp_mutex_state));atomic_init(&state->refs,1);state->data=data;
+#ifdef _WIN32
+InitializeCriticalSection(&state->native);
+#else
+if(pthread_mutex_init(&state->native,NULL)!=0)disp_allocation_failure("could not initialize Mutex");
+#endif
+return state;}
+static void disp_mutex_retain(disp_mutex_state *state){if(!state)dv_panic("invalid Mutex handle",0,0);size_t previous=atomic_fetch_add_explicit(&state->refs,1,memory_order_relaxed);if(previous==SIZE_MAX)dv_panic("Mutex reference count overflow",0,0);}
+static disp_native_mutex_guard disp_mutex_lock(disp_mutex_state *state,int line,int column){disp_mutex_retain(state);
+#ifdef _WIN32
+EnterCriticalSection(&state->native);
+#else
+if(pthread_mutex_lock(&state->native)!=0)dv_panic("could not lock Mutex",line,column);
+#endif
+return (disp_native_mutex_guard){.state=state};}
+static void disp_mutex_unlock(disp_mutex_state *state){
+#ifdef _WIN32
+LeaveCriticalSection(&state->native);
+#else
+if(pthread_mutex_unlock(&state->native)!=0)dv_panic("could not unlock Mutex",0,0);
+#endif
+}
+static bool disp_mutex_release(disp_mutex_state *state){if(!state)return false;if(atomic_fetch_sub_explicit(&state->refs,1,memory_order_acq_rel)!=1)return false;atomic_thread_fence(memory_order_acquire);
+#ifdef _WIN32
+DeleteCriticalSection(&state->native);
+#else
+if(pthread_mutex_destroy(&state->native)!=0)dv_panic("could not destroy Mutex",0,0);
+#endif
+return true;}
+struct disp_atomic_int_state { atomic_size_t refs; atomic_int_fast64_t value; };
+static disp_atomic_int_state *disp_atomic_int_create(int64_t value){disp_atomic_int_state *state=(disp_atomic_int_state*)disp_alloc(sizeof(disp_atomic_int_state),_Alignof(disp_atomic_int_state));atomic_init(&state->refs,1);atomic_init(&state->value,value);return state;}
+static void disp_atomic_int_retain(disp_atomic_int_state *state){if(!state)dv_panic("invalid AtomicInt handle",0,0);size_t previous=atomic_fetch_add_explicit(&state->refs,1,memory_order_relaxed);if(previous==SIZE_MAX)dv_panic("AtomicInt reference count overflow",0,0);}
+static bool disp_atomic_int_release(disp_atomic_int_state *state){if(!state)return false;if(atomic_fetch_sub_explicit(&state->refs,1,memory_order_acq_rel)!=1)return false;atomic_thread_fence(memory_order_acquire);return true;}
+static int64_t disp_atomic_int_load(disp_atomic_int_state *state){return (int64_t)atomic_load_explicit(&state->value,memory_order_seq_cst);}
+static void disp_atomic_int_store(disp_atomic_int_state *state,int64_t value){atomic_store_explicit(&state->value,value,memory_order_seq_cst);}
+static int64_t disp_atomic_int_fetch_add(disp_atomic_int_state *state,int64_t delta,int line,int column){int_fast64_t expected=atomic_load_explicit(&state->value,memory_order_seq_cst);for(;;){int64_t desired;if(__builtin_add_overflow((int64_t)expected,delta,&desired))dv_panic("AtomicInt overflow",line,column);if(atomic_compare_exchange_weak_explicit(&state->value,&expected,(int_fast64_t)desired,memory_order_seq_cst,memory_order_seq_cst))return (int64_t)expected;}}
+
+typedef void (*disp_thread_entry)(void *);
+typedef struct { disp_thread_entry entry; void *context; } disp_thread_boot;
+#ifdef _WIN32
+static DWORD WINAPI disp_thread_bootstrap(LPVOID raw){disp_thread_boot boot=*(disp_thread_boot*)raw;disp_dealloc(raw);boot.entry(boot.context);return 0;}
+static uintptr_t disp_thread_start(disp_thread_entry entry,void *context,int line,int column){disp_thread_boot *boot=(disp_thread_boot*)disp_alloc(sizeof(disp_thread_boot),_Alignof(disp_thread_boot));boot->entry=entry;boot->context=context;HANDLE handle=CreateThread(NULL,0,disp_thread_bootstrap,boot,0,NULL);if(!handle){disp_dealloc(boot);dv_panic("could not create native thread",line,column);}return (uintptr_t)handle;}
+static void disp_thread_wait(disp_native_thread *thread){if(!thread->handle)return;HANDLE handle=(HANDLE)thread->handle;DWORD status=WaitForSingleObject(handle,INFINITE);CloseHandle(handle);thread->handle=0;if(status!=WAIT_OBJECT_0)dv_panic("could not join native thread",0,0);}
+#else
+static void *disp_thread_bootstrap(void *raw){disp_thread_boot boot=*(disp_thread_boot*)raw;disp_dealloc(raw);boot.entry(boot.context);return NULL;}
+static uintptr_t disp_thread_start(disp_thread_entry entry,void *context,int line,int column){_Static_assert(sizeof(pthread_t)<=sizeof(uintptr_t),"pthread_t cannot fit DISP thread handle");disp_thread_boot *boot=(disp_thread_boot*)disp_alloc(sizeof(disp_thread_boot),_Alignof(disp_thread_boot));boot->entry=entry;boot->context=context;pthread_t native;if(pthread_create(&native,NULL,disp_thread_bootstrap,boot)!=0){disp_dealloc(boot);dv_panic("could not create native thread",line,column);}uintptr_t handle=0;memcpy(&handle,&native,sizeof(native));return handle;}
+static void disp_thread_wait(disp_native_thread *thread){if(!thread->handle)return;pthread_t native;memcpy(&native,&thread->handle,sizeof(native));thread->handle=0;if(pthread_join(native,NULL)!=0)dv_panic("could not join native thread",0,0);}
+#endif
 
 static void disp_string_drop(disp_native_string *value){if(value->cap)disp_dealloc(value->data);value->data=NULL;value->len=0;value->cap=0;}
 static disp_native_string disp_string_with_capacity(size_t capacity){disp_native_string value={0};if(capacity){value.data=(char*)disp_alloc(capacity,1);value.cap=capacity;}return value;}

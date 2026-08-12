@@ -75,6 +75,41 @@ print(started.elapsed().millis())
 `Time.unix_seconds()` is the wall-clock operation. Keeping it separate prevents clock
 adjustments from corrupting elapsed-time measurements.
 
+## Threads and synchronization
+
+`spawn` transfers owned arguments to a named DISP function and returns a typed handle.
+Joining consumes the handle and returns the function's result:
+
+```disp
+fn square(value: int) -> int = value * value
+
+task = spawn square(12)
+print(task.join())
+```
+
+References, borrowed views, raw pointers, and mutex guards cannot cross a thread
+boundary. A `Thread<T>` that leaves scope without an explicit `join()` is joined during
+deterministic cleanup, so it cannot outlive resources owned by the process.
+
+`Mutex<T>` is explicitly shared. Its guard owns the lock and releases it when the guard
+leaves scope:
+
+```disp
+counter = Mutex.new(0)
+shared = counter.share()
+guard = shared.lock()
+*guard += 1
+```
+
+`AtomicInt` provides sequentially consistent `load`, `store`, `add`, and `fetch_add`
+operations for counters that do not need a larger protected value. `share()` is explicit
+for both synchronization types, keeping accidental shared ownership visible without
+exposing reference-counting or platform handles.
+
+A leading dereference assignment on the line after another expression is treated as a
+new statement. This resolves the otherwise ambiguous `call()\n*guard += 1` spelling
+without requiring a semicolon.
+
 ## Collection loops
 
 ```disp

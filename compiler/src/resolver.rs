@@ -459,7 +459,7 @@ impl Resolver {
                 field,
                 field_span,
             } => {
-                if matches!(&object.node, Expression::Identifier(name) if matches!(name.as_str(), "String" | "List" | "Map" | "Set" | "Path" | "File" | "Directory" | "Time" | "Duration"))
+                if matches!(&object.node, Expression::Identifier(name) if matches!(name.as_str(), "String" | "List" | "Map" | "Set" | "Mutex" | "AtomicInt" | "Path" | "File" | "Directory" | "Time" | "Duration"))
                 {
                     return Ok(());
                 }
@@ -498,6 +498,7 @@ impl Resolver {
                 Ok(())
             }
             Expression::Try(operand)
+            | Expression::Spawn(operand)
             | Expression::Move(operand)
             | Expression::Dereference(operand) => self.resolve_expression(operand),
             Expression::Borrow { target, .. } => self.resolve_expression(target),
@@ -690,6 +691,9 @@ impl Resolver {
             "List" => Some(1),
             "Map" => Some(2),
             "Set" => Some(1),
+            "Thread" => Some(1),
+            "Mutex" | "MutexGuard" => Some(1),
+            "AtomicInt" => Some(0),
             "[]" => Some(1),
             name if name.starts_with("[;") && name.ends_with(']') => Some(1),
             "int" | "f64" | "str" | "String" | "Path" | "Instant" | "Duration" | "IoError"

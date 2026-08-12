@@ -241,6 +241,7 @@ pub enum Expression {
         arms: Vec<MatchArm>,
     },
     Try(Box<Expr>),
+    Spawn(Box<Expr>),
     Move(Box<Expr>),
     Borrow {
         mutable: bool,

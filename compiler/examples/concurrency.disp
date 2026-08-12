@@ -1,0 +1,49 @@
+fn square(value: int) -> int {
+    return value * value
+}
+
+fn echo(value: String) -> String {
+    return value
+}
+
+fn increment(counter: Mutex<int>, times: int) {
+    var index = 0
+    while index < times {
+        guard = counter.lock()
+        *guard += 1
+        index += 1
+    }
+}
+
+fn count_atomic(counter: AtomicInt, times: int) {
+    var index = 0
+    while index < times {
+        counter.add(1)
+        index += 1
+    }
+}
+
+fn main() {
+    first = spawn square(9)
+    second = spawn square(5)
+    message = spawn echo("owned safely")
+
+    print(first.join())
+    print(second.join())
+    print(message.join())
+
+    counter = Mutex.new(0)
+    left = spawn increment(counter.share(), 1000)
+    right = spawn increment(counter.share(), 1000)
+    left.join()
+    right.join()
+    guard = counter.lock()
+    print(*guard)
+
+    total = AtomicInt.new(0)
+    atomic_left = spawn count_atomic(total.share(), 1000)
+    atomic_right = spawn count_atomic(total.share(), 1000)
+    atomic_left.join()
+    atomic_right.join()
+    print(total.load())
+}

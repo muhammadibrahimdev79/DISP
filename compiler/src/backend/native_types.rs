@@ -14,7 +14,13 @@ pub fn generate(
          typedef struct { const char *data; size_t len; } disp_native_str;\n\
          typedef struct { char *data; size_t len; size_t cap; } disp_native_path;\n\
          typedef struct { uint64_t nanos; } disp_native_instant;\n\
-         typedef struct { uint64_t nanos; } disp_native_duration;\n",
+         typedef struct { uint64_t nanos; } disp_native_duration;\n\
+         typedef struct { uintptr_t handle; void *result; } disp_native_thread;\n\
+         typedef struct disp_mutex_state disp_mutex_state;\n\
+         typedef struct { disp_mutex_state *state; } disp_native_mutex;\n\
+         typedef struct { disp_mutex_state *state; } disp_native_mutex_guard;\n\
+         typedef struct disp_atomic_int_state disp_atomic_int_state;\n\
+         typedef struct { disp_atomic_int_state *state; } disp_native_atomic_int;\n",
     );
     for instance in &mono_program.types {
         writeln!(
@@ -260,6 +266,7 @@ fn dependencies(program: &hir::Program, ty: &hir::Type) -> Vec<hir::Type> {
             vec![(**element).clone()]
         }
         hir::Type::Map(key, value) => vec![(**key).clone(), (**value).clone()],
+        hir::Type::Thread(_) | hir::Type::Mutex(_) | hir::Type::MutexGuard(_) => vec![],
         _ => vec![],
     }
 }
@@ -292,6 +299,10 @@ pub fn c_type(ty: &hir::Type) -> String {
         hir::Type::Path => "disp_native_path".into(),
         hir::Type::Instant => "disp_native_instant".into(),
         hir::Type::Duration => "disp_native_duration".into(),
+        hir::Type::Thread(_) => "disp_native_thread".into(),
+        hir::Type::Mutex(_) => "disp_native_mutex".into(),
+        hir::Type::MutexGuard(_) => "disp_native_mutex_guard".into(),
+        hir::Type::AtomicInt => "disp_native_atomic_int".into(),
         hir::Type::Str => "disp_native_str".into(),
         hir::Type::Array(_, _) => name(ty),
         hir::Type::Slice(_) => name(ty),

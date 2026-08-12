@@ -35,6 +35,7 @@ impl ControlFlowGraph {
                 Terminator::Call { next, unwind, .. } => {
                     std::iter::once(*next).chain(*unwind).collect()
                 }
+                Terminator::Spawn { next, .. } => vec![*next],
                 Terminator::Return | Terminator::Unreachable => Vec::new(),
             };
             edges.sort_unstable();

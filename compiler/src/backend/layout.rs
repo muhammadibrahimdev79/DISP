@@ -104,6 +104,12 @@ impl<'a> LayoutEngine<'a> {
                 self.target.pointer_alignment,
                 self.target.pointer_alignment,
             ]),
+            hir::Type::Thread(_) => {
+                aggregate(&[self.target.pointer_alignment, self.target.pointer_alignment])
+            }
+            hir::Type::Mutex(_) | hir::Type::MutexGuard(_) | hir::Type::AtomicInt => {
+                aggregate(&[self.target.pointer_alignment])
+            }
             hir::Type::Instant | hir::Type::Duration => scalar(8, 8),
             hir::Type::Int { width, .. } => {
                 let bytes = u64::from(width.unwrap_or(self.target.pointer_width)) / 8;
@@ -291,6 +297,11 @@ pub fn substitute(ty: &hir::Type, substitutions: &HashMap<String, hir::Type>) ->
         }
         hir::Type::Slice(element) => hir::Type::Slice(Box::new(substitute(element, substitutions))),
         hir::Type::List(element) => hir::Type::List(Box::new(substitute(element, substitutions))),
+        hir::Type::Thread(result) => hir::Type::Thread(Box::new(substitute(result, substitutions))),
+        hir::Type::Mutex(value) => hir::Type::Mutex(Box::new(substitute(value, substitutions))),
+        hir::Type::MutexGuard(value) => {
+            hir::Type::MutexGuard(Box::new(substitute(value, substitutions)))
+        }
         _ => ty.clone(),
     }
 }

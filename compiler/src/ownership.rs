@@ -19,6 +19,10 @@ enum Ty {
     List(Box<Ty>),
     Map(Box<Ty>, Box<Ty>),
     Set(Box<Ty>),
+    Thread(Box<Ty>),
+    Mutex(Box<Ty>),
+    MutexGuard(Box<Ty>),
+    AtomicInt,
     Str,
     Path,
     Instant,
@@ -614,7 +618,7 @@ impl<'a> Analyzer<'a> {
             .expect("resolved place");
         let through_mutable_reference =
             place.fields.first().is_some_and(|field| field == "<deref>")
-                && matches!(slot.ty, Ty::Reference(_, true));
+                && matches!(slot.ty, Ty::Reference(_, true) | Ty::MutexGuard(_));
         if !slot.mutable
             && !through_mutable_reference
             && matches!(
@@ -750,7 +754,9 @@ impl<'a> Analyzer<'a> {
                 Ok(Ty::Reference(Box::new(ty), *mutable))
             }
             Expression::Dereference(target) => match self.check_expr(target, UseMode::Read)? {
-                Ty::Reference(inner, _) | Ty::RawPointer(inner, _) => Ok(*inner),
+                Ty::Reference(inner, _) | Ty::RawPointer(inner, _) | Ty::MutexGuard(inner) => {
+                    Ok(*inner)
+                }
                 _ => Err(Diagnostic::new(
                     DiagnosticKind::Type,
                     "cannot dereference this value",
@@ -786,6 +792,18 @@ impl<'a> Analyzer<'a> {
             }
             Expression::Call { callee, arguments } => {
                 self.check_call(callee, arguments, expression.span)
+            }
+            Expression::Spawn(task) => {
+                let Expression::Call { callee, arguments } = &task.node else {
+                    return Err(Diagnostic::new(
+                        DiagnosticKind::Type,
+                        "`spawn` requires a direct function call",
+                        task.span,
+                    ));
+                };
+                Ok(Ty::Thread(Box::new(
+                    self.check_call(callee, arguments, task.span)?,
+                )))
             }
             Expression::Match { value, arms } => {
                 let matched = self.check_expr(value, UseMode::Consume)?;
@@ -949,6 +967,20 @@ impl<'a> Analyzer<'a> {
                 }
                 return Ok(Ty::List(Box::new(Ty::Owned("inferred".into()))));
             }
+            if matches!(&object.node, Expression::Identifier(name) if name == "Mutex")
+                && field == "new"
+                && arguments.len() == 1
+            {
+                let value = self.check_expr(&arguments[0], UseMode::Consume)?;
+                return Ok(Ty::Mutex(Box::new(value)));
+            }
+            if matches!(&object.node, Expression::Identifier(name) if name == "AtomicInt")
+                && field == "new"
+                && arguments.len() == 1
+            {
+                self.check_expr(&arguments[0], UseMode::Read)?;
+                return Ok(Ty::AtomicInt);
+            }
             if matches!(&object.node, Expression::Identifier(name) if name == "Map") {
                 for argument in arguments {
                     self.check_expr(
@@ -1004,6 +1036,34 @@ impl<'a> Analyzer<'a> {
             if matches!(self.expr_ty(object), Ok(Ty::Duration)) {
                 self.check_expr(object, UseMode::Read)?;
                 return Ok(Ty::Copy);
+            }
+            if let Ok(Ty::Thread(result)) = self.expr_ty(object)
+                && field == "join"
+                && arguments.is_empty()
+            {
+                self.check_expr(object, UseMode::Consume)?;
+                return Ok(*result);
+            }
+            if let Ok(Ty::Mutex(value)) = self.expr_ty(object) {
+                if field == "share" && arguments.is_empty() {
+                    self.check_expr(object, UseMode::Read)?;
+                    return Ok(Ty::Mutex(value));
+                }
+                if field == "lock" && arguments.is_empty() {
+                    self.check_expr(object, UseMode::Read)?;
+                    return Ok(Ty::MutexGuard(value));
+                }
+            }
+            if matches!(self.expr_ty(object), Ok(Ty::AtomicInt)) {
+                self.check_expr(object, UseMode::Read)?;
+                for argument in arguments {
+                    self.check_expr(argument, UseMode::Read)?;
+                }
+                return Ok(match field.as_str() {
+                    "share" => Ty::AtomicInt,
+                    "store" => Ty::Unit,
+                    _ => Ty::Copy,
+                });
             }
             if let Ok(Ty::Map(key, value)) = self.expr_ty(object) {
                 let method = match field.as_str() {
@@ -1444,7 +1504,10 @@ impl<'a> Analyzer<'a> {
                                 expression.span,
                             ))
                         }
-                    } else if matches!(self.slots[&root].ty, Ty::Reference(_, _)) {
+                    } else if matches!(
+                        self.slots[&root].ty,
+                        Ty::Reference(_, _) | Ty::MutexGuard(_)
+                    ) {
                         Ok(Place {
                             root,
                             fields: vec!["<deref>".into()],
@@ -1497,7 +1560,9 @@ impl<'a> Analyzer<'a> {
         for field in &place.fields {
             if field == "<deref>" {
                 ty = match ty {
-                    Ty::Reference(inner, _) | Ty::RawPointer(inner, _) => *inner,
+                    Ty::Reference(inner, _) | Ty::RawPointer(inner, _) | Ty::MutexGuard(inner) => {
+                        *inner
+                    }
                     other => other,
                 };
                 continue;
@@ -1565,7 +1630,11 @@ impl<'a> Analyzer<'a> {
                 Box::new(self.place(target).and_then(|place| self.place_ty(&place))?),
                 *mutable,
             )),
-            Expression::Move(target) | Expression::Dereference(target) => self.expr_ty(target),
+            Expression::Move(target) => self.expr_ty(target),
+            Expression::Dereference(target) => match self.expr_ty(target)? {
+                Ty::MutexGuard(inner) => Ok(*inner),
+                other => Ok(other),
+            },
             Expression::Integer(_)
             | Expression::Float(_)
             | Expression::Character(_)
@@ -1728,6 +1797,16 @@ impl<'a> Analyzer<'a> {
             "Set" if ty.arguments.len() == 1 => {
                 Ty::Set(Box::new(self.ty_from_name(&ty.arguments[0])))
             }
+            "Thread" if ty.arguments.len() == 1 => {
+                Ty::Thread(Box::new(self.ty_from_name(&ty.arguments[0])))
+            }
+            "Mutex" if ty.arguments.len() == 1 => {
+                Ty::Mutex(Box::new(self.ty_from_name(&ty.arguments[0])))
+            }
+            "MutexGuard" if ty.arguments.len() == 1 => {
+                Ty::MutexGuard(Box::new(self.ty_from_name(&ty.arguments[0])))
+            }
+            "AtomicInt" => Ty::AtomicInt,
             "str" => Ty::Str,
             "Path" => Ty::Path,
             "Instant" => Ty::Instant,
@@ -1771,7 +1850,14 @@ impl<'a> Analyzer<'a> {
             Ty::Result(ok, error) => self.ty_is_copy(ok) && self.ty_is_copy(error),
             Ty::Array(element) => self.ty_is_copy(element),
             Ty::Slice(_) | Ty::Str | Ty::Instant | Ty::Duration => true,
-            Ty::Path | Ty::List(_) | Ty::Map(_, _) | Ty::Set(_) => false,
+            Ty::Path
+            | Ty::List(_)
+            | Ty::Map(_, _)
+            | Ty::Set(_)
+            | Ty::Thread(_)
+            | Ty::Mutex(_)
+            | Ty::MutexGuard(_)
+            | Ty::AtomicInt => false,
             Ty::Owned(name) => self.copy_types.contains(name),
             Ty::Generic(name) => self.generic_copy.contains(name),
             Ty::Unit => true,
@@ -1983,7 +2069,10 @@ fn ty_contains_reference(ty: &Ty) -> bool {
         | Ty::Array(inner)
         | Ty::Slice(inner)
         | Ty::List(inner)
-        | Ty::Set(inner) => ty_contains_reference(inner),
+        | Ty::Set(inner)
+        | Ty::Thread(inner)
+        | Ty::Mutex(inner) => ty_contains_reference(inner),
+        Ty::MutexGuard(_) => false,
         Ty::Map(key, value) => ty_contains_reference(key) || ty_contains_reference(value),
         Ty::Result(ok, error) => ty_contains_reference(ok) || ty_contains_reference(error),
         _ => false,
@@ -2134,6 +2223,7 @@ fn collect_expr_names(expression: &Expr, names: &mut HashSet<String>) {
         }
         Expression::FieldAccess { object, .. }
         | Expression::Try(object)
+        | Expression::Spawn(object)
         | Expression::Move(object)
         | Expression::Dereference(object)
         | Expression::Unary {

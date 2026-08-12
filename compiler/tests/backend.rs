@@ -349,6 +349,10 @@ fn representative_examples_match_the_interpreter_natively() {
             "ownership_example",
             include_str!("../examples/ownership.disp"),
         ),
+        (
+            "concurrency_example",
+            include_str!("../examples/concurrency.disp"),
+        ),
         ("hello_example", include_str!("../hello.disp")),
     ] {
         let expected = run_source(source).unwrap().join("\n") + "\n";

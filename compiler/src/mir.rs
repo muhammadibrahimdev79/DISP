@@ -98,6 +98,14 @@ pub enum Terminator {
         substitutions: Vec<hir::Type>,
         span: Span,
     },
+    Spawn {
+        target: hir::FunctionId,
+        arguments: Vec<Operand>,
+        destination: Place,
+        next: BlockId,
+        substitutions: Vec<hir::Type>,
+        span: Span,
+    },
     Return,
     Unreachable,
 }
@@ -854,6 +862,7 @@ impl<'a> Builder<'a> {
             }
             hir::ExprKind::Function(_) => Ok(Operand::Constant(Constant::Unit)),
             hir::ExprKind::Call(call) => self.lower_call(call, &expr.ty, expr.span),
+            hir::ExprKind::Spawn(call) => self.lower_spawn(call, &expr.ty, expr.span),
             hir::ExprKind::Match { value, arms } => {
                 self.lower_match(value, arms, &expr.ty, expr.span)
             }
@@ -911,6 +920,41 @@ impl<'a> Builder<'a> {
         } else {
             Operand::Move(self.place(destination))
         })
+    }
+
+    fn lower_spawn(
+        &mut self,
+        call: &hir::Call,
+        ty: &hir::Type,
+        span: Span,
+    ) -> Result<Operand, Diagnostic> {
+        let hir::CallTarget::Function(target) = call.target else {
+            return Err(Diagnostic::new(
+                DiagnosticKind::Internal,
+                "MIR lowering received a non-function spawn target",
+                span,
+            ));
+        };
+        let mut arguments = Vec::with_capacity(call.arguments.len());
+        for argument in &call.arguments {
+            arguments.push(self.lower_expr(argument)?);
+        }
+        let destination = self.temp(ty.clone(), span);
+        for argument in &arguments {
+            self.consume_operand(argument, span);
+        }
+        let next = self.new_block();
+        self.terminate(Terminator::Spawn {
+            target,
+            arguments,
+            destination: self.place(destination),
+            next,
+            substitutions: call.substitutions.clone(),
+            span,
+        });
+        self.current = next;
+        self.set_initialized(destination, true, span);
+        Ok(Operand::Move(self.place(destination)))
     }
 
     fn borrow_argument(
@@ -1554,6 +1598,27 @@ pub fn validate(program: &Program) -> Result<(), Diagnostic> {
                         check_block(*x)?;
                     }
                 }
+                Terminator::Spawn {
+                    target,
+                    arguments,
+                    destination,
+                    next,
+                    substitutions: _,
+                    span,
+                } => {
+                    if target.0 >= program.functions.len() {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Internal,
+                            "MIR spawn target is out of range",
+                            *span,
+                        ));
+                    }
+                    check_place(program, function, destination, *span)?;
+                    for argument in arguments {
+                        validate_operand(program, function, argument, *span)?;
+                    }
+                    check_block(*next)?;
+                }
                 Terminator::Return | Terminator::Unreachable => {}
             }
         }
@@ -1582,6 +1647,7 @@ fn check_place(
     for projection in &place.projections {
         ty = match (projection, ty) {
             (Projection::SafeDereference, hir::Type::Reference { inner, .. })
+            | (Projection::SafeDereference, hir::Type::MutexGuard(inner))
             | (Projection::RawDereference, hir::Type::RawPointer { inner, .. }) => *inner,
             (Projection::Field(index), hir::Type::Struct(id, _)) => program
                 .structs
@@ -1709,7 +1775,7 @@ fn validate_rvalue(
                 matches!(x.projections.first(), Some(Projection::SafeDereference))
                     && matches!(
                         function.locals[x.local.0].ty,
-                        hir::Type::Reference { mutable: true, .. }
+                        hir::Type::Reference { mutable: true, .. } | hir::Type::MutexGuard(_)
                     );
             if !function.locals[x.local.0].mutable && !through_mutable_reference {
                 return Err(Diagnostic::new(
@@ -1783,7 +1849,9 @@ pub fn moved_places(function: &Function) -> HashSet<Place> {
                 collect_moved(value, &mut moved);
             }
         }
-        if let Terminator::Call { arguments, .. } = &block.terminator {
+        if let Terminator::Call { arguments, .. } | Terminator::Spawn { arguments, .. } =
+            &block.terminator
+        {
             for argument in arguments {
                 if let Operand::Move(place) = argument {
                     moved.insert(place.clone());

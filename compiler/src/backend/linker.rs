@@ -7,30 +7,29 @@ pub fn compile_and_link(
     executable: &Path,
     optimized: bool,
 ) -> Result<(), Diagnostic> {
-    run_gcc(
-        &[
-            "-std=c11",
-            if optimized { "-O2" } else { "-O0" },
-            "-g",
-            "-ffunction-sections",
-            "-fdata-sections",
-            "-c",
-            path(c_source)?,
-            "-o",
-            path(object)?,
-        ],
-        "C compilation",
-    )?;
-    run_gcc(
-        &[
-            path(object)?,
-            "-o",
-            path(executable)?,
-            "-Wl,--gc-sections",
-            "-lm",
-        ],
-        "native linking",
-    )
+    let mut compile = vec![
+        "-std=c11",
+        if optimized { "-O2" } else { "-O0" },
+        "-g",
+        "-ffunction-sections",
+        "-fdata-sections",
+    ];
+    if !cfg!(windows) {
+        compile.push("-pthread");
+    }
+    compile.extend(["-c", path(c_source)?, "-o", path(object)?]);
+    run_gcc(&compile, "C compilation")?;
+    let mut link = vec![
+        path(object)?,
+        "-o",
+        path(executable)?,
+        "-Wl,--gc-sections",
+        "-lm",
+    ];
+    if !cfg!(windows) {
+        link.push("-pthread");
+    }
+    run_gcc(&link, "native linking")
 }
 
 fn path(path: &Path) -> Result<&str, Diagnostic> {

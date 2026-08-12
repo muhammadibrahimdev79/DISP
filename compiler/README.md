@@ -15,6 +15,8 @@ Implemented executable subset:
 - ownership, moves, Copy validation, safe references, NLL-style borrow checking, and drop facts
 - typed/resolved HIR with stable semantic identities and source spans
 - ownership-explicit MIR with basic blocks, calls, moves, copies, borrows, drop flags, and cleanup
+- typed native threads with owned `spawn`, consuming `join`, Send-style boundary checks, and deterministic joining
+- explicitly shared `Mutex<T>`, owning lock guards, and checked sequentially consistent `AtomicInt`
 - CFG predecessor/successor, reachability, reverse-postorder, and back-edge analysis
 - checked integer arithmetic and an explicit `disp interpret` semantic oracle
 - deterministic monomorphization, target-aware layouts, ABI classification, and native MIR lowering
