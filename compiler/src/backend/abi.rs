@@ -51,8 +51,13 @@ pub fn lower(
             let ty = layout::substitute(&local.ty, &substitutions);
             arguments.push(classify(&ty, &engine.layout(&ty)?, target));
         }
-        let result_ty =
+        let declared_result =
             layout::substitute(&function.locals[function.return_local.0].ty, &substitutions);
+        let result_ty = if function.asynchronous {
+            hir::Type::Future(Box::new(declared_result))
+        } else {
+            declared_result
+        };
         let result = classify(&result_ty, &engine.layout(&result_ty)?, target);
         functions.insert(instance.clone(), FunctionAbi { arguments, result });
     }

@@ -40,6 +40,7 @@ pub enum Type {
     Map(Box<Type>, Box<Type>),
     Set(Box<Type>),
     Thread(Box<Type>),
+    Future(Box<Type>),
     Mutex(Box<Type>),
     MutexGuard(Box<Type>),
     AtomicInt,
@@ -84,6 +85,7 @@ impl Type {
             | Self::Map(_, _)
             | Self::Set(_)
             | Self::Thread(_)
+            | Self::Future(_)
             | Self::Mutex(_)
             | Self::MutexGuard(_)
             | Self::AtomicInt
@@ -165,6 +167,7 @@ pub struct Function {
     pub name: String,
     pub parameters: Vec<LocalId>,
     pub capture_count: usize,
+    pub asynchronous: bool,
     pub locals: Vec<Local>,
     pub return_type: Type,
     pub body: Block,
@@ -296,6 +299,7 @@ pub enum ExprKind {
         arms: Vec<MatchArm>,
     },
     Try(Box<Expr>),
+    Await(Box<Expr>),
     Spawn(Call),
     Move(Place),
     Borrow {
@@ -645,6 +649,7 @@ impl<'a> Lowering<'a> {
             name: function.name.clone(),
             parameters,
             capture_count: 0,
+            asynchronous: function.asynchronous,
             locals: cx.locals,
             return_type,
             body,
@@ -784,6 +789,12 @@ impl<'a> Lowering<'a> {
                     .unwrap_or(Type::Unknown),
             )),
             "Thread" => Type::Thread(Box::new(
+                ty.arguments
+                    .first()
+                    .map(|x| self.lower_type(x))
+                    .unwrap_or(Type::Unknown),
+            )),
+            "Future" => Type::Future(Box::new(
                 ty.arguments
                     .first()
                     .map(|x| self.lower_type(x))
@@ -1293,6 +1304,7 @@ impl FunctionLowering<'_, '_> {
                     name: format!("@closure{}", id.0),
                     parameters: parameter_ids,
                     capture_count,
+                    asynchronous: false,
                     locals: closure.locals,
                     return_type: result.clone(),
                     body: closure_body,
@@ -1415,12 +1427,19 @@ impl FunctionLowering<'_, '_> {
                                 .iter()
                                 .map(|x| self.lower_type(&x.ty))
                                 .collect(),
-                            Box::new(
+                            Box::new(if f.asynchronous {
+                                Type::Future(Box::new(
+                                    f.return_type
+                                        .as_ref()
+                                        .map(|x| self.lower_type(x))
+                                        .unwrap_or(Type::Unit),
+                                ))
+                            } else {
                                 f.return_type
                                     .as_ref()
                                     .map(|x| self.lower_type(x))
-                                    .unwrap_or(Type::Unit),
-                            ),
+                                    .unwrap_or(Type::Unit)
+                            }),
                         ),
                     )
                 } else if let Some((enum_id, variant_id)) = self.find_variant(name) {
@@ -1620,6 +1639,14 @@ impl FunctionLowering<'_, '_> {
                 };
                 (ExprKind::Try(Box::new(x)), ty)
             }
+            ast::Expression::Await(x) => {
+                let x = self.lower_expr(x)?;
+                let ty = match &x.ty {
+                    Type::Future(inner) => (**inner).clone(),
+                    _ => Type::Unknown,
+                };
+                (ExprKind::Await(Box::new(x)), ty)
+            }
             ast::Expression::Spawn(task) => {
                 let ast::Expression::Call { callee, arguments } = &task.node else {
                     return Err(Diagnostic::new(
@@ -1655,6 +1682,18 @@ impl FunctionLowering<'_, '_> {
     ) -> Result<Expr, Diagnostic> {
         if let ast::Expression::FieldAccess { object, field, .. } = &callee.node {
             if let ast::Expression::Identifier(owner) = &object.node {
+                if owner == "Async" {
+                    return Ok(Expr {
+                        kind: ExprKind::Call(Call {
+                            target: CallTarget::Intrinsic(format!("Async.{field}")),
+                            arguments: vec![],
+                            receiver: None,
+                            substitutions: vec![],
+                        }),
+                        ty: Type::Future(Box::new(Type::Unit)),
+                        span,
+                    });
+                }
                 if owner == "String" {
                     let args = arguments
                         .iter()
@@ -2627,7 +2666,10 @@ impl FunctionLowering<'_, '_> {
                     .map(|generic| generic.name.clone())
                     .zip(substitutions.iter().cloned())
                     .collect::<HashMap<_, _>>();
-                let ty = substitute_type(&declared, &mapping);
+                let mut ty = substitute_type(&declared, &mapping);
+                if function.asynchronous {
+                    ty = Type::Future(Box::new(ty));
+                }
                 return Ok(Expr {
                     kind: ExprKind::Call(Call {
                         target: CallTarget::Function(target),
@@ -2978,11 +3020,21 @@ impl FunctionLowering<'_, '_> {
                             method: method_index,
                         },
                         mode,
-                        method
-                            .return_type
-                            .as_ref()
-                            .map(|ty| self.lower_type(ty))
-                            .unwrap_or(Type::Unit),
+                        if method.asynchronous {
+                            Type::Future(Box::new(
+                                method
+                                    .return_type
+                                    .as_ref()
+                                    .map(|ty| self.lower_type(ty))
+                                    .unwrap_or(Type::Unit),
+                            ))
+                        } else {
+                            method
+                                .return_type
+                                .as_ref()
+                                .map(|ty| self.lower_type(ty))
+                                .unwrap_or(Type::Unit)
+                        },
                         vec![],
                     ));
                 }
@@ -3055,14 +3107,25 @@ impl FunctionLowering<'_, '_> {
                 return Some((
                     CallTarget::Function(self.root.method_ids[&(impl_index, method_index)]),
                     mode,
-                    substitute_type(
-                        &method
-                            .return_type
-                            .as_ref()
-                            .map(|x| self.lower_type(x))
-                            .unwrap_or(Type::Unit),
-                        &substitution_map,
-                    ),
+                    if method.asynchronous {
+                        Type::Future(Box::new(substitute_type(
+                            &method
+                                .return_type
+                                .as_ref()
+                                .map(|x| self.lower_type(x))
+                                .unwrap_or(Type::Unit),
+                            &substitution_map,
+                        )))
+                    } else {
+                        substitute_type(
+                            &method
+                                .return_type
+                                .as_ref()
+                                .map(|x| self.lower_type(x))
+                                .unwrap_or(Type::Unit),
+                            &substitution_map,
+                        )
+                    },
                     substitutions,
                 ));
             }
@@ -3122,6 +3185,7 @@ fn surface_type_is_copy(ty: &Type) -> bool {
         | Type::Map(_, _)
         | Type::Set(_)
         | Type::Thread(_)
+        | Type::Future(_)
         | Type::Mutex(_)
         | Type::MutexGuard(_)
         | Type::AtomicInt
@@ -3234,9 +3298,10 @@ fn infer_named_type(
         | Type::Slice(element)
         | Type::List(element)
         | Type::Option(element) => std::slice::from_ref(element),
-        Type::Thread(element) | Type::Mutex(element) | Type::MutexGuard(element) => {
-            std::slice::from_ref(element)
-        }
+        Type::Thread(element)
+        | Type::Future(element)
+        | Type::Mutex(element)
+        | Type::MutexGuard(element) => std::slice::from_ref(element),
         _ => &[],
     };
     for (template, actual) in template.arguments.iter().zip(actual_arguments) {
@@ -3279,7 +3344,9 @@ fn infer_hir_type(pattern: &Type, concrete: &Type, inferred: &mut HashMap<String
             infer_hir_type(ak, bk, inferred) && infer_hir_type(av, bv, inferred)
         }
         (Type::Set(x), Type::Set(y)) => infer_hir_type(x, y, inferred),
-        (Type::Thread(x), Type::Thread(y)) => infer_hir_type(x, y, inferred),
+        (Type::Thread(x), Type::Thread(y)) | (Type::Future(x), Type::Future(y)) => {
+            infer_hir_type(x, y, inferred)
+        }
         (Type::Mutex(x), Type::Mutex(y)) | (Type::MutexGuard(x), Type::MutexGuard(y)) => {
             infer_hir_type(x, y, inferred)
         }
@@ -3350,6 +3417,7 @@ pub(crate) fn substitute_type(ty: &Type, substitutions: &HashMap<String, Type>) 
         ),
         Type::Set(inner) => Type::Set(Box::new(substitute_type(inner, substitutions))),
         Type::Thread(inner) => Type::Thread(Box::new(substitute_type(inner, substitutions))),
+        Type::Future(inner) => Type::Future(Box::new(substitute_type(inner, substitutions))),
         Type::Mutex(inner) => Type::Mutex(Box::new(substitute_type(inner, substitutions))),
         Type::MutexGuard(inner) => {
             Type::MutexGuard(Box::new(substitute_type(inner, substitutions)))
@@ -3395,6 +3463,7 @@ fn fill_unknown(actual: &mut Type, expected: &Type) {
         }
         (Type::Set(actual), Type::Set(expected)) => fill_unknown(actual, expected),
         (Type::Thread(actual), Type::Thread(expected)) => fill_unknown(actual, expected),
+        (Type::Future(actual), Type::Future(expected)) => fill_unknown(actual, expected),
         (Type::Mutex(actual), Type::Mutex(expected))
         | (Type::MutexGuard(actual), Type::MutexGuard(expected)) => fill_unknown(actual, expected),
         (Type::Result(actual_ok, actual_error), Type::Result(expected_ok, expected_error)) => {
@@ -3578,6 +3647,7 @@ fn validate_semantics_expr(expr: &Expr, functions: usize) -> Result<(), Diagnost
         }
         ExprKind::Field { object, .. }
         | ExprKind::Try(object)
+        | ExprKind::Await(object)
         | ExprKind::Dereference(object, _)
         | ExprKind::Unary {
             operand: object, ..
@@ -3611,6 +3681,7 @@ fn contains_unknown(ty: &Type) -> bool {
         | Type::Slice(inner)
         | Type::List(inner)
         | Type::Thread(inner) => contains_unknown(inner),
+        Type::Future(inner) => contains_unknown(inner),
         Type::Map(key, value) => contains_unknown(key) || contains_unknown(value),
         Type::Set(inner) => contains_unknown(inner),
         Type::Result(ok, error) => contains_unknown(ok) || contains_unknown(error),
@@ -3747,6 +3818,7 @@ fn validate_expr(expr: &Expr, locals: usize) -> Result<(), Diagnostic> {
         }
         ExprKind::Field { object, .. }
         | ExprKind::Try(object)
+        | ExprKind::Await(object)
         | ExprKind::Dereference(object, _)
         | ExprKind::Unary {
             operand: object, ..
@@ -3790,7 +3862,8 @@ pub fn dump(program: &Program) -> String {
     let mut out = String::new();
     for function in &program.functions {
         out.push_str(&format!(
-            "fn{} {}({}) -> {:?} @ {}:{}\n",
+            "{}fn{} {}({}) -> {:?} @ {}:{}\n",
+            if function.asynchronous { "async " } else { "" },
             function.id.0,
             function.name,
             function

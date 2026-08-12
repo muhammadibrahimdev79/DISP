@@ -30,6 +30,7 @@ pub enum Type {
     Map(Box<Type>, Box<Type>),
     Set(Box<Type>),
     Thread(Box<Type>),
+    Future(Box<Type>),
     Mutex(Box<Type>),
     MutexGuard(Box<Type>),
     AtomicInt,
@@ -82,6 +83,7 @@ struct Variable {
 
 #[derive(Debug, Clone)]
 struct Signature {
+    asynchronous: bool,
     generics: Vec<String>,
     constraints: HashMap<String, Vec<String>>,
     parameters: Vec<Type>,
@@ -115,6 +117,7 @@ pub struct TypeChecker {
     implementations: Vec<ImplInfo>,
     external_functions: HashSet<String>,
     unsafe_depth: usize,
+    async_depth: usize,
 }
 
 impl TypeChecker {
@@ -132,6 +135,7 @@ impl TypeChecker {
             implementations: Vec::new(),
             external_functions: HashSet::new(),
             unsafe_depth: 0,
+            async_depth: 0,
         }
     }
 
@@ -263,6 +267,7 @@ impl TypeChecker {
             let mut methods = HashMap::new();
             for method in &declaration.methods {
                 let signature = Signature {
+                    asynchronous: method.asynchronous,
                     generics: method.generics.iter().map(|p| p.name.clone()).collect(),
                     constraints: method
                         .generics
@@ -398,9 +403,24 @@ impl TypeChecker {
                 self.validate_external_signature(function, &parameters, &result)?;
                 self.external_functions.insert(function.name.clone());
             }
+            if function.asynchronous
+                && (parameters.iter().any(type_crosses_thread_by_borrow)
+                    || type_crosses_thread_by_borrow(&result))
+            {
+                return Err(Diagnostic::new(
+                    DiagnosticKind::Type,
+                    format!(
+                        "async function `{}` cannot capture a borrowed or raw-pointer type",
+                        function.name
+                    ),
+                    function.span,
+                )
+                .with_help("pass owned data into async functions and return owned results"));
+            }
             self.functions.insert(
                 function.name.clone(),
                 Signature {
+                    asynchronous: function.asynchronous,
                     generics: function.generics.iter().map(|p| p.name.clone()).collect(),
                     constraints: function
                         .generics
@@ -445,6 +465,7 @@ impl TypeChecker {
             for method in &implementation.methods {
                 let expected = trait_info.methods[&method.name].clone();
                 let actual = Signature {
+                    asynchronous: method.asynchronous,
                     generics: method.generics.iter().map(|p| p.name.clone()).collect(),
                     constraints: method
                         .generics
@@ -477,12 +498,13 @@ impl TypeChecker {
                 {
                     substitutions.insert(name.clone(), self.resolve_type(argument)?);
                 }
-                if expected
-                    .parameters
-                    .iter()
-                    .map(|ty| substitute(ty, &substitutions))
-                    .collect::<Vec<_>>()
-                    != actual.parameters
+                if expected.asynchronous != actual.asynchronous
+                    || expected
+                        .parameters
+                        .iter()
+                        .map(|ty| substitute(ty, &substitutions))
+                        .collect::<Vec<_>>()
+                        != actual.parameters
                     || substitute(&expected.result, &substitutions) != actual.result
                 {
                     return Err(Diagnostic::new(
@@ -616,6 +638,23 @@ impl TypeChecker {
         function: &Function,
         signature: Signature,
     ) -> Result<(), Diagnostic> {
+        if function.asynchronous
+            && (signature
+                .parameters
+                .iter()
+                .any(type_crosses_thread_by_borrow)
+                || type_crosses_thread_by_borrow(&signature.result))
+        {
+            return Err(Diagnostic::new(
+                DiagnosticKind::Type,
+                format!(
+                    "async function `{}` cannot capture a borrowed or raw-pointer type",
+                    function.name
+                ),
+                function.span,
+            )
+            .with_help("pass owned data into async functions and return owned results"));
+        }
         self.expected_return = signature.result.clone();
         self.scopes.clear();
         self.begin_scope();
@@ -628,7 +667,10 @@ impl TypeChecker {
                 },
             );
         }
-        let always_returns = self.check_block_contents(&function.body)?;
+        self.async_depth += usize::from(function.asynchronous);
+        let checked = self.check_block_contents(&function.body);
+        self.async_depth -= usize::from(function.asynchronous);
+        let always_returns = checked?;
         if self.expected_return != Type::Unit && !always_returns {
             return Err(Diagnostic::new(
                 DiagnosticKind::Type,
@@ -1128,6 +1170,14 @@ impl TypeChecker {
                         callee.span,
                     ));
                 };
+                if signature.asynchronous {
+                    return Err(Diagnostic::new(
+                        DiagnosticKind::Type,
+                        "`spawn` requires a synchronous function",
+                        callee.span,
+                    )
+                    .with_help("call the async function and `await` its Future instead"));
+                }
                 if self.external_functions.contains(name) {
                     return Err(Diagnostic::new(
                         DiagnosticKind::Type,
@@ -1174,6 +1224,27 @@ impl TypeChecker {
                     ));
                 }
                 Ok(Type::Thread(Box::new(result)))
+            }
+            Expression::Await(future) => {
+                if self.async_depth == 0 {
+                    return Err(Diagnostic::new(
+                        DiagnosticKind::Type,
+                        "`await` is only allowed inside an `async fn`",
+                        expression.span,
+                    )
+                    .with_help("make the enclosing function `async`, or wait at an explicit synchronous boundary"));
+                }
+                match self.check_expression(future)? {
+                    Type::Future(output) => Ok(*output),
+                    other => Err(Diagnostic::new(
+                        DiagnosticKind::Type,
+                        format!(
+                            "`await` requires Future<T>, found {}",
+                            self.format_type(&other)
+                        ),
+                        future.span,
+                    )),
+                }
             }
             Expression::StructConstruct { name, fields, .. } => {
                 let Some(Type::Struct(id, _)) = self.types.get(name).cloned() else {
@@ -1268,7 +1339,11 @@ impl TypeChecker {
                     }
                     return Ok(Type::Function(
                         signature.parameters.clone(),
-                        Box::new(signature.result.clone()),
+                        Box::new(if signature.asynchronous {
+                            Type::Future(Box::new(signature.result.clone()))
+                        } else {
+                            signature.result.clone()
+                        }),
                     ));
                 }
                 if name == "print" {
@@ -1428,6 +1503,21 @@ impl TypeChecker {
                 self.check_binary(*operator, left_type, right_type, expression.span)
             }
             Expression::Call { callee, arguments } => {
+                if let Expression::FieldAccess { object, field, .. } = &callee.node
+                    && matches!(&object.node, Expression::Identifier(name) if name == "Async")
+                {
+                    if field != "yield" || !arguments.is_empty() {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            format!(
+                                "no async operation `Async.{field}` with {} arguments",
+                                arguments.len()
+                            ),
+                            expression.span,
+                        ));
+                    }
+                    return Ok(Type::Future(Box::new(Type::Unit)));
+                }
                 if matches!(callee.node, Expression::FieldAccess { .. })
                     && let Ok(Type::Function(parameters, result)) = self.check_expression(callee)
                 {
@@ -2453,6 +2543,7 @@ impl TypeChecker {
                                 .zip(implementation.trait_arguments.iter().cloned())
                                 .collect();
                             let method = Signature {
+                                asynchronous: method.asynchronous,
                                 generics: method.generics.clone(),
                                 constraints: method.constraints.clone(),
                                 parameters: method
@@ -2526,7 +2617,12 @@ impl TypeChecker {
                             let actual = self.check_expression(argument)?;
                             self.require_same(expected, &actual, argument.span, "method argument")?;
                         }
-                        return Ok(substitute(&method.result, &substitutions));
+                        let result = substitute(&method.result, &substitutions);
+                        return Ok(if method.asynchronous {
+                            Type::Future(Box::new(result))
+                        } else {
+                            result
+                        });
                     }
                     return Err(Diagnostic::new(
                         DiagnosticKind::Type,
@@ -2662,7 +2758,10 @@ impl TypeChecker {
                             }
                         }
                     }
-                    let result = substitute(&signature.result, &substitutions);
+                    let mut result = substitute(&signature.result, &substitutions);
+                    if signature.asynchronous {
+                        result = Type::Future(Box::new(result));
+                    }
                     self.validate_instantiated_type(&result, expression.span)?;
                     return Ok(result);
                 }
@@ -3111,6 +3210,9 @@ impl TypeChecker {
             "Thread" if ty.arguments.len() == 1 => {
                 Type::Thread(Box::new(self.resolve_type(&ty.arguments[0])?))
             }
+            "Future" if ty.arguments.len() == 1 => {
+                Type::Future(Box::new(self.resolve_type(&ty.arguments[0])?))
+            }
             "Mutex" if ty.arguments.len() == 1 => {
                 Type::Mutex(Box::new(self.resolve_type(&ty.arguments[0])?))
             }
@@ -3413,6 +3515,7 @@ impl TypeChecker {
             ),
             Type::Set(element) => format!("Set<{}>", self.format_type(element)),
             Type::Thread(result) => format!("Thread<{}>", self.format_type(result)),
+            Type::Future(result) => format!("Future<{}>", self.format_type(result)),
             Type::Mutex(value) => format!("Mutex<{}>", self.format_type(value)),
             Type::MutexGuard(value) => format!("MutexGuard<{}>", self.format_type(value)),
             Type::AtomicInt => "AtomicInt".into(),
@@ -3498,6 +3601,7 @@ impl TypeChecker {
                         .all(|arm| self.is_constant_expression(&arm.value))
             }
             Expression::Try(_)
+            | Expression::Await(_)
             | Expression::Spawn(_)
             | Expression::Call { .. }
             | Expression::Closure { .. }
@@ -3952,6 +4056,7 @@ fn type_crosses_thread_by_borrow(ty: &Type) -> bool {
         | Type::Set(inner)
         | Type::Option(inner)
         | Type::Thread(inner)
+        | Type::Future(inner)
         | Type::Mutex(inner) => type_crosses_thread_by_borrow(inner),
         Type::Map(key, value) | Type::Result(key, value) => {
             type_crosses_thread_by_borrow(key) || type_crosses_thread_by_borrow(value)

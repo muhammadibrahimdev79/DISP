@@ -20,6 +20,7 @@ enum Ty {
     Map(Box<Ty>, Box<Ty>),
     Set(Box<Ty>),
     Thread(Box<Ty>),
+    Future(Box<Ty>),
     Mutex(Box<Ty>),
     MutexGuard(Box<Ty>),
     AtomicInt,
@@ -122,6 +123,7 @@ enum UseMode {
 
 #[derive(Debug, Clone)]
 struct MethodInfo {
+    asynchronous: bool,
     parameters: Vec<crate::ast::Parameter>,
     return_type: Option<TypeName>,
 }
@@ -1111,6 +1113,10 @@ impl<'a> Analyzer<'a> {
                     self.check_call(callee, arguments, task.span)?,
                 )))
             }
+            Expression::Await(future) => match self.check_expr(future, UseMode::Consume)? {
+                Ty::Future(output) => Ok(*output),
+                _ => Ok(Ty::Owned("future-output".into())),
+            },
             Expression::Match { value, arms } => {
                 let matched = self.check_expr(value, UseMode::Consume)?;
                 let before = self.clone();
@@ -1200,11 +1206,16 @@ impl<'a> Analyzer<'a> {
                     }
                 }
                 self.loans.truncate(temporary_start);
-                return Ok(function
+                let result = function
                     .return_type
                     .as_ref()
                     .map(|ty| self.ty_from_name(ty))
-                    .unwrap_or(Ty::Unit));
+                    .unwrap_or(Ty::Unit);
+                return Ok(if function.asynchronous {
+                    Ty::Future(Box::new(result))
+                } else {
+                    result
+                });
             }
             if matches!(name.as_str(), "Some" | "Ok" | "Err") {
                 let payload = arguments
@@ -1222,6 +1233,13 @@ impl<'a> Analyzer<'a> {
             }
         }
         if let Expression::FieldAccess { object, field, .. } = &callee.node {
+            if matches!(&object.node, Expression::Identifier(name) if name == "Async") {
+                return Ok(if field == "yield" {
+                    Ty::Future(Box::new(Ty::Unit))
+                } else {
+                    Ty::Unit
+                });
+            }
             if let Expression::Identifier(owner) = &object.node
                 && matches!(
                     owner.as_str(),
@@ -1670,11 +1688,16 @@ impl<'a> Analyzer<'a> {
                     )?;
                 }
                 self.loans.truncate(temporary_start);
-                return Ok(method
+                let result = method
                     .return_type
                     .as_ref()
                     .map(|ty| self.ty_from_name(ty))
-                    .unwrap_or(Ty::Unit));
+                    .unwrap_or(Ty::Unit);
+                return Ok(if method.asynchronous {
+                    Ty::Future(Box::new(result))
+                } else {
+                    result
+                });
             }
             self.check_expr(object, UseMode::Read)?;
         } else {
@@ -2233,6 +2256,7 @@ impl<'a> Analyzer<'a> {
             | Ty::List(inner)
             | Ty::Set(inner)
             | Ty::Thread(inner)
+            | Ty::Future(inner)
             | Ty::Mutex(inner)
             | Ty::MutexGuard(inner) => self.ty_contains_function_inner(inner, visiting),
             Ty::Map(key, value) | Ty::Result(key, value) => {
@@ -2371,6 +2395,7 @@ impl<'a> Analyzer<'a> {
                     })
                 {
                     return Some(MethodInfo {
+                        asynchronous: method.asynchronous,
                         parameters: method.parameters.clone(),
                         return_type: method.return_type.clone(),
                     });
@@ -2397,6 +2422,7 @@ impl<'a> Analyzer<'a> {
                     .find(|method| method.name == name)
             })
             .map(|method| MethodInfo {
+                asynchronous: method.asynchronous,
                 parameters: method.parameters.clone(),
                 return_type: method.return_type.clone(),
             })
@@ -2432,6 +2458,9 @@ impl<'a> Analyzer<'a> {
             }
             "Thread" if ty.arguments.len() == 1 => {
                 Ty::Thread(Box::new(self.ty_from_name(&ty.arguments[0])))
+            }
+            "Future" if ty.arguments.len() == 1 => {
+                Ty::Future(Box::new(self.ty_from_name(&ty.arguments[0])))
             }
             "Mutex" if ty.arguments.len() == 1 => {
                 Ty::Mutex(Box::new(self.ty_from_name(&ty.arguments[0])))
@@ -2495,6 +2524,7 @@ impl<'a> Analyzer<'a> {
             | Ty::Map(_, _)
             | Ty::Set(_)
             | Ty::Thread(_)
+            | Ty::Future(_)
             | Ty::Mutex(_)
             | Ty::MutexGuard(_)
             | Ty::AtomicInt
@@ -2750,6 +2780,7 @@ fn ty_contains_reference(ty: &Ty) -> bool {
         | Ty::List(inner)
         | Ty::Set(inner)
         | Ty::Thread(inner)
+        | Ty::Future(inner)
         | Ty::Mutex(inner) => ty_contains_reference(inner),
         Ty::MutexGuard(_) => false,
         Ty::Map(key, value) => ty_contains_reference(key) || ty_contains_reference(value),
@@ -2770,6 +2801,7 @@ fn ty_contains_mutable_reference(ty: &Ty) -> bool {
         | Ty::List(inner)
         | Ty::Set(inner)
         | Ty::Thread(inner)
+        | Ty::Future(inner)
         | Ty::Mutex(inner) => ty_contains_mutable_reference(inner),
         Ty::Map(key, value) | Ty::Result(key, value) => {
             ty_contains_mutable_reference(key) || ty_contains_mutable_reference(value)
@@ -2931,6 +2963,7 @@ fn collect_expr_names(expression: &Expr, names: &mut HashSet<String>) {
         }
         Expression::FieldAccess { object, .. }
         | Expression::Try(object)
+        | Expression::Await(object)
         | Expression::Spawn(object)
         | Expression::Move(object)
         | Expression::Dereference(object)

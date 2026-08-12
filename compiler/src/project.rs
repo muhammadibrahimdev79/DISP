@@ -1582,6 +1582,7 @@ impl<'a> Renamer<'a> {
                 }
             }
             Expression::Try(value)
+            | Expression::Await(value)
             | Expression::Spawn(value)
             | Expression::Move(value)
             | Expression::Dereference(value)

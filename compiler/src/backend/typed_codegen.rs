@@ -10,7 +10,7 @@ use super::{
 };
 use crate::{ast, diagnostics::Diagnostic, hir, mir};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     fmt::Write,
 };
 
@@ -54,13 +54,25 @@ pub fn generate(
     for instance in &instances.instances {
         function(program, instance, &mut output)?;
     }
-    writeln!(
-        output,
-        "int main(void){{{} result={}();(void)result;return 0;}}",
-        native_types::c_type(&hir::Type::Unit),
-        mono::mangle(program, &instances.entry)
-    )
-    .unwrap();
+    let entry_function = &program.functions[instances.entry.function.0];
+    if entry_function.asynchronous {
+        let substitutions = mono::mapping(entry_function, &instances.entry);
+        let result = c_local_type(entry_function, entry_function.return_local, &substitutions);
+        writeln!(
+            output,
+            "int main(void){{disp_native_future future={}();{result} result=({result}){{0}};disp_future_wait(&future,&result,0,0);(void)result;return 0;}}",
+            mono::mangle(program, &instances.entry)
+        )
+        .unwrap();
+    } else {
+        writeln!(
+            output,
+            "int main(void){{{} result={}();(void)result;return 0;}}",
+            native_types::c_type(&hir::Type::Unit),
+            mono::mangle(program, &instances.entry)
+        )
+        .unwrap();
+    }
     Ok(Some(output))
 }
 
@@ -121,7 +133,12 @@ fn callable_drop_name(program: &mir::Program, target: &mono::FunctionInstance) -
 fn callable_wrapper(program: &mir::Program, target: &mono::FunctionInstance, output: &mut String) {
     let function = &program.functions[target.function.0];
     let substitutions = mono::mapping(function, target);
-    let result = substitute(&function.locals[function.return_local.0].ty, &substitutions);
+    let declared_result = substitute(&function.locals[function.return_local.0].ty, &substitutions);
+    let result = if function.asynchronous {
+        hir::Type::Future(Box::new(declared_result))
+    } else {
+        declared_result
+    };
     if function.capture_count > 0 {
         let environment = callable_env_name(program, target);
         writeln!(output, "typedef struct {environment} {{").unwrap();
@@ -319,6 +336,7 @@ pub fn supported(program: &mir::Program, ty: &hir::Type) -> bool {
         | hir::Type::Float { .. } => true,
         hir::Type::AtomicInt => true,
         hir::Type::Thread(result) => supported(program, result),
+        hir::Type::Future(result) => supported(program, result),
         hir::Type::Mutex(value) | hir::Type::MutexGuard(value) => supported(program, value),
         hir::Type::Struct(id, arguments) => {
             let declaration = &program.structs[id.0];
@@ -371,7 +389,9 @@ pub fn supported(program: &mir::Program, ty: &hir::Type) -> bool {
 fn prototype(program: &mir::Program, instance: &mono::FunctionInstance, output: &mut String) {
     let function = &program.functions[instance.function.0];
     let substitutions = mono::mapping(function, instance);
-    let result = if function.external.is_some()
+    let result = if function.asynchronous {
+        "disp_native_future".into()
+    } else if function.external.is_some()
         && matches!(function.locals[function.return_local.0].ty, hir::Type::Unit)
     {
         "void".into()
@@ -419,11 +439,15 @@ fn function(
         return Ok(());
     }
     let substitutions = mono::mapping(function, instance);
+    if function.asynchronous {
+        return async_function(program, function, instance, &substitutions, output);
+    }
+    let symbol = mono::mangle(program, instance);
     write!(
         output,
         "static {} {}(",
         c_local_type(function, function.return_local, &substitutions),
-        mono::mangle(program, instance)
+        symbol
     )
     .unwrap();
     for index in 0..function.argument_count {
@@ -472,10 +496,145 @@ fn function(
             instance,
             &block.terminator,
             &substitutions,
+            (false, index),
             output,
         )?;
     }
     output.push_str("}\n");
+    Ok(())
+}
+
+fn async_function(
+    program: &mir::Program,
+    function: &mir::Function,
+    instance: &mono::FunctionInstance,
+    substitutions: &HashMap<String, hir::Type>,
+    output: &mut String,
+) -> Result<(), Diagnostic> {
+    let symbol = mono::mangle(program, instance);
+    let context = format!("{symbol}_future_context");
+    let result = c_local_type(function, function.return_local, substitutions);
+    writeln!(output, "typedef struct {context} {{bool started;size_t pc;").unwrap();
+    for local in &function.locals {
+        writeln!(
+            output,
+            "{} l{};",
+            native_types::c_type(&substitute(&local.ty, substitutions)),
+            local.id.0
+        )
+        .unwrap();
+    }
+    writeln!(output, "}} {context};").unwrap();
+    for local in &function.locals {
+        writeln!(output, "#define l{} (context->l{})", local.id.0, local.id.0).unwrap();
+    }
+    writeln!(
+        output,
+        "static bool {symbol}_future_poll(void *raw,void *_output){{{context} *context=({context}*)raw;if(!context->started){{context->started=true;goto bb0;}}switch(context->pc){{"
+    )
+    .unwrap();
+    for index in 0..function.blocks.len() {
+        writeln!(output, "case {index}:goto bb{index};").unwrap();
+    }
+    output.push_str("default:dv_panic(\"invalid async resume state\",0,0);return false;}\n");
+    for (index, block) in function.blocks.iter().enumerate() {
+        writeln!(output, "bb{index}:;").unwrap();
+        for statement in &block.statements {
+            emit_statement(
+                program,
+                function,
+                instance,
+                statement,
+                substitutions,
+                output,
+            )?;
+        }
+        terminator(
+            program,
+            function,
+            instance,
+            &block.terminator,
+            substitutions,
+            (true, index),
+            output,
+        )?;
+    }
+    output.push_str("}\n");
+
+    writeln!(
+        output,
+        "static void {symbol}_future_drop(void *raw){{{context} *context=({context}*)raw;"
+    )
+    .unwrap();
+    let mut emitted = HashSet::new();
+    for block in &function.blocks {
+        for statement in &block.statements {
+            if let mir::StatementKind::Drop {
+                place,
+                flag: Some(flag),
+            } = &statement.kind
+                && emitted.insert((place.clone(), *flag))
+            {
+                let ty = place_ty(program, function, place, substitutions);
+                let action = drop_value(
+                    program,
+                    &place_expr(program, function, place, substitutions),
+                    &ty,
+                );
+                if !action.is_empty() {
+                    writeln!(output, "if(l{}){{{action}}}", flag.0).unwrap();
+                }
+            }
+        }
+    }
+    output.push_str("disp_dealloc(context);}\n");
+    for local in &function.locals {
+        writeln!(output, "#undef l{}", local.id.0).unwrap();
+    }
+
+    write!(output, "static disp_native_future {symbol}(").unwrap();
+    for index in 0..function.argument_count {
+        if index > 0 {
+            output.push(',');
+        }
+        write!(
+            output,
+            "{} a{}",
+            c_local_type(function, mir::LocalId(index + 1), substitutions),
+            index + 1
+        )
+        .unwrap();
+    }
+    writeln!(
+        output,
+        "){{{context} *context=({context}*)disp_alloc_zeroed(1,sizeof({context}),_Alignof({context}));"
+    )
+    .unwrap();
+    for index in 0..function.argument_count {
+        writeln!(output, "context->l{}=a{};", index + 1, index + 1).unwrap();
+    }
+    let mut argument_flags = HashSet::new();
+    for block in &function.blocks {
+        for statement in &block.statements {
+            if let mir::StatementKind::Drop {
+                place,
+                flag: Some(flag),
+            } = &statement.kind
+                && place.projections.is_empty()
+                && place.local.0 > 0
+                && place.local.0 <= function.argument_count
+                && argument_flags.insert(*flag)
+            {
+                writeln!(output, "context->l{}=true;", flag.0).unwrap();
+            }
+        }
+    }
+    writeln!(
+        output,
+        "return (disp_native_future){{.context=context,.poll={symbol}_future_poll,.drop={symbol}_future_drop}};}}"
+    )
+    .unwrap();
+    let _ = result;
     Ok(())
 }
 
@@ -549,8 +708,10 @@ fn terminator(
     instance: &mono::FunctionInstance,
     terminator: &mir::Terminator,
     substitutions: &HashMap<String, hir::Type>,
+    emission: (bool, usize),
     output: &mut String,
 ) -> Result<(), Diagnostic> {
+    let (async_poll, block_index) = emission;
     match terminator {
         mir::Terminator::Goto(block) => writeln!(output, "goto bb{};", block.0).unwrap(),
         mir::Terminator::SwitchBool {
@@ -623,6 +784,9 @@ fn terminator(
         } => {
             let destination_ty = place_ty(program, function, destination, substitutions);
             let call = match target {
+                hir::CallTarget::Intrinsic(name) if name == "Async.yield" => {
+                    "disp_future_yield()".into()
+                }
                 hir::CallTarget::Callable => {
                     let callable_ty = operand_ty(program, function, &arguments[0], substitutions);
                     let hir::Type::Function(parameters, result) = &callable_ty else {
@@ -1578,6 +1742,37 @@ fn terminator(
             )
             .unwrap();
         }
+        mir::Terminator::Await {
+            future,
+            destination,
+            next,
+            span,
+        } => {
+            let future_ty = operand_ty(program, function, future, substitutions);
+            let future = operand(program, function, future, &future_ty, substitutions);
+            let destination = place_expr(program, function, destination, substitutions);
+            if async_poll {
+                writeln!(
+                    output,
+                    "if(!({future}).poll(({future}).context,&({destination}))){{context->pc={block_index};return false;}}if(({future}).drop)({future}).drop(({future}).context);({future})=(disp_native_future){{0}};goto bb{};",
+                    next.0
+                )
+                .unwrap();
+            } else {
+                writeln!(
+                    output,
+                    "disp_future_wait(&({future}),&({destination}),{},{});goto bb{};",
+                    span.start.line, span.start.column, next.0
+                )
+                .unwrap();
+            }
+        }
+        mir::Terminator::Return if async_poll => writeln!(
+            output,
+            "*({}*)_output=l0;return true;",
+            c_local_type(function, function.return_local, substitutions)
+        )
+        .unwrap(),
         mir::Terminator::Return => output.push_str("return l0;\n"),
         mir::Terminator::Unreachable => {
             output.push_str("dv_panic(\"entered unreachable MIR block\",0,0);\n")
@@ -2621,6 +2816,9 @@ fn drop_value_depth(program: &mir::Program, value: &str, ty: &hir::Type, depth: 
         }
         hir::Type::Function(_, _) => format!(
             "{{if(({value}).drop)({value}).drop(({value}).env);({value})=(disp_native_callable){{0}};}}"
+        ),
+        hir::Type::Future(_) => format!(
+            "{{if(({value}).drop)({value}).drop(({value}).context);({value})=(disp_native_future){{0}};}}"
         ),
         _ => String::new(),
     }

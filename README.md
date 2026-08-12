@@ -14,7 +14,10 @@ code generation, first-class functions and ownership-safe closures, algebraic
 data types, generics and traits, strings, slices,
 lists, maps, sets, iteration, paths, filesystem operations, and time
 foundations, native concurrency, checked C interoperability, explicit system-memory
-control, deterministic multi-file modules, and content-locked local package dependencies. The implementation
+control, deterministic multi-file modules, content-locked local package dependencies,
+and lazy owned `Future<T>` values compiled to resumable native `async fn` state machines.
+`await` is available inside async functions, `Async.yield()` provides cooperative suspension,
+and an `async fn main()` is driven automatically. The implementation
 remains under active development and should not
 yet be treated as a stable production language.
 

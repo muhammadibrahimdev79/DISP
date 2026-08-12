@@ -88,6 +88,42 @@ impl PartialEq for RuntimeThread {
 }
 
 #[derive(Clone)]
+struct RuntimeFuture(Arc<StdMutex<Option<FutureWork>>>);
+
+enum FutureWork {
+    Function(Box<Function>, Vec<Value>),
+    Yield,
+}
+
+impl RuntimeFuture {
+    fn new(function: Function, arguments: Vec<Value>) -> Self {
+        Self(Arc::new(StdMutex::new(Some(FutureWork::Function(
+            Box::new(function),
+            arguments,
+        )))))
+    }
+
+    fn yielding() -> Self {
+        Self(Arc::new(StdMutex::new(Some(FutureWork::Yield))))
+    }
+}
+
+impl std::fmt::Debug for RuntimeFuture {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("Future")
+            .field(&Arc::as_ptr(&self.0))
+            .finish()
+    }
+}
+
+impl PartialEq for RuntimeFuture {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+#[derive(Clone)]
 struct RuntimeMutex(Arc<RuntimeMutexState>);
 
 struct RuntimeMutexState {
@@ -440,6 +476,7 @@ enum Value {
     Instant(StdInstant),
     Duration(StdDuration),
     Thread(RuntimeThread),
+    Future(RuntimeFuture),
     Mutex(RuntimeMutex),
     MutexGuard(RuntimeMutexGuard),
     AtomicInt(RuntimeAtomicInt),
@@ -578,8 +615,13 @@ impl Interpreter {
             .find(|function| function.name == "main")
             .ok_or_else(|| self.diagnostic("missing `main` function", Span::point(1, 1)))?
             .clone();
-        self.call_function(program, &main, Vec::new(), main.name_span)
+        let result = self
+            .call_function(program, &main, Vec::new(), main.name_span)
             .map_err(RuntimeFault::into_diagnostic)?;
+        if let Value::Future(future) = result {
+            self.await_future(program, future, main.name_span)
+                .map_err(RuntimeFault::into_diagnostic)?;
+        }
         Ok(std::mem::take(
             &mut *self
                 .output
@@ -589,6 +631,22 @@ impl Interpreter {
     }
 
     fn call_function(
+        &mut self,
+        program: &Program,
+        function: &Function,
+        arguments: Vec<Value>,
+        call_span: Span,
+    ) -> RuntimeResult<Value> {
+        if function.asynchronous {
+            return Ok(Value::Future(RuntimeFuture::new(
+                function.clone(),
+                arguments,
+            )));
+        }
+        self.call_function_body(program, function, arguments, call_span)
+    }
+
+    fn call_function_body(
         &mut self,
         program: &Program,
         function: &Function,
@@ -650,6 +708,26 @@ impl Interpreter {
             Ok(Flow::Break | Flow::Continue) => {
                 Err(self.error("loop control escaped a function body", function.body.span))
             }
+        }
+    }
+
+    fn await_future(
+        &mut self,
+        program: &Program,
+        future: RuntimeFuture,
+        span: Span,
+    ) -> RuntimeResult<Value> {
+        let work = future
+            .0
+            .lock()
+            .map_err(|_| self.error("future state is poisoned", span))?
+            .take()
+            .ok_or_else(|| self.error("future has already been awaited", span))?;
+        match work {
+            FutureWork::Function(function, arguments) => {
+                self.call_function_body(program, &function, arguments, span)
+            }
+            FutureWork::Yield => Ok(Value::Unit),
         }
     }
 
@@ -1509,6 +1587,12 @@ impl Interpreter {
                         values: Vec::new(),
                         capacity,
                     });
+                }
+                if let Expression::FieldAccess { object, field, .. } = &callee.node
+                    && matches!(&object.node, Expression::Identifier(name) if name == "Async")
+                    && field == "yield"
+                {
+                    return Ok(Value::Future(RuntimeFuture::yielding()));
                 }
                 if let Expression::FieldAccess { object, field, .. } = &callee.node
                     && let Expression::Identifier(owner) = &object.node
@@ -2709,6 +2793,13 @@ impl Interpreter {
                 }
             }
             Expression::Spawn(task) => self.spawn_task(program, task, expression.span),
+            Expression::Await(future) => {
+                let value = self.consume(program, future)?;
+                let Value::Future(future) = value else {
+                    return Err(self.error("`await` requires a Future", future.span));
+                };
+                self.await_future(program, future, expression.span)
+            }
             Expression::Borrow { mutable, target } => {
                 let place = self
                     .dynamic_place(program, target)?
@@ -3366,6 +3457,7 @@ fn value_type_name(value: &Value) -> &str {
         Value::Instant(_) => "Instant",
         Value::Duration(_) => "Duration",
         Value::Thread(_) => "Thread",
+        Value::Future(_) => "Future",
         Value::Mutex(_) => "Mutex",
         Value::MutexGuard(_) => "MutexGuard",
         Value::AtomicInt(_) => "AtomicInt",
@@ -3421,6 +3513,7 @@ fn value_is_copy(program: &Program, value: &Value) -> bool {
         | Value::Map { .. }
         | Value::Set { .. }
         | Value::Thread(_)
+        | Value::Future(_)
         | Value::Mutex(_)
         | Value::MutexGuard(_)
         | Value::AtomicInt(_)
@@ -3793,6 +3886,7 @@ fn display_value(value: Value) -> String {
         Value::Instant(_) => "<Instant>".into(),
         Value::Duration(value) => format!("{}ns", value.as_nanos()),
         Value::Thread(_) => "<Thread>".into(),
+        Value::Future(_) => "<Future>".into(),
         Value::Mutex(_) => "<Mutex>".into(),
         Value::MutexGuard(_) => "<MutexGuard>".into(),
         Value::AtomicInt(_) => "<AtomicInt>".into(),

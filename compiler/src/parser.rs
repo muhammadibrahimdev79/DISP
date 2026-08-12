@@ -68,7 +68,7 @@ impl Parser {
                     });
                 }
                 enums.push(declaration);
-            } else if self.check(&TokenKind::Fn) {
+            } else if self.check(&TokenKind::Fn) || self.check(&TokenKind::Async) {
                 let declaration = self.parse_function()?;
                 if public {
                     public_items.push(Spanned {
@@ -303,6 +303,7 @@ impl Parser {
     }
 
     fn parse_function_signature(&mut self) -> Result<FunctionSignature, Diagnostic> {
+        let asynchronous = self.match_token(&TokenKind::Async);
         let start = self
             .expect(TokenKind::Fn, "expected trait method or associated type")?
             .span;
@@ -318,6 +319,7 @@ impl Parser {
         self.match_token(&TokenKind::Comma);
         let end = return_type.as_ref().map_or(name_span, |ty| ty.span);
         Ok(FunctionSignature {
+            asynchronous,
             name,
             name_span,
             generics,
@@ -438,6 +440,7 @@ impl Parser {
     }
 
     fn parse_function(&mut self) -> Result<Function, Diagnostic> {
+        let asynchronous = self.match_token(&TokenKind::Async);
         let start = self.expect(TokenKind::Fn, "expected `fn`")?.span;
         let (name, name_span) = self.expect_identifier("expected function name")?;
         let generics = self.parse_generic_parameters()?;
@@ -469,6 +472,7 @@ impl Parser {
         };
         let span = start.through(body.span);
         Ok(Function {
+            asynchronous,
             name,
             name_span,
             generics,
@@ -538,6 +542,7 @@ impl Parser {
             self.match_token(&TokenKind::Semicolon);
             self.match_token(&TokenKind::Comma);
             functions.push(Function {
+                asynchronous: false,
                 name: name.clone(),
                 name_span,
                 generics,
@@ -1082,6 +1087,14 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, Diagnostic> {
+        if self.match_token(&TokenKind::Await) {
+            let start = self.previous().span;
+            let future = self.with_recursion(Self::parse_unary)?;
+            return Ok(Spanned {
+                span: start.through(future.span),
+                node: Expression::Await(Box::new(future)),
+            });
+        }
         if self.match_token(&TokenKind::Spawn) {
             let start = self.previous().span;
             let task = self.with_recursion(Self::parse_unary)?;

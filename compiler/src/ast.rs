@@ -78,6 +78,7 @@ pub struct VariantDeclaration {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Function {
+    pub asynchronous: bool,
     pub name: String,
     pub name_span: Span,
     pub generics: Vec<GenericParameter>,
@@ -112,6 +113,7 @@ pub struct TraitDeclaration {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FunctionSignature {
+    pub asynchronous: bool,
     pub name: String,
     pub name_span: Span,
     pub generics: Vec<GenericParameter>,
@@ -288,6 +290,7 @@ pub enum Expression {
         arms: Vec<MatchArm>,
     },
     Try(Box<Expr>),
+    Await(Box<Expr>),
     Spawn(Box<Expr>),
     Move(Box<Expr>),
     Borrow {
@@ -577,7 +580,7 @@ fn collect_capture_expr(
                 collect_capture_expr(&arm.value, mode, &mut arm_locals, captures);
             }
         }
-        Expression::Try(value) | Expression::Move(value) => {
+        Expression::Try(value) | Expression::Await(value) | Expression::Move(value) => {
             collect_capture_expr(value, CaptureMode::Consume, locals, captures)
         }
         Expression::Spawn(value) => {

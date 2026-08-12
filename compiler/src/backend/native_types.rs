@@ -18,6 +18,7 @@ pub fn generate(
          typedef struct { uint64_t nanos; } disp_native_instant;\n\
          typedef struct { uint64_t nanos; } disp_native_duration;\n\
          typedef struct { uintptr_t handle; void *result; } disp_native_thread;\n\
+         typedef struct { void *context; _Bool (*poll)(void *, void *); void (*drop)(void *); } disp_native_future;\n\
          typedef struct disp_mutex_state disp_mutex_state;\n\
          typedef struct { disp_mutex_state *state; } disp_native_mutex;\n\
          typedef struct { disp_mutex_state *state; } disp_native_mutex_guard;\n\
@@ -269,7 +270,10 @@ fn dependencies(program: &hir::Program, ty: &hir::Type) -> Vec<hir::Type> {
             vec![(**element).clone()]
         }
         hir::Type::Map(key, value) => vec![(**key).clone(), (**value).clone()],
-        hir::Type::Thread(_) | hir::Type::Mutex(_) | hir::Type::MutexGuard(_) => vec![],
+        hir::Type::Thread(_)
+        | hir::Type::Future(_)
+        | hir::Type::Mutex(_)
+        | hir::Type::MutexGuard(_) => vec![],
         _ => vec![],
     }
 }
@@ -306,6 +310,7 @@ pub fn c_type(ty: &hir::Type) -> String {
         hir::Type::Instant => "disp_native_instant".into(),
         hir::Type::Duration => "disp_native_duration".into(),
         hir::Type::Thread(_) => "disp_native_thread".into(),
+        hir::Type::Future(_) => "disp_native_future".into(),
         hir::Type::Mutex(_) => "disp_native_mutex".into(),
         hir::Type::MutexGuard(_) => "disp_native_mutex_guard".into(),
         hir::Type::AtomicInt => "disp_native_atomic_int".into(),

@@ -25,6 +25,7 @@ pub struct Function {
     pub locals: Vec<Local>,
     pub argument_count: usize,
     pub capture_count: usize,
+    pub asynchronous: bool,
     pub return_local: LocalId,
     pub blocks: Vec<BasicBlock>,
     pub span: Span,
@@ -107,6 +108,12 @@ pub enum Terminator {
         destination: Place,
         next: BlockId,
         substitutions: Vec<hir::Type>,
+        span: Span,
+    },
+    Await {
+        future: Operand,
+        destination: Place,
+        next: BlockId,
         span: Span,
     },
     Return,
@@ -285,6 +292,7 @@ impl<'a> Builder<'a> {
             locals: self.locals,
             argument_count: self.function.parameters.len(),
             capture_count: self.function.capture_count,
+            asynchronous: self.function.asynchronous,
             return_local: LocalId(0),
             blocks: self.blocks,
             span: self.function.span,
@@ -915,6 +923,25 @@ impl<'a> Builder<'a> {
                 self.lower_match(value, arms, &expr.ty, expr.span)
             }
             hir::ExprKind::Try(value) => self.lower_try(value, &expr.ty, expr.span),
+            hir::ExprKind::Await(value) => {
+                let future = self.lower_expr(value)?;
+                let consumed = future.clone();
+                let result = self.temp(expr.ty.clone(), expr.span);
+                let await_block = self.new_block();
+                let next = self.new_block();
+                self.terminate(Terminator::Goto(await_block));
+                self.current = await_block;
+                self.terminate(Terminator::Await {
+                    future,
+                    destination: self.place(result),
+                    next,
+                    span: expr.span,
+                });
+                self.current = next;
+                self.consume_operand(&consumed, expr.span);
+                self.set_initialized(result, true, expr.span);
+                Ok(Operand::Move(self.place(result)))
+            }
         }
     }
 
@@ -1754,6 +1781,49 @@ pub fn validate(program: &Program) -> Result<(), Diagnostic> {
                     }
                     check_block(*next)?;
                 }
+                Terminator::Await {
+                    future,
+                    destination,
+                    next,
+                    span,
+                } => {
+                    if !function.asynchronous {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Internal,
+                            "MIR await appears outside an async function",
+                            *span,
+                        ));
+                    }
+                    validate_operand(program, function, future, *span)?;
+                    let future_ty = match future {
+                        Operand::Move(place) | Operand::Copy(place) => {
+                            check_place(program, function, place, *span)?
+                        }
+                        Operand::Constant(_) => {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Internal,
+                                "MIR await operand cannot be a constant",
+                                *span,
+                            ));
+                        }
+                    };
+                    let hir::Type::Future(output) = future_ty else {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Internal,
+                            "MIR await operand is not a Future",
+                            *span,
+                        ));
+                    };
+                    let destination_ty = check_place(program, function, destination, *span)?;
+                    if *output != destination_ty {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Internal,
+                            "MIR await output type does not match its destination",
+                            *span,
+                        ));
+                    }
+                    check_block(*next)?;
+                }
                 Terminator::Return | Terminator::Unreachable => {}
             }
         }
@@ -2038,7 +2108,8 @@ pub fn dump(program: &Program) -> String {
     let mut out = String::new();
     for function in &program.functions {
         out.push_str(&format!(
-            "mir fn{} {} args={} return=_0 @ {}:{}\n",
+            "mir {}fn{} {} args={} return=_0 @ {}:{}\n",
+            if function.asynchronous { "async " } else { "" },
             function.id.0,
             function.name,
             function.argument_count,
@@ -2081,6 +2152,12 @@ pub fn moved_places(function: &Function) -> HashSet<Place> {
                     moved.insert(place.clone());
                 }
             }
+        } else if let Terminator::Await {
+            future: Operand::Move(place),
+            ..
+        } = &block.terminator
+        {
+            moved.insert(place.clone());
         }
     }
     moved

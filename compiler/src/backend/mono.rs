@@ -258,6 +258,9 @@ fn collect_type(
         hir::Type::Thread(result) => {
             collect_type(program, result, types, generic_names)?;
         }
+        hir::Type::Future(result) => {
+            collect_type(program, result, types, generic_names)?;
+        }
         hir::Type::Mutex(value) | hir::Type::MutexGuard(value) => {
             collect_type(program, value, types, generic_names)?;
         }
@@ -479,6 +482,7 @@ fn match_type(
         }
         (hir::Type::Set(x), hir::Type::Set(y)) => match_type(x, y, inferred),
         (hir::Type::Thread(x), hir::Type::Thread(y)) => match_type(x, y, inferred),
+        (hir::Type::Future(x), hir::Type::Future(y)) => match_type(x, y, inferred),
         (hir::Type::Mutex(x), hir::Type::Mutex(y))
         | (hir::Type::MutexGuard(x), hir::Type::MutexGuard(y)) => match_type(x, y, inferred),
         (hir::Type::Result(a, b), hir::Type::Result(x, y)) => {
@@ -534,6 +538,7 @@ pub fn type_code(ty: &hir::Type) -> String {
         hir::Type::Map(key, value) => format!("M{}_{}", type_code(key), type_code(value)),
         hir::Type::Set(element) => format!("Q{}", type_code(element)),
         hir::Type::Thread(result) => format!("T{}", type_code(result)),
+        hir::Type::Future(result) => format!("U{}", type_code(result)),
         hir::Type::Mutex(value) => format!("X{}", type_code(value)),
         hir::Type::MutexGuard(value) => format!("Y{}", type_code(value)),
         hir::Type::AtomicInt => "Z".into(),

@@ -113,6 +113,11 @@ impl<'a> LayoutEngine<'a> {
             hir::Type::Thread(_) => {
                 aggregate(&[self.target.pointer_alignment, self.target.pointer_alignment])
             }
+            hir::Type::Future(_) => aggregate(&[
+                self.target.pointer_alignment,
+                self.target.pointer_alignment,
+                self.target.pointer_alignment,
+            ]),
             hir::Type::Mutex(_) | hir::Type::MutexGuard(_) | hir::Type::AtomicInt => {
                 aggregate(&[self.target.pointer_alignment])
             }

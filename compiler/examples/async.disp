@@ -1,0 +1,17 @@
+async fn load_value(value: int) -> int {
+    print("future started")
+    return value
+}
+
+async fn calculate() -> int {
+    left = await load_value(20)
+    await Async.yield()
+    right = await load_value(22)
+    return left + right
+}
+
+async fn main() {
+    work = calculate()
+    print("future created")
+    print(await work)
+}

@@ -452,6 +452,7 @@ impl Resolver {
                         | "Directory"
                         | "Time"
                         | "Duration"
+                        | "Async"
                 ) {
                     return Ok(());
                 }
@@ -495,7 +496,7 @@ impl Resolver {
                 field,
                 field_span,
             } => {
-                if matches!(&object.node, Expression::Identifier(name) if matches!(name.as_str(), "String" | "List" | "Map" | "Set" | "Mutex" | "AtomicInt" | "Path" | "File" | "Directory" | "Time" | "Duration"))
+                if matches!(&object.node, Expression::Identifier(name) if matches!(name.as_str(), "String" | "List" | "Map" | "Set" | "Mutex" | "AtomicInt" | "Path" | "File" | "Directory" | "Time" | "Duration" | "Async"))
                 {
                     return Ok(());
                 }
@@ -534,6 +535,7 @@ impl Resolver {
                 Ok(())
             }
             Expression::Try(operand)
+            | Expression::Await(operand)
             | Expression::Spawn(operand)
             | Expression::Move(operand)
             | Expression::Dereference(operand) => self.resolve_expression(operand),
@@ -740,7 +742,7 @@ impl Resolver {
             "List" => Some(1),
             "Map" => Some(2),
             "Set" => Some(1),
-            "Thread" => Some(1),
+            "Thread" | "Future" => Some(1),
             "Mutex" | "MutexGuard" => Some(1),
             "AtomicInt" => Some(0),
             "CString" | "CStr" | "Memory" | "CInt" | "CUInt" | "CSize" | "CSSize" | "CChar"

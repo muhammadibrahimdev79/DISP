@@ -16,10 +16,22 @@ pub const C_RUNTIME: &str = r#"
 #else
 #include <dirent.h>
 #include <pthread.h>
+#include <sched.h>
 #include <unistd.h>
 #endif
 
 static void dv_panic(const char *message,int line,int column);
+static void disp_future_wait(disp_native_future *future,void *output,int line,int column){if(!future->context||!future->poll)dv_panic("future has already been awaited",line,column);while(!future->poll(future->context,output)){
+#ifdef _WIN32
+SwitchToThread();
+#else
+sched_yield();
+#endif
+}if(future->drop)future->drop(future->context);*future=(disp_native_future){0};}
+typedef struct { bool yielded; } disp_yield_future;
+static bool disp_yield_poll(void *raw,void *output){disp_yield_future *state=(disp_yield_future*)raw;if(!state->yielded){state->yielded=true;return false;}*(disp_native_unit*)output=(disp_native_unit){0};return true;}
+static void disp_yield_drop(void *raw){disp_dealloc(raw);}
+static disp_native_future disp_future_yield(void){disp_yield_future *state=(disp_yield_future*)disp_alloc_zeroed(1,sizeof(disp_yield_future),_Alignof(disp_yield_future));return (disp_native_future){.context=state,.poll=disp_yield_poll,.drop=disp_yield_drop};}
 struct disp_mutex_state {
     atomic_size_t refs;
     void *data;
