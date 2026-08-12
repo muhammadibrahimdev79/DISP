@@ -67,6 +67,7 @@ impl<'a> LayoutEngine<'a> {
                     self.target.pointer_alignment,
                 ])
             }
+            hir::Type::IpAddress => aggregate_layout(&[scalar(16, 1), scalar(1, 1)]),
             hir::Type::SocketAddress => aggregate(&[
                 self.target.pointer_alignment,
                 self.target.pointer_alignment,

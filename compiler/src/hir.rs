@@ -32,6 +32,7 @@ pub enum Type {
     CStr,
     Memory,
     Path,
+    IpAddress,
     SocketAddress,
     TcpStream,
     TcpListener,
@@ -73,6 +74,7 @@ impl Type {
             | Self::Float { .. }
             | Self::Instant
             | Self::Duration
+            | Self::IpAddress
             | Self::Reference { .. }
             | Self::RawPointer { .. } => true,
             Self::Struct(id, _) => program.copy_types.contains(&TypeId(id.0)),
@@ -765,6 +767,7 @@ impl<'a> Lowering<'a> {
             "CFloat" => Type::Float { width: 32 },
             "CDouble" => Type::Float { width: 64 },
             "Path" => Type::Path,
+            "IpAddress" => Type::IpAddress,
             "SocketAddress" => Type::SocketAddress,
             "TcpStream" => Type::TcpStream,
             "TcpListener" => Type::TcpListener,
@@ -1735,6 +1738,10 @@ impl FunctionLowering<'_, '_> {
                             Box::new(Type::TcpStream),
                             Box::new(Type::Generic("NetworkError".into())),
                         ))),
+                        "resolve" | "resolve_timeout" => Type::Future(Box::new(Type::Result(
+                            Box::new(Type::List(Box::new(Type::IpAddress))),
+                            Box::new(Type::Generic("NetworkError".into())),
+                        ))),
                         _ => Type::Future(Box::new(Type::Unit)),
                     };
                     return Ok(Expr {
@@ -1781,6 +1788,44 @@ impl FunctionLowering<'_, '_> {
                         }),
                         ty: Type::Result(
                             Box::new(Type::UdpSocket),
+                            Box::new(Type::Generic("NetworkError".into())),
+                        ),
+                        span,
+                    });
+                }
+                if owner == "IpAddress" && field == "parse" {
+                    let args = arguments
+                        .iter()
+                        .map(|x| self.lower_expr(x))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    return Ok(Expr {
+                        kind: ExprKind::Call(Call {
+                            target: CallTarget::Intrinsic("IpAddress.parse".into()),
+                            arguments: args,
+                            receiver: None,
+                            substitutions: vec![],
+                        }),
+                        ty: Type::Result(
+                            Box::new(Type::IpAddress),
+                            Box::new(Type::Generic("NetworkError".into())),
+                        ),
+                        span,
+                    });
+                }
+                if owner == "Dns" && field == "resolve" {
+                    let args = arguments
+                        .iter()
+                        .map(|x| self.lower_expr(x))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    return Ok(Expr {
+                        kind: ExprKind::Call(Call {
+                            target: CallTarget::Intrinsic("Dns.resolve".into()),
+                            arguments: args,
+                            receiver: None,
+                            substitutions: vec![],
+                        }),
+                        ty: Type::Result(
+                            Box::new(Type::List(Box::new(Type::IpAddress))),
                             Box::new(Type::Generic("NetworkError".into())),
                         ),
                         span,
@@ -2455,6 +2500,29 @@ impl FunctionLowering<'_, '_> {
                         substitutions: vec![],
                     }),
                     ty,
+                    span,
+                });
+            }
+            if matches!(receiver.ty, Type::IpAddress) {
+                let mut args = vec![receiver];
+                args.extend(
+                    arguments
+                        .iter()
+                        .map(|x| self.lower_expr(x))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+                return Ok(Expr {
+                    kind: ExprKind::Call(Call {
+                        target: CallTarget::Intrinsic(format!("IpAddress.{field}")),
+                        arguments: args,
+                        receiver: Some(ReceiverMode::Shared),
+                        substitutions: vec![],
+                    }),
+                    ty: if field == "as_string" {
+                        Type::String
+                    } else {
+                        Type::Bool
+                    },
                     span,
                 });
             }
@@ -3455,6 +3523,7 @@ fn surface_type_is_copy(ty: &Type) -> bool {
         | Type::CString
         | Type::Memory
         | Type::Path
+        | Type::IpAddress
         | Type::SocketAddress
         | Type::TcpStream
         | Type::TcpListener

@@ -175,6 +175,8 @@ fn async_operations(
                         | "Async.write_bytes"
                         | "Async.connect"
                         | "Async.connect_timeout"
+                        | "Async.resolve"
+                        | "Async.resolve_timeout"
                         | "TcpListener.accept"
                         | "TcpListener.accept_timeout"
                         | "TcpStream.read_async"
@@ -214,6 +216,18 @@ fn async_poll_wrapper(operation: &str, result: &hir::Type, output: &mut String) 
         writeln!(
             output,
             "static bool {poll}(void *raw,void *output){{disp_connect_state *state=(disp_connect_state*)raw;if(!disp_connect_poll(state))return false;bool ok=false;disp_native_tcp_stream stream={{0}};disp_native_string error={{0}};disp_connect_take(state,&ok,&stream,&error);{result_c} *result=({result_c}*)output;*result=({result_c}){{0}};if(ok){{result->tag=0;result->payload.v0.f0=stream;}}else{{result->tag=1;result->payload.v1.f0=error;}}return true;}}"
+        )
+        .unwrap();
+        return;
+    }
+    if matches!(operation, "Async.resolve" | "Async.resolve_timeout") {
+        let hir::Type::Result(value, _) = result else {
+            unreachable!("DNS future must contain Result")
+        };
+        let list_c = native_types::c_type(value);
+        writeln!(
+            output,
+            "static bool {poll}(void *raw,void *output){{disp_dns_state *state=(disp_dns_state*)raw;if(!disp_dns_poll(state))return false;bool ok=false;disp_native_ip_list addresses={{0}};disp_native_string error={{0}};disp_dns_take(state,&ok,&addresses,&error);{result_c} *result=({result_c}*)output;*result=({result_c}){{0}};if(ok){{result->tag=0;result->payload.v0.f0=({list_c}){{.data=addresses.data,.len=addresses.len,.cap=addresses.cap}};}}else{{result->tag=1;result->payload.v1.f0=error;}}return true;}}"
         )
         .unwrap();
         return;
@@ -501,6 +515,7 @@ pub fn supported(program: &mir::Program, ty: &hir::Type) -> bool {
         | hir::Type::CStr
         | hir::Type::Memory
         | hir::Type::Path
+        | hir::Type::IpAddress
         | hir::Type::SocketAddress
         | hir::Type::TcpStream
         | hir::Type::TcpListener
@@ -1017,6 +1032,29 @@ fn terminator(
                     )
                 }
                 hir::CallTarget::Intrinsic(name)
+                    if matches!(name.as_str(), "Async.resolve" | "Async.resolve_timeout") =>
+                {
+                    let hir::Type::Future(result) = &destination_ty else {
+                        unreachable!("Async.resolve destination must be Future<T>")
+                    };
+                    let (host, _) =
+                        system_argument(program, function, &arguments[0], substitutions);
+                    let (has_timeout, timeout) = if arguments.len() == 2 {
+                        let timeout_ty =
+                            operand_ty(program, function, &arguments[1], substitutions);
+                        let timeout =
+                            operand(program, function, &arguments[1], &timeout_ty, substitutions);
+                        ("true", format!("({timeout}).nanos"))
+                    } else {
+                        ("false", "0".into())
+                    };
+                    let poll = async_poll_name(name, result);
+                    format!(
+                        "({{disp_dns_state *_state=disp_dns_create(({host})->data,({host})->len,{has_timeout},{timeout},{},{});(disp_native_future){{.context=_state,.poll={poll},.drop=disp_dns_drop}};}})",
+                        span.start.line, span.start.column
+                    )
+                }
+                hir::CallTarget::Intrinsic(name)
                     if matches!(
                         name.as_str(),
                         "Async.read_text"
@@ -1301,8 +1339,7 @@ fn terminator(
                     )
                 }
                 hir::CallTarget::Intrinsic(name) if name == "SocketAddress.new" => {
-                    let (host, _) =
-                        system_argument(program, function, &arguments[0], substitutions);
+                    let host_ty = operand_ty(program, function, &arguments[0], substitutions);
                     let port_ty = operand_ty(program, function, &arguments[1], substitutions);
                     let port = operand(program, function, &arguments[1], &port_ty, substitutions);
                     let (port_c, invalid) =
@@ -1311,9 +1348,40 @@ fn terminator(
                         } else {
                             ("unsigned __int128", "_port>65535")
                         };
+                    if matches!(host_ty, hir::Type::IpAddress) {
+                        let host =
+                            operand(program, function, &arguments[0], &host_ty, substitutions);
+                        format!(
+                            "({{{port_c} _port=({port_c})({port});if({invalid})dv_panic(\"socket port is outside 0 through 65535\",{},{});disp_native_ip_address _ip={host};disp_socket_address_from_ip(&_ip,(uint64_t)_port,{},{});}})",
+                            span.start.line, span.start.column, span.start.line, span.start.column
+                        )
+                    } else {
+                        let (host, _) =
+                            system_argument(program, function, &arguments[0], substitutions);
+                        format!(
+                            "({{{port_c} _port=({port_c})({port});if({invalid})dv_panic(\"socket port is outside 0 through 65535\",{},{});disp_socket_address_create(({host})->data,({host})->len,(uint64_t)_port,{},{});}})",
+                            span.start.line, span.start.column, span.start.line, span.start.column
+                        )
+                    }
+                }
+                hir::CallTarget::Intrinsic(name) if name == "IpAddress.parse" => {
+                    let (source, _) =
+                        system_argument(program, function, &arguments[0], substitutions);
+                    let result_c = native_types::c_type(&destination_ty);
                     format!(
-                        "({{{port_c} _port=({port_c})({port});if({invalid})dv_panic(\"socket port is outside 0 through 65535\",{},{});disp_socket_address_create(({host})->data,({host})->len,(uint64_t)_port,{},{});}})",
-                        span.start.line, span.start.column, span.start.line, span.start.column
+                        "({{{result_c} _r={{0}};disp_native_ip_address _address={{0}};disp_native_string _error={{0}};if(disp_ip_address_parse(({source})->data,({source})->len,&_address,&_error)){{_r.tag=0;_r.payload.v0.f0=_address;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                    )
+                }
+                hir::CallTarget::Intrinsic(name) if name == "Dns.resolve" => {
+                    let (host, _) =
+                        system_argument(program, function, &arguments[0], substitutions);
+                    let result_c = native_types::c_type(&destination_ty);
+                    let hir::Type::Result(value, _) = &destination_ty else {
+                        unreachable!("DNS resolution must return Result")
+                    };
+                    let list_c = native_types::c_type(value);
+                    format!(
+                        "({{{result_c} _r={{0}};disp_native_ip_list _addresses={{0}};disp_native_string _error={{0}};if(disp_dns_resolve(({host})->data,({host})->len,&_addresses,&_error)){{_r.tag=0;_r.payload.v0.f0=({list_c}){{.data=_addresses.data,.len=_addresses.len,.cap=_addresses.cap}};}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
                     )
                 }
                 hir::CallTarget::Intrinsic(name) if name == "TcpListener.bind" => {
@@ -1616,6 +1684,21 @@ fn terminator(
                         }
                         "UdpDatagram.len" => format!("({datagram})->len"),
                         "UdpDatagram.is_empty" => format!("({datagram})->len==0"),
+                        _ => unreachable!(),
+                    }
+                }
+                hir::CallTarget::Intrinsic(name) if name.starts_with("IpAddress.") => {
+                    let (ip, _) = system_argument(program, function, &arguments[0], substitutions);
+                    match name.as_str() {
+                        "IpAddress.as_string" => format!("disp_ip_address_string({ip})"),
+                        "IpAddress.is_ipv4" => format!("({ip})->family==4"),
+                        "IpAddress.is_ipv6" => format!("({ip})->family==6"),
+                        "IpAddress.is_loopback" => {
+                            format!("disp_ip_address_loopback({ip})")
+                        }
+                        "IpAddress.is_unspecified" => {
+                            format!("disp_ip_address_unspecified({ip})")
+                        }
                         _ => unreachable!(),
                     }
                 }
@@ -3028,6 +3111,7 @@ fn to_dv(value: &str, ty: &hir::Type) -> String {
         hir::Type::CStr => format!("dv_string(({value}),strlen({value}))"),
         hir::Type::Memory => "dv_string(\"<Memory>\",8)".into(),
         hir::Type::Path => format!("dv_string(({value}).data,({value}).len)"),
+        hir::Type::IpAddress => format!("dv_ip({value})"),
         hir::Type::SocketAddress => "dv_string(\"<SocketAddress>\",15)".into(),
         hir::Type::TcpStream => "dv_string(\"<TcpStream>\",11)".into(),
         hir::Type::TcpListener => "dv_string(\"<TcpListener>\",13)".into(),

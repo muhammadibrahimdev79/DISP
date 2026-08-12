@@ -1,0 +1,22 @@
+fn inspect_ip() -> Result<bool, NetworkError> {
+    parsed = IpAddress.parse("127.0.0.1")
+    ip = parsed?
+    print(ip.as_string())
+    print(ip.is_ipv4())
+    print(ip.is_loopback())
+    address = SocketAddress(ip, 8080)
+    return Ok(!ip.is_unspecified())
+}
+
+async fn inspect_dns() -> Result<bool, NetworkError> {
+    resolved = await Async.resolve_timeout("localhost", Duration.from_seconds(2))
+    addresses = resolved?
+    first = addresses[0]
+    print(first.as_string().is_empty() == false)
+    return Ok(addresses.is_empty() == false)
+}
+
+async fn main() {
+    print(inspect_ip())
+    print(await inspect_dns())
+}

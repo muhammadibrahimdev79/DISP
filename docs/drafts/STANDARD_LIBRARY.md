@@ -630,6 +630,31 @@ TcpListener
 UdpSocket
 ```
 
+The implemented address layer uses a compact Copy `IpAddress` value for IPv4 and IPv6. Parsing is
+strict, formatting is canonical, and no text allocation is retained inside the address:
+
+```disp
+address = IpAddress.parse("2001:db8::1")?
+print(address.as_string())
+print(address.is_ipv6())
+endpoint = SocketAddress(address, 443)
+```
+
+`is_ipv4()`, `is_ipv6()`, `is_loopback()`, and `is_unspecified()` are allocation-free. A
+`SocketAddress` may be constructed from an `IpAddress`, `String`, or borrowed `str`.
+
+DNS resolution returns a sorted, deduplicated, owned `List<IpAddress>` so results cannot borrow
+resolver or operating-system storage:
+
+```disp
+addresses = Dns.resolve("example.com")?
+addresses = await Async.resolve("example.com")?
+addresses = await Async.resolve_timeout("example.com", Duration.from_seconds(5))?
+```
+
+Async DNS futures are lazy: resolution and any timeout begin on first poll. Dropping or timing out
+a future discards late results safely while the runtime drains its native worker before shutdown.
+
 ---
 
 # 34. TCP
@@ -677,8 +702,8 @@ var stream = connection?
 
 `local_port()` returns `Result<uint, NetworkError>`, which supports safe operating-system
 port assignment with port zero. `accept()` and `accept_timeout()` are lazy nonblocking futures;
-closing or dropping the listener safely terminates pending accepts. UDP and high-level protocol
-clients remain design work.
+closing or dropping the listener safely terminates pending accepts. High-level protocol clients
+remain design work.
 
 ---
 

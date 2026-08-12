@@ -18,7 +18,8 @@ Implemented executable subset:
 - typed native threads with owned `spawn`, consuming `join`, Send-style boundary checks, and deterministic joining
 - lazy `Future<T>` state machines and structured `Task<T>` values with `Async.spawn`, cooperative scheduling, consuming `await`, cancellation, and deterministic result cleanup
 - deadline-aware async timer waits and lazy owned text/byte file futures with background native I/O, UTF-8 validation, cancellation, and shutdown draining
-- validated `SocketAddress`, lazy deadline-aware TCP connect/read/write futures, serialized per-direction stream operations, EOF and half-close semantics, typed `NetworkError`, explicit close, and reference-counted deterministic native socket cleanup
+- compact Copy `IpAddress` values, strict IPv4/IPv6 parsing and canonical formatting, synchronous and lazy deadline-aware DNS resolution with sorted/deduplicated owned results, and validated `SocketAddress` construction from names or addresses
+- lazy deadline-aware TCP connect/read/write futures, serialized per-direction stream operations, EOF and half-close semantics, typed `NetworkError`, explicit close, and reference-counted deterministic native socket cleanup
 - owned `TcpListener` bind/local-port operations and lazy nonblocking `accept`/`accept_timeout` futures with responsive cancellation and reference-counted native listener state
 - owned `UdpSocket` datagram I/O with local-port discovery, sender-address metadata, synchronous and lazy deadline-aware operations, explicit truncation errors, serialized directions, and cancellation-safe native cleanup
 - explicitly shared `Mutex<T>`, owning lock guards, and checked sequentially consistent `AtomicInt`

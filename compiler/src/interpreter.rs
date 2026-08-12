@@ -9,7 +9,7 @@ use std::{
     fs,
     io::{Read, Write},
     net::{
-        Shutdown, TcpListener as StdTcpListener, TcpStream as StdTcpStream, ToSocketAddrs,
+        IpAddr, Shutdown, TcpListener as StdTcpListener, TcpStream as StdTcpStream, ToSocketAddrs,
         UdpSocket as StdUdpSocket,
     },
     path::PathBuf,
@@ -114,6 +114,7 @@ enum FutureWork {
         RuntimeSocketAddress,
         Option<StdDuration>,
     ),
+    Resolve(String, Option<StdDuration>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +122,9 @@ struct RuntimeSocketAddress {
     host: String,
     port: u16,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RuntimeIpAddress(IpAddr);
 
 #[derive(Clone)]
 struct RuntimeTcpStream(Arc<StdMutex<RuntimeTcpStreamState>>);
@@ -597,6 +601,23 @@ fn runtime_path(value: Value) -> Option<PathBuf> {
     }
 }
 
+fn resolve_ip_addresses(host: &str) -> std::io::Result<Vec<IpAddr>> {
+    let mut addresses = (host, 0)
+        .to_socket_addrs()?
+        .map(|address| address.ip())
+        .collect::<Vec<_>>();
+    addresses.sort();
+    addresses.dedup();
+    if addresses.is_empty() {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "DNS resolution returned no addresses",
+        ))
+    } else {
+        Ok(addresses)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum Value {
     Int(i64),
@@ -611,6 +632,7 @@ enum Value {
     CStr(RuntimeCString),
     Memory(RuntimeMemory),
     Path(PathBuf),
+    IpAddress(RuntimeIpAddress),
     SocketAddress(RuntimeSocketAddress),
     TcpStream(RuntimeTcpStream),
     TcpListener(RuntimeTcpListener),
@@ -1089,6 +1111,32 @@ impl Interpreter {
                     ))
                 };
                 Ok(runtime_result(result))
+            }
+            FutureWork::Resolve(host, timeout) => {
+                if timeout.is_some_and(|timeout| timeout.is_zero()) {
+                    return Ok(runtime_result(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "DNS resolution timed out",
+                    ))));
+                }
+                let started = StdInstant::now();
+                let resolved = resolve_ip_addresses(&host).and_then(|addresses| {
+                    if timeout.is_some_and(|timeout| started.elapsed() > timeout) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "DNS resolution timed out",
+                        ));
+                    }
+                    let values = addresses
+                        .into_iter()
+                        .map(|address| Value::IpAddress(RuntimeIpAddress(address)))
+                        .collect::<Vec<_>>();
+                    Ok(Value::List {
+                        capacity: values.len(),
+                        values,
+                    })
+                });
+                Ok(runtime_result(resolved))
             }
         }
     }
@@ -1876,16 +1924,20 @@ impl Interpreter {
                 }
                 if matches!(&callee.node, Expression::Identifier(name) if name == "SocketAddress") {
                     let host = self.evaluate(program, &arguments[0])?;
-                    let Value::String(host) = host else {
-                        return Err(self.error(
-                            "SocketAddress host must be String or str",
-                            arguments[0].span,
-                        ));
+                    let host = match host {
+                        Value::String(host) => host.text,
+                        Value::IpAddress(address) => address.0.to_string(),
+                        _ => {
+                            return Err(self.error(
+                                "SocketAddress host must be String, str, or IpAddress",
+                                arguments[0].span,
+                            ));
+                        }
                     };
-                    if host.text.is_empty() {
+                    if host.is_empty() {
                         return Err(self.error("socket host cannot be empty", arguments[0].span));
                     }
-                    if host.text.contains('\0') {
+                    if host.contains('\0') {
                         return Err(
                             self.error("socket host cannot contain a NUL byte", arguments[0].span)
                         );
@@ -1894,10 +1946,42 @@ impl Interpreter {
                     let port = u16::try_from(port).map_err(|_| {
                         self.error("socket port is outside 0 through 65535", arguments[1].span)
                     })?;
-                    return Ok(Value::SocketAddress(RuntimeSocketAddress {
-                        host: host.text,
-                        port,
-                    }));
+                    return Ok(Value::SocketAddress(RuntimeSocketAddress { host, port }));
+                }
+                if let Expression::FieldAccess { object, field, .. } = &callee.node
+                    && matches!(&object.node, Expression::Identifier(name) if name == "IpAddress")
+                    && field == "parse"
+                {
+                    let Value::String(source) = self.evaluate(program, &arguments[0])? else {
+                        unreachable!("type checking validates IP address source")
+                    };
+                    let parsed = source
+                        .text
+                        .parse::<IpAddr>()
+                        .map(|address| Value::IpAddress(RuntimeIpAddress(address)))
+                        .map_err(|error| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
+                        });
+                    return Ok(runtime_result(parsed));
+                }
+                if let Expression::FieldAccess { object, field, .. } = &callee.node
+                    && matches!(&object.node, Expression::Identifier(name) if name == "Dns")
+                    && field == "resolve"
+                {
+                    let Value::String(host) = self.evaluate(program, &arguments[0])? else {
+                        unreachable!("type checking validates DNS host")
+                    };
+                    let result = resolve_ip_addresses(&host.text).map(|addresses| {
+                        let values = addresses
+                            .into_iter()
+                            .map(|address| Value::IpAddress(RuntimeIpAddress(address)))
+                            .collect::<Vec<_>>();
+                        Value::List {
+                            capacity: values.len(),
+                            values,
+                        }
+                    });
+                    return Ok(runtime_result(result));
                 }
                 if matches!(&callee.node, Expression::Identifier(name) if name == "Path") {
                     let value = self.evaluate(program, &arguments[0])?;
@@ -2101,6 +2185,24 @@ impl Interpreter {
                             };
                             Ok(Value::Future(RuntimeFuture::operation(
                                 FutureWork::Connect(address, timeout),
+                            )))
+                        }
+                        "resolve" | "resolve_timeout" => {
+                            let Value::String(host) = self.evaluate(program, &arguments[0])? else {
+                                unreachable!("type checking validates DNS host")
+                            };
+                            let timeout = if field == "resolve_timeout" {
+                                let Value::Duration(duration) =
+                                    self.evaluate(program, &arguments[1])?
+                                else {
+                                    unreachable!("type checking validates DNS timeout")
+                                };
+                                Some(duration)
+                            } else {
+                                None
+                            };
+                            Ok(Value::Future(RuntimeFuture::operation(
+                                FutureWork::Resolve(host.text, timeout),
                             )))
                         }
                         "read_text" | "read_bytes" => {
@@ -2983,6 +3085,18 @@ impl Interpreter {
                             "len" => Ok(Value::UInt(datagram.bytes.len() as u64)),
                             "is_empty" => Ok(Value::Bool(datagram.bytes.is_empty())),
                             _ => Err(self.error("unknown UdpDatagram operation", expression.span)),
+                        };
+                    }
+                    if let Value::IpAddress(address) = self.evaluate(program, object)? {
+                        return match field.as_str() {
+                            "as_string" => {
+                                Ok(Value::String(RuntimeString::literal(address.0.to_string())))
+                            }
+                            "is_ipv4" => Ok(Value::Bool(address.0.is_ipv4())),
+                            "is_ipv6" => Ok(Value::Bool(address.0.is_ipv6())),
+                            "is_loopback" => Ok(Value::Bool(address.0.is_loopback())),
+                            "is_unspecified" => Ok(Value::Bool(address.0.is_unspecified())),
+                            _ => Err(self.error("unknown IpAddress operation", expression.span)),
                         };
                     }
                     if let Value::Path(path) = self.evaluate(program, object)? {
@@ -4341,6 +4455,7 @@ fn value_type_name(value: &Value) -> &str {
         Value::CStr(_) => "CStr",
         Value::Memory(_) => "Memory",
         Value::Path(_) => "Path",
+        Value::IpAddress(_) => "IpAddress",
         Value::SocketAddress(_) => "SocketAddress",
         Value::TcpStream(_) => "TcpStream",
         Value::TcpListener(_) => "TcpListener",
@@ -4378,6 +4493,7 @@ fn value_is_copy(program: &Program, value: &Value) -> bool {
         | Value::Float32(_)
         | Value::Instant(_)
         | Value::Duration(_)
+        | Value::IpAddress(_)
         | Value::Char(_)
         | Value::Bool(_)
         | Value::Reference(_, _)
@@ -4782,6 +4898,7 @@ fn display_value(value: Value) -> String {
         Value::CString(value) | Value::CStr(value) => value.text(),
         Value::Memory(_) => "<Memory>".into(),
         Value::Path(value) => value.to_string_lossy().into_owned(),
+        Value::IpAddress(value) => value.0.to_string(),
         Value::SocketAddress(value) => format!("{}:{}", value.host, value.port),
         Value::TcpStream(_) => "<TcpStream>".into(),
         Value::TcpListener(_) => "<TcpListener>".into(),

@@ -22,7 +22,9 @@ awaited or is cancelled with deterministic cleanup before its async scope exits.
 `spawn function()` syntax creates an operating-system thread. An `async fn main()` is driven
 automatically. `Async.sleep`, `Async.read_text`, `Async.read_bytes`, `Async.write_text`, and
 `Async.write_bytes` are lazy owned futures; synchronous `Time.*` and `File.*` operations remain
-available. `SocketAddress` validates owned host/port pairs and `Async.connect` produces an owned
+available. `IpAddress` provides compact Copy IPv4/IPv6 values with canonical formatting,
+`Dns.resolve` and lazy deadline-aware `Async.resolve` provide sorted, deduplicated owned address
+lists, and `SocketAddress` validates owned host/IP and port pairs. `Async.connect` produces an owned
 `TcpStream` with typed `NetworkError` failures, synchronous or lazy nonblocking byte
 reads/writes, operation deadlines, explicit read/write half-close, explicit close, and automatic
 drop cleanup. Asynchronous writes copy their byte input into the future, so later caller mutation

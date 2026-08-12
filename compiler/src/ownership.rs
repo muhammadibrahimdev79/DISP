@@ -30,6 +30,7 @@ enum Ty {
     CStr,
     Memory,
     Path,
+    IpAddress,
     SocketAddress,
     TcpStream,
     TcpListener,
@@ -1271,6 +1272,16 @@ impl<'a> Analyzer<'a> {
                             Box::new(Ty::Owned("NetworkError".into())),
                         ))))
                     }
+                    "resolve" | "resolve_timeout" => {
+                        self.check_expr(&arguments[0], UseMode::Read)?;
+                        if field == "resolve_timeout" {
+                            self.check_expr(&arguments[1], UseMode::Read)?;
+                        }
+                        Ok(Ty::Future(Box::new(Ty::Result(
+                            Box::new(Ty::List(Box::new(Ty::IpAddress))),
+                            Box::new(Ty::Owned("NetworkError".into())),
+                        ))))
+                    }
                     "read_text" | "read_bytes" => {
                         self.check_expr(&arguments[0], UseMode::Consume)?;
                         let value = if field == "read_text" {
@@ -1309,6 +1320,24 @@ impl<'a> Analyzer<'a> {
                 self.check_expr(&arguments[0], UseMode::Consume)?;
                 return Ok(Ty::Result(
                     Box::new(Ty::UdpSocket),
+                    Box::new(Ty::Owned("NetworkError".into())),
+                ));
+            }
+            if matches!(&object.node, Expression::Identifier(name) if name == "IpAddress")
+                && field == "parse"
+            {
+                self.check_expr(&arguments[0], UseMode::Read)?;
+                return Ok(Ty::Result(
+                    Box::new(Ty::IpAddress),
+                    Box::new(Ty::Owned("NetworkError".into())),
+                ));
+            }
+            if matches!(&object.node, Expression::Identifier(name) if name == "Dns")
+                && field == "resolve"
+            {
+                self.check_expr(&arguments[0], UseMode::Read)?;
+                return Ok(Ty::Result(
+                    Box::new(Ty::List(Box::new(Ty::IpAddress))),
                     Box::new(Ty::Owned("NetworkError".into())),
                 ));
             }
@@ -1542,6 +1571,13 @@ impl<'a> Analyzer<'a> {
                     "source" => Ty::SocketAddress,
                     "len" | "is_empty" => Ty::Copy,
                     _ => Ty::Unit,
+                });
+            }
+            if matches!(self.expr_ty(object), Ok(Ty::IpAddress)) {
+                self.check_expr(object, UseMode::Read)?;
+                return Ok(match field.as_str() {
+                    "as_string" => Ty::Owned("String".into()),
+                    _ => Ty::Copy,
                 });
             }
             if matches!(self.expr_ty(object), Ok(Ty::Instant)) {
@@ -2644,6 +2680,7 @@ impl<'a> Analyzer<'a> {
             "CInt" | "CUInt" | "CSize" | "CSSize" | "CChar" | "CUChar" | "CShort" | "CUShort"
             | "CLongLong" | "CULongLong" | "CFloat" | "CDouble" => Ty::Copy,
             "Path" => Ty::Path,
+            "IpAddress" => Ty::IpAddress,
             "SocketAddress" => Ty::SocketAddress,
             "TcpStream" => Ty::TcpStream,
             "TcpListener" => Ty::TcpListener,
@@ -2689,7 +2726,7 @@ impl<'a> Analyzer<'a> {
             Ty::Option(value) => self.ty_is_copy(value),
             Ty::Result(ok, error) => self.ty_is_copy(ok) && self.ty_is_copy(error),
             Ty::Array(element) => self.ty_is_copy(element),
-            Ty::Slice(_) | Ty::Str | Ty::CStr | Ty::Instant | Ty::Duration => true,
+            Ty::Slice(_) | Ty::Str | Ty::CStr | Ty::Instant | Ty::Duration | Ty::IpAddress => true,
             Ty::Path
             | Ty::SocketAddress
             | Ty::TcpStream

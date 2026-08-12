@@ -486,7 +486,8 @@ fn collect_type(
         hir::Type::Future(result) => {
             collect_type(program, result, types, generic_names)?;
         }
-        hir::Type::SocketAddress
+        hir::Type::IpAddress
+        | hir::Type::SocketAddress
         | hir::Type::TcpStream
         | hir::Type::TcpListener
         | hir::Type::UdpSocket
@@ -835,6 +836,7 @@ pub fn type_code(ty: &hir::Type) -> String {
         hir::Type::CStr => "cz".into(),
         hir::Type::Memory => "mem".into(),
         hir::Type::Path => "p".into(),
+        hir::Type::IpAddress => "ni".into(),
         hir::Type::SocketAddress => "na".into(),
         hir::Type::TcpStream => "nt".into(),
         hir::Type::TcpListener => "nl".into(),

@@ -22,6 +22,7 @@ pub enum Type {
     CStr,
     Memory,
     Path,
+    IpAddress,
     SocketAddress,
     TcpStream,
     TcpListener,
@@ -1611,6 +1612,31 @@ impl TypeChecker {
                             Box::new(Type::NetworkError),
                         ))));
                     }
+                    if matches!(field.as_str(), "resolve" | "resolve_timeout")
+                        && arguments.len() == if field == "resolve" { 1 } else { 2 }
+                    {
+                        let host = self.check_expression(&arguments[0])?;
+                        if !matches!(host, Type::String | Type::Str) {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Type,
+                                "DNS host must be String or str",
+                                arguments[0].span,
+                            ));
+                        }
+                        if field == "resolve_timeout" {
+                            let timeout = self.check_expression(&arguments[1])?;
+                            self.require_same(
+                                &Type::Duration,
+                                &timeout,
+                                arguments[1].span,
+                                "DNS resolution timeout",
+                            )?;
+                        }
+                        return Ok(Type::Future(Box::new(Type::Result(
+                            Box::new(Type::List(Box::new(Type::IpAddress))),
+                            Box::new(Type::NetworkError),
+                        ))));
+                    }
                     if matches!(field.as_str(), "read_text" | "read_bytes") && arguments.len() == 1
                     {
                         self.require_path(&arguments[0])?;
@@ -1739,10 +1765,10 @@ impl TypeChecker {
                         ));
                     }
                     let host = self.check_expression(&arguments[0])?;
-                    if !matches!(host, Type::String | Type::Str) {
+                    if !matches!(host, Type::String | Type::Str | Type::IpAddress) {
                         return Err(Diagnostic::new(
                             DiagnosticKind::Type,
-                            "socket host must be String or str",
+                            "socket host must be String, str, or IpAddress",
                             arguments[0].span,
                         ));
                     }
@@ -1755,6 +1781,42 @@ impl TypeChecker {
                         ));
                     }
                     return Ok(Type::SocketAddress);
+                }
+                if let Expression::FieldAccess { object, field, .. } = &callee.node
+                    && matches!(&object.node, Expression::Identifier(name) if name == "IpAddress")
+                    && field == "parse"
+                    && arguments.len() == 1
+                {
+                    let source = self.check_expression(&arguments[0])?;
+                    if !matches!(source, Type::String | Type::Str) {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            "IP address source must be String or str",
+                            arguments[0].span,
+                        ));
+                    }
+                    return Ok(Type::Result(
+                        Box::new(Type::IpAddress),
+                        Box::new(Type::NetworkError),
+                    ));
+                }
+                if let Expression::FieldAccess { object, field, .. } = &callee.node
+                    && matches!(&object.node, Expression::Identifier(name) if name == "Dns")
+                    && field == "resolve"
+                    && arguments.len() == 1
+                {
+                    let host = self.check_expression(&arguments[0])?;
+                    if !matches!(host, Type::String | Type::Str) {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            "DNS host must be String or str",
+                            arguments[0].span,
+                        ));
+                    }
+                    return Ok(Type::Result(
+                        Box::new(Type::List(Box::new(Type::IpAddress))),
+                        Box::new(Type::NetworkError),
+                    ));
                 }
                 if let Expression::FieldAccess { object, field, .. } = &callee.node
                     && matches!(&object.node, Expression::Identifier(name) if name == "UdpSocket")
@@ -2849,6 +2911,25 @@ impl TypeChecker {
                             _ => {}
                         }
                     }
+                    if matches!(receiver, Type::IpAddress) {
+                        match field.as_str() {
+                            "as_string" if arguments.is_empty() => return Ok(Type::String),
+                            "is_ipv4" | "is_ipv6" | "is_loopback" | "is_unspecified"
+                                if arguments.is_empty() =>
+                            {
+                                return Ok(Type::Bool);
+                            }
+                            "as_string" | "is_ipv4" | "is_ipv6" | "is_loopback"
+                            | "is_unspecified" => {
+                                return Err(Diagnostic::new(
+                                    DiagnosticKind::Type,
+                                    format!("`{field}` expects no arguments"),
+                                    expression.span,
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
                     if matches!(receiver, Type::Instant)
                         && field == "elapsed"
                         && arguments.is_empty()
@@ -3594,6 +3675,7 @@ impl TypeChecker {
             "CFloat" if ty.arguments.is_empty() => Type::Float32,
             "CDouble" if ty.arguments.is_empty() => Type::Float,
             "Path" if ty.arguments.is_empty() => Type::Path,
+            "IpAddress" if ty.arguments.is_empty() => Type::IpAddress,
             "SocketAddress" if ty.arguments.is_empty() => Type::SocketAddress,
             "TcpStream" if ty.arguments.is_empty() => Type::TcpStream,
             "TcpListener" if ty.arguments.is_empty() => Type::TcpListener,
@@ -3776,6 +3858,7 @@ impl TypeChecker {
             | Type::Bool
             | Type::Instant
             | Type::Duration
+            | Type::IpAddress
             | Type::CStr
             | Type::Unit
             | Type::Reference(_, false)
@@ -3934,6 +4017,7 @@ impl TypeChecker {
             Type::CStr => "CStr".into(),
             Type::Memory => "Memory".into(),
             Type::Path => "Path".into(),
+            Type::IpAddress => "IpAddress".into(),
             Type::SocketAddress => "SocketAddress".into(),
             Type::TcpStream => "TcpStream".into(),
             Type::TcpListener => "TcpListener".into(),

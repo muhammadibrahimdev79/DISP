@@ -134,7 +134,8 @@ pub fn build(
 
 fn type_uses_networking(ty: &hir::Type) -> bool {
     match ty {
-        hir::Type::SocketAddress
+        hir::Type::IpAddress
+        | hir::Type::SocketAddress
         | hir::Type::TcpStream
         | hir::Type::TcpListener
         | hir::Type::UdpSocket
