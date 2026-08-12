@@ -4,8 +4,8 @@
 designed around a simple goal: make ordinary programming easy, safe by default,
 and capable of high-performance native execution.
 
-The repository contains the language specifications, roadmap, Rust compiler,
-native backend, interpreter, examples, fuzz targets, and test suites.
+The repository contains the Rust compiler, native backend, interpreter,
+examples, fuzz targets, test suites, and the evolving design material.
 
 ## Current implementation
 
@@ -15,8 +15,9 @@ lists, maps, sets, iteration, paths, filesystem operations, and time
 foundations. The implementation remains under active development and should not
 yet be treated as a stable production language.
 
-See [DISP.md](DISP.md), [SPEC.md](SPEC.md), and [ROADMAP.md](ROADMAP.md) for the
-vision, current specification, and planned development.
+The compiler and its tests are the authority for currently implemented
+behavior. See the [documentation index](docs/README.md) for verified compiler
+documentation and clearly separated design drafts.
 
 ## Build and test
 

@@ -1,5 +1,7 @@
 # DISP Package System
 
+> **Design draft:** GPT-generated and not authoritative. See [the documentation index](../README.md) for current, test-backed behavior.
+
 ## 0. Status
 
 This document defines the initial package, dependency, registry, and build-security model for DISP.

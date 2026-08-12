@@ -1,5 +1,7 @@
 # DISP Language Specification
 
+> **Design draft:** GPT-generated and not authoritative. See [the documentation index](../README.md) for current, test-backed behavior.
+
 ## 0. Status
 
 DISP is an experimental programming language under active design.

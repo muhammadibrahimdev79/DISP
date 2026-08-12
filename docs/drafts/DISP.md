@@ -1,5 +1,7 @@
 # DISP
 
+> **Design draft:** GPT-generated and not authoritative. See [the documentation index](../README.md) for current, test-backed behavior.
+
 ## Data · Intelligence · System · Page
 
 **DISP** is a next-generation, general-purpose programming language designed around four fundamental computing domains:
