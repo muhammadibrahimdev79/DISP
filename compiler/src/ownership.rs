@@ -32,6 +32,7 @@ enum Ty {
     Path,
     SocketAddress,
     TcpStream,
+    TcpListener,
     Instant,
     Duration,
     Function,
@@ -1283,6 +1284,15 @@ impl<'a> Analyzer<'a> {
                     _ => Ok(Ty::Unit),
                 };
             }
+            if matches!(&object.node, Expression::Identifier(name) if name == "TcpListener")
+                && field == "bind"
+            {
+                self.check_expr(&arguments[0], UseMode::Consume)?;
+                return Ok(Ty::Result(
+                    Box::new(Ty::TcpListener),
+                    Box::new(Ty::Owned("NetworkError".into())),
+                ));
+            }
             if let Expression::Identifier(owner) = &object.node
                 && matches!(
                     owner.as_str(),
@@ -1436,6 +1446,29 @@ impl<'a> Analyzer<'a> {
                         Box::new(Ty::Owned("NetworkError".into())),
                     ),
                     "write" => Ty::Result(
+                        Box::new(Ty::Copy),
+                        Box::new(Ty::Owned("NetworkError".into())),
+                    ),
+                    _ => Ty::Unit,
+                });
+            }
+            if matches!(self.expr_ty(object), Ok(Ty::TcpListener)) {
+                if field == "close" {
+                    let place = self.place(object)?;
+                    self.check_borrow(&place, true, object.span)?;
+                    self.use_place(&place, UseMode::Read, object.span)?;
+                } else {
+                    self.check_expr(object, UseMode::Read)?;
+                }
+                for argument in arguments {
+                    self.check_expr(argument, UseMode::Read)?;
+                }
+                return Ok(match field.as_str() {
+                    "accept" | "accept_timeout" => Ty::Future(Box::new(Ty::Result(
+                        Box::new(Ty::TcpStream),
+                        Box::new(Ty::Owned("NetworkError".into())),
+                    ))),
+                    "local_port" => Ty::Result(
                         Box::new(Ty::Copy),
                         Box::new(Ty::Owned("NetworkError".into())),
                     ),
@@ -2544,6 +2577,7 @@ impl<'a> Analyzer<'a> {
             "Path" => Ty::Path,
             "SocketAddress" => Ty::SocketAddress,
             "TcpStream" => Ty::TcpStream,
+            "TcpListener" => Ty::TcpListener,
             "Instant" => Ty::Instant,
             "Duration" => Ty::Duration,
             "Self" if self.self_type.is_some() => {
@@ -2588,6 +2622,7 @@ impl<'a> Analyzer<'a> {
             Ty::Path
             | Ty::SocketAddress
             | Ty::TcpStream
+            | Ty::TcpListener
             | Ty::CString
             | Ty::Memory
             | Ty::List(_)

@@ -19,6 +19,7 @@ Implemented executable subset:
 - lazy `Future<T>` state machines and structured `Task<T>` values with `Async.spawn`, cooperative scheduling, consuming `await`, cancellation, and deterministic result cleanup
 - deadline-aware async timer waits and lazy owned text/byte file futures with background native I/O, UTF-8 validation, cancellation, and shutdown draining
 - validated `SocketAddress`, lazy `Async.connect`, owned `TcpStream` byte I/O, typed `NetworkError`, explicit close, and deterministic native socket cleanup
+- owned `TcpListener` bind/local-port operations and lazy nonblocking `accept`/`accept_timeout` futures with responsive cancellation and reference-counted native listener state
 - explicitly shared `Mutex<T>`, owning lock guards, and checked sequentially consistent `AtomicInt`
 - defined `extern C` declarations, fixed C ABI aliases, checked `CString`, borrowed `CStr`, and native library linking
 - owned aligned `Memory`, bounds-checked byte operations, raw pointer views, and explicit unsafe pointer arithmetic/read/write

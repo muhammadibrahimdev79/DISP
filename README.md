@@ -24,7 +24,9 @@ automatically. `Async.sleep`, `Async.read_text`, `Async.read_bytes`, `Async.writ
 `Async.write_bytes` are lazy owned futures; synchronous `Time.*` and `File.*` operations remain
 available. `SocketAddress` validates owned host/port pairs and `Async.connect` produces an owned
 `TcpStream` with typed `NetworkError` failures, byte reads/writes, explicit close, and automatic
-drop cleanup. Cancelling an unpolled I/O future has no side effects. Once native I/O has started,
+drop cleanup. `TcpListener.bind` provides owned server sockets with lazy readiness-polled
+`accept` futures, optional deadlines, local-port discovery, and cancellation-safe listener
+cleanup. Cancelling an unpolled I/O future has no side effects. Once native I/O has started,
 cancellation discards its result but lets the operating-system operation finish, and shutdown
 drains that work so owned resources are released deterministically. The implementation
 remains under active development and should not

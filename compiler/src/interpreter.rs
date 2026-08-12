@@ -8,7 +8,7 @@ use std::{
     collections::HashMap,
     fs,
     io::{Read, Write},
-    net::{Shutdown, TcpStream as StdTcpStream},
+    net::{Shutdown, TcpListener as StdTcpListener, TcpStream as StdTcpStream},
     path::PathBuf,
     sync::{
         Arc, Mutex as StdMutex, Weak,
@@ -101,6 +101,7 @@ enum FutureWork {
     WriteText(PathBuf, RuntimeString),
     WriteBytes(PathBuf, Vec<u8>),
     Connect(RuntimeSocketAddress),
+    Accept(RuntimeTcpListener, Option<StdDuration>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +113,9 @@ struct RuntimeSocketAddress {
 #[derive(Clone)]
 struct RuntimeTcpStream(Arc<StdMutex<Option<StdTcpStream>>>);
 
+#[derive(Clone)]
+struct RuntimeTcpListener(Arc<StdMutex<Option<StdTcpListener>>>);
+
 impl std::fmt::Debug for RuntimeTcpStream {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -122,6 +126,21 @@ impl std::fmt::Debug for RuntimeTcpStream {
 }
 
 impl PartialEq for RuntimeTcpStream {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl std::fmt::Debug for RuntimeTcpListener {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("TcpListener")
+            .field(&Arc::as_ptr(&self.0))
+            .finish()
+    }
+}
+
+impl PartialEq for RuntimeTcpListener {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
@@ -542,6 +561,7 @@ enum Value {
     Path(PathBuf),
     SocketAddress(RuntimeSocketAddress),
     TcpStream(RuntimeTcpStream),
+    TcpListener(RuntimeTcpListener),
     Instant(StdInstant),
     Duration(StdDuration),
     Thread(RuntimeThread),
@@ -832,6 +852,41 @@ impl Interpreter {
                     Value::TcpStream(RuntimeTcpStream(Arc::new(StdMutex::new(Some(stream)))))
                 }),
             )),
+            FutureWork::Accept(listener, timeout) => {
+                let deadline = timeout.and_then(|duration| StdInstant::now().checked_add(duration));
+                loop {
+                    let accepted = {
+                        let guard = listener
+                            .0
+                            .lock()
+                            .map_err(|_| self.error("TCP listener state is poisoned", span))?;
+                        match guard.as_ref() {
+                            Some(listener) => listener.accept(),
+                            None => Err(std::io::Error::new(
+                                std::io::ErrorKind::NotConnected,
+                                "TCP listener is closed",
+                            )),
+                        }
+                    };
+                    match accepted {
+                        Ok((stream, _)) => {
+                            break Ok(runtime_result(Ok(Value::TcpStream(RuntimeTcpStream(
+                                Arc::new(StdMutex::new(Some(stream))),
+                            )))));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if deadline.is_some_and(|deadline| StdInstant::now() >= deadline) {
+                                break Ok(runtime_result(Err(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "TCP accept timed out",
+                                ))));
+                            }
+                            thread::sleep(StdDuration::from_millis(1));
+                        }
+                        Err(error) => break Ok(runtime_result(Err(error))),
+                    }
+                }
+            }
         }
     }
 
@@ -1575,6 +1630,25 @@ impl Interpreter {
                     return Ok(Value::Mutex(RuntimeMutex::new(
                         self.consume(program, &arguments[0])?,
                     )));
+                }
+                if let Expression::FieldAccess { object, field, .. } = &callee.node
+                    && matches!(&object.node, Expression::Identifier(name) if name == "TcpListener")
+                    && field == "bind"
+                {
+                    let address = self.consume(program, &arguments[0])?;
+                    let Value::SocketAddress(address) = address else {
+                        return Err(
+                            self.error("TcpListener.bind expects SocketAddress", arguments[0].span)
+                        );
+                    };
+                    let bound = StdTcpListener::bind((address.host.as_str(), address.port))
+                        .and_then(|listener| {
+                            listener.set_nonblocking(true)?;
+                            Ok(Value::TcpListener(RuntimeTcpListener(Arc::new(
+                                StdMutex::new(Some(listener)),
+                            ))))
+                        });
+                    return Ok(runtime_result(bound));
                 }
                 if matches!(&callee.node, Expression::Identifier(name) if name == "String") {
                     return Ok(Value::String(RuntimeString::with_capacity(0)));
@@ -2379,6 +2453,48 @@ impl Interpreter {
                             );
                         };
                         return handle.join(expression.span).map_err(RuntimeFault::Error);
+                    }
+                    if let Value::TcpListener(listener) = self.evaluate(program, object)? {
+                        return match field.as_str() {
+                            "accept" | "accept_timeout" => {
+                                let timeout = if field == "accept_timeout" {
+                                    let Value::Duration(duration) =
+                                        self.evaluate(program, &arguments[0])?
+                                    else {
+                                        unreachable!("type checking validates accept timeout")
+                                    };
+                                    Some(duration)
+                                } else {
+                                    None
+                                };
+                                Ok(Value::Future(RuntimeFuture::operation(FutureWork::Accept(
+                                    listener, timeout,
+                                ))))
+                            }
+                            "local_port" => {
+                                let guard = listener.0.lock().map_err(|_| {
+                                    self.error("TCP listener state is poisoned", object.span)
+                                })?;
+                                let port = match guard.as_ref() {
+                                    Some(listener) => listener
+                                        .local_addr()
+                                        .map(|address| Value::UInt(address.port() as u64)),
+                                    None => Err(std::io::Error::new(
+                                        std::io::ErrorKind::NotConnected,
+                                        "TCP listener is closed",
+                                    )),
+                                };
+                                Ok(runtime_result(port))
+                            }
+                            "close" => {
+                                let mut guard = listener.0.lock().map_err(|_| {
+                                    self.error("TCP listener state is poisoned", object.span)
+                                })?;
+                                guard.take();
+                                Ok(Value::Unit)
+                            }
+                            _ => Err(self.error("unknown TcpListener operation", expression.span)),
+                        };
                     }
                     if let Value::TcpStream(stream) = self.evaluate(program, object)? {
                         return match field.as_str() {
@@ -3811,6 +3927,7 @@ fn value_type_name(value: &Value) -> &str {
         Value::Path(_) => "Path",
         Value::SocketAddress(_) => "SocketAddress",
         Value::TcpStream(_) => "TcpStream",
+        Value::TcpListener(_) => "TcpListener",
         Value::Instant(_) => "Instant",
         Value::Duration(_) => "Duration",
         Value::Thread(_) => "Thread",
@@ -3879,6 +3996,7 @@ fn value_is_copy(program: &Program, value: &Value) -> bool {
         | Value::Path(_)
         | Value::SocketAddress(_)
         | Value::TcpStream(_)
+        | Value::TcpListener(_)
         | Value::String(_)
         | Value::CString(_)
         | Value::Memory(_)
@@ -4246,6 +4364,7 @@ fn display_value(value: Value) -> String {
         Value::Path(value) => value.to_string_lossy().into_owned(),
         Value::SocketAddress(value) => format!("{}:{}", value.host, value.port),
         Value::TcpStream(_) => "<TcpStream>".into(),
+        Value::TcpListener(_) => "<TcpListener>".into(),
         Value::Instant(_) => "<Instant>".into(),
         Value::Duration(value) => format!("{}ns", value.as_nanos()),
         Value::Thread(_) => "<Thread>".into(),

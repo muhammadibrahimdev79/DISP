@@ -72,7 +72,7 @@ impl<'a> LayoutEngine<'a> {
                 self.target.pointer_alignment,
                 2,
             ]),
-            hir::Type::TcpStream => scalar(
+            hir::Type::TcpStream | hir::Type::TcpListener => scalar(
                 u64::from(self.target.pointer_width) / 8,
                 self.target.pointer_alignment,
             ),

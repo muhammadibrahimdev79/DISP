@@ -1,0 +1,11 @@
+fn inspect() -> Result<bool, NetworkError> {
+    bound = TcpListener.bind(SocketAddress("127.0.0.1", 0))
+    var listener = bound?
+    valid = listener.local_port()? > 0
+    listener.close()
+    return Ok(valid)
+}
+
+fn main() {
+    print(inspect())
+}

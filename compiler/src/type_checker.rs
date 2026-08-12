@@ -24,6 +24,7 @@ pub enum Type {
     Path,
     SocketAddress,
     TcpStream,
+    TcpListener,
     Instant,
     Duration,
     Array(Box<Type>, usize),
@@ -1734,6 +1735,23 @@ impl TypeChecker {
                     return Ok(Type::SocketAddress);
                 }
                 if let Expression::FieldAccess { object, field, .. } = &callee.node
+                    && matches!(&object.node, Expression::Identifier(name) if name == "TcpListener")
+                    && field == "bind"
+                    && arguments.len() == 1
+                {
+                    let address = self.check_expression(&arguments[0])?;
+                    self.require_same(
+                        &Type::SocketAddress,
+                        &address,
+                        arguments[0].span,
+                        "TCP listener bind address",
+                    )?;
+                    return Ok(Type::Result(
+                        Box::new(Type::TcpListener),
+                        Box::new(Type::NetworkError),
+                    ));
+                }
+                if let Expression::FieldAccess { object, field, .. } = &callee.node
                     && let Expression::Identifier(owner) = &object.node
                     && matches!(
                         owner.as_str(),
@@ -2627,6 +2645,35 @@ impl TypeChecker {
                             _ => {}
                         }
                     }
+                    if matches!(receiver, Type::TcpListener) {
+                        let accepted = || {
+                            Type::Future(Box::new(Type::Result(
+                                Box::new(Type::TcpStream),
+                                Box::new(Type::NetworkError),
+                            )))
+                        };
+                        match field.as_str() {
+                            "accept" if arguments.is_empty() => return Ok(accepted()),
+                            "accept_timeout" if arguments.len() == 1 => {
+                                let timeout = self.check_expression(&arguments[0])?;
+                                self.require_same(
+                                    &Type::Duration,
+                                    &timeout,
+                                    arguments[0].span,
+                                    "TCP accept timeout",
+                                )?;
+                                return Ok(accepted());
+                            }
+                            "local_port" if arguments.is_empty() => {
+                                return Ok(Type::Result(
+                                    Box::new(Type::UInt),
+                                    Box::new(Type::NetworkError),
+                                ));
+                            }
+                            "close" if arguments.is_empty() => return Ok(Type::Unit),
+                            _ => {}
+                        }
+                    }
                     if matches!(receiver, Type::Instant)
                         && field == "elapsed"
                         && arguments.is_empty()
@@ -3374,6 +3421,7 @@ impl TypeChecker {
             "Path" if ty.arguments.is_empty() => Type::Path,
             "SocketAddress" if ty.arguments.is_empty() => Type::SocketAddress,
             "TcpStream" if ty.arguments.is_empty() => Type::TcpStream,
+            "TcpListener" if ty.arguments.is_empty() => Type::TcpListener,
             "Instant" if ty.arguments.is_empty() => Type::Instant,
             "Duration" if ty.arguments.is_empty() => Type::Duration,
             "IoError" if ty.arguments.is_empty() => Type::IoError,
@@ -3692,6 +3740,7 @@ impl TypeChecker {
             Type::Path => "Path".into(),
             Type::SocketAddress => "SocketAddress".into(),
             Type::TcpStream => "TcpStream".into(),
+            Type::TcpListener => "TcpListener".into(),
             Type::Instant => "Instant".into(),
             Type::Duration => "Duration".into(),
             Type::Str => "str".into(),

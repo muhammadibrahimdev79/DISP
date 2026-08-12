@@ -174,6 +174,8 @@ fn async_operations(
                         | "Async.write_text"
                         | "Async.write_bytes"
                         | "Async.connect"
+                        | "TcpListener.accept"
+                        | "TcpListener.accept_timeout"
                 )
             {
                 let hir::Type::Future(result) =
@@ -203,6 +205,17 @@ fn async_poll_wrapper(operation: &str, result: &hir::Type, output: &mut String) 
         writeln!(
             output,
             "static bool {poll}(void *raw,void *output){{disp_connect_state *state=(disp_connect_state*)raw;if(!disp_connect_poll(state))return false;bool ok=false;disp_native_tcp_stream stream={{0}};disp_native_string error={{0}};disp_connect_take(state,&ok,&stream,&error);{result_c} *result=({result_c}*)output;*result=({result_c}){{0}};if(ok){{result->tag=0;result->payload.v0.f0=stream;}}else{{result->tag=1;result->payload.v1.f0=error;}}return true;}}"
+        )
+        .unwrap();
+        return;
+    }
+    if matches!(
+        operation,
+        "TcpListener.accept" | "TcpListener.accept_timeout"
+    ) {
+        writeln!(
+            output,
+            "static bool {poll}(void *raw,void *output){{disp_accept_state *state=(disp_accept_state*)raw;if(!disp_accept_poll(state))return false;bool ok=false;disp_native_tcp_stream stream={{0}};disp_native_string error={{0}};disp_accept_take(state,&ok,&stream,&error);{result_c} *result=({result_c}*)output;*result=({result_c}){{0}};if(ok){{result->tag=0;result->payload.v0.f0=stream;}}else{{result->tag=1;result->payload.v1.f0=error;}}return true;}}"
         )
         .unwrap();
         return;
@@ -445,6 +458,7 @@ pub fn supported(program: &mir::Program, ty: &hir::Type) -> bool {
         | hir::Type::Path
         | hir::Type::SocketAddress
         | hir::Type::TcpStream
+        | hir::Type::TcpListener
         | hir::Type::Instant
         | hir::Type::Duration
         | hir::Type::Int { .. }
@@ -1244,6 +1258,15 @@ fn terminator(
                         span.start.line, span.start.column, span.start.line, span.start.column
                     )
                 }
+                hir::CallTarget::Intrinsic(name) if name == "TcpListener.bind" => {
+                    let address_ty = operand_ty(program, function, &arguments[0], substitutions);
+                    let address =
+                        operand(program, function, &arguments[0], &address_ty, substitutions);
+                    let result_c = native_types::c_type(&destination_ty);
+                    format!(
+                        "({{{result_c} _r={{0}};disp_native_tcp_listener _listener={{0}};disp_native_string _error={{0}};if(disp_tcp_listener_bind({address},&_listener,&_error)){{_r.tag=0;_r.payload.v0.f0=_listener;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                    )
+                }
                 hir::CallTarget::Intrinsic(name) if name.starts_with("TcpStream.") => {
                     let (stream, _) =
                         system_argument(program, function, &arguments[0], substitutions);
@@ -1284,6 +1307,46 @@ fn terminator(
                             format!(
                                 "({{{result_c} _r={{0}};size_t _written=0;disp_native_string _error={{0}};if(disp_tcp_stream_write({stream},(const char*)({bytes}).data,({bytes}).len,&_written,&_error)){{_r.tag=0;_r.payload.v0.f0=(uint64_t)_written;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
                             )
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                hir::CallTarget::Intrinsic(name) if name.starts_with("TcpListener.") => {
+                    let (listener, _) =
+                        system_argument(program, function, &arguments[0], substitutions);
+                    match name.as_str() {
+                        "TcpListener.accept" | "TcpListener.accept_timeout" => {
+                            let hir::Type::Future(result) = &destination_ty else {
+                                unreachable!("TCP accept must return Future")
+                            };
+                            let (has_timeout, timeout) = if arguments.len() == 2 {
+                                let timeout_ty =
+                                    operand_ty(program, function, &arguments[1], substitutions);
+                                let timeout = operand(
+                                    program,
+                                    function,
+                                    &arguments[1],
+                                    &timeout_ty,
+                                    substitutions,
+                                );
+                                ("true", format!("({timeout}).nanos"))
+                            } else {
+                                ("false", "0".into())
+                            };
+                            let poll = async_poll_name(name, result);
+                            format!(
+                                "({{disp_accept_state *_state=disp_accept_create({listener},{has_timeout},{timeout},{},{});(disp_native_future){{.context=_state,.poll={poll},.drop=disp_accept_drop}};}})",
+                                span.start.line, span.start.column
+                            )
+                        }
+                        "TcpListener.local_port" => {
+                            let result_c = native_types::c_type(&destination_ty);
+                            format!(
+                                "({{{result_c} _r={{0}};size_t _port=0;disp_native_string _error={{0}};if(disp_tcp_listener_local_port({listener},&_port,&_error)){{_r.tag=0;_r.payload.v0.f0=(uint64_t)_port;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                            )
+                        }
+                        "TcpListener.close" => {
+                            format!("(disp_tcp_listener_close({listener}),(disp_native_unit){{0}})")
                         }
                         _ => unreachable!(),
                     }
@@ -2699,6 +2762,7 @@ fn to_dv(value: &str, ty: &hir::Type) -> String {
         hir::Type::Path => format!("dv_string(({value}).data,({value}).len)"),
         hir::Type::SocketAddress => "dv_string(\"<SocketAddress>\",15)".into(),
         hir::Type::TcpStream => "dv_string(\"<TcpStream>\",11)".into(),
+        hir::Type::TcpListener => "dv_string(\"<TcpListener>\",13)".into(),
         hir::Type::Instant | hir::Type::Duration => {
             format!("dv_u((unsigned __int128)({value}).nanos,64)")
         }
@@ -2934,6 +2998,7 @@ fn drop_value_depth(program: &mir::Program, value: &str, ty: &hir::Type, depth: 
         hir::Type::Path => format!("disp_path_drop(&({value}));"),
         hir::Type::SocketAddress => format!("disp_socket_address_drop(&({value}));"),
         hir::Type::TcpStream => format!("disp_tcp_stream_drop(&({value}));"),
+        hir::Type::TcpListener => format!("disp_tcp_listener_drop(&({value}));"),
         hir::Type::Thread(result) => {
             let result_c = native_types::c_type(result);
             let result_drop = drop_value_depth(

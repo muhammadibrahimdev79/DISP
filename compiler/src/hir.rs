@@ -34,6 +34,7 @@ pub enum Type {
     Path,
     SocketAddress,
     TcpStream,
+    TcpListener,
     Instant,
     Duration,
     Array(Box<Type>, usize),
@@ -86,6 +87,7 @@ impl Type {
             | Self::Path
             | Self::SocketAddress
             | Self::TcpStream
+            | Self::TcpListener
             | Self::List(_)
             | Self::Map(_, _)
             | Self::Set(_)
@@ -761,6 +763,7 @@ impl<'a> Lowering<'a> {
             "Path" => Type::Path,
             "SocketAddress" => Type::SocketAddress,
             "TcpStream" => Type::TcpStream,
+            "TcpListener" => Type::TcpListener,
             "Instant" => Type::Instant,
             "Duration" => Type::Duration,
             "IoError" => Type::Generic("IoError".into()),
@@ -1739,6 +1742,25 @@ impl FunctionLowering<'_, '_> {
                         span,
                     });
                 }
+                if owner == "TcpListener" && field == "bind" {
+                    let args = arguments
+                        .iter()
+                        .map(|x| self.lower_expr(x))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    return Ok(Expr {
+                        kind: ExprKind::Call(Call {
+                            target: CallTarget::Intrinsic("TcpListener.bind".into()),
+                            arguments: args,
+                            receiver: None,
+                            substitutions: vec![],
+                        }),
+                        ty: Type::Result(
+                            Box::new(Type::TcpListener),
+                            Box::new(Type::Generic("NetworkError".into())),
+                        ),
+                        span,
+                    });
+                }
                 if owner == "String" {
                     let args = arguments
                         .iter()
@@ -2275,6 +2297,43 @@ impl FunctionLowering<'_, '_> {
                         target: CallTarget::Intrinsic(format!("TcpStream.{field}")),
                         arguments: args,
                         receiver: Some(ReceiverMode::Mutable),
+                        substitutions: vec![],
+                    }),
+                    ty,
+                    span,
+                });
+            }
+            if matches!(receiver.ty, Type::TcpListener) {
+                let mut args = vec![receiver];
+                args.extend(
+                    arguments
+                        .iter()
+                        .map(|x| self.lower_expr(x))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+                let ty = match field.as_str() {
+                    "accept" | "accept_timeout" => Type::Future(Box::new(Type::Result(
+                        Box::new(Type::TcpStream),
+                        Box::new(Type::Generic("NetworkError".into())),
+                    ))),
+                    "local_port" => Type::Result(
+                        Box::new(Type::Int {
+                            signed: false,
+                            width: None,
+                        }),
+                        Box::new(Type::Generic("NetworkError".into())),
+                    ),
+                    _ => Type::Unit,
+                };
+                return Ok(Expr {
+                    kind: ExprKind::Call(Call {
+                        target: CallTarget::Intrinsic(format!("TcpListener.{field}")),
+                        arguments: args,
+                        receiver: Some(if field == "close" {
+                            ReceiverMode::Mutable
+                        } else {
+                            ReceiverMode::Shared
+                        }),
                         substitutions: vec![],
                     }),
                     ty,
@@ -3280,6 +3339,7 @@ fn surface_type_is_copy(ty: &Type) -> bool {
         | Type::Path
         | Type::SocketAddress
         | Type::TcpStream
+        | Type::TcpListener
         | Type::List(_)
         | Type::Map(_, _)
         | Type::Set(_)

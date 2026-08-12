@@ -21,6 +21,7 @@ pub const C_RUNTIME: &str = r#"
 #else
 #ifdef DISP_NETWORKING
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <sys/socket.h>
 #endif
@@ -32,6 +33,7 @@ pub const C_RUNTIME: &str = r#"
 
 static void dv_panic(const char *message,int line,int column);
 static void disp_time_sleep(uint64_t nanos);
+static uint64_t disp_time_now_nanos(void);
 static void disp_async_file_drain(void);
 static _Thread_local uint64_t disp_reactor_wait_nanos=UINT64_MAX;
 static void disp_reactor_begin(void){disp_reactor_wait_nanos=UINT64_MAX;}
@@ -200,12 +202,16 @@ static BOOL CALLBACK disp_network_init_once(PINIT_ONCE once,PVOID parameter,PVOI
 static void disp_network_init(void){InitOnceExecuteOnce(&disp_network_once,disp_network_init_once,NULL,NULL);if(disp_network_init_error)dv_panic("could not initialize Windows networking",0,0);}
 static void disp_socket_close(disp_socket_handle socket){if(socket!=DISP_INVALID_SOCKET)closesocket(socket);}
 static int disp_socket_error_code(void){return WSAGetLastError();}
+static bool disp_socket_would_block(int code){return code==WSAEWOULDBLOCK;}
+static bool disp_socket_set_blocking(disp_socket_handle socket,bool blocking){u_long mode=blocking?0:1;return ioctlsocket(socket,FIONBIO,&mode)==0;}
 #else
 typedef int disp_socket_handle;
 #define DISP_INVALID_SOCKET (-1)
 static void disp_network_init(void){}
 static void disp_socket_close(disp_socket_handle socket){if(socket!=DISP_INVALID_SOCKET)close(socket);}
 static int disp_socket_error_code(void){return errno;}
+static bool disp_socket_would_block(int code){return code==EAGAIN||code==EWOULDBLOCK;}
+static bool disp_socket_set_blocking(disp_socket_handle socket,bool blocking){int flags=fcntl(socket,F_GETFL,0);return flags>=0&&fcntl(socket,F_SETFL,blocking?(flags&~O_NONBLOCK):(flags|O_NONBLOCK))==0;}
 #endif
 struct disp_tcp_state { disp_socket_handle socket;bool closed; };
 static disp_native_string disp_network_error_code(const char *operation,int code){char message[160];int length=snprintf(message,sizeof(message),"%s failed with network error %d",operation,code);if(length<0)length=0;return disp_owned_bytes(message,(size_t)length);}
@@ -244,6 +250,24 @@ static disp_connect_state *disp_connect_create(disp_native_socket_address addres
 static bool disp_connect_poll(disp_connect_state *state){if(!state||state->taken)dv_panic("TCP connect future has already completed",0,0);if(!state->started){state->started=true;atomic_fetch_add_explicit(&state->refs,1,memory_order_relaxed);atomic_fetch_add_explicit(&disp_async_jobs,1,memory_order_relaxed);uintptr_t handle=disp_thread_start(disp_connect_worker,state,state->line,state->column);disp_thread_detach(handle);}if(!atomic_load_explicit(&state->done,memory_order_acquire)){disp_reactor_offer(1000000ULL);return false;}return true;}
 static void disp_connect_take(disp_connect_state *state,bool *ok,disp_native_tcp_stream *stream,disp_native_string *error){if(!atomic_load_explicit(&state->done,memory_order_acquire)||state->taken)dv_panic("TCP connect result is not ready",0,0);state->taken=true;*ok=state->ok;*stream=state->stream;*error=state->error;state->stream=(disp_native_tcp_stream){0};state->error=(disp_native_string){0};}
 static void disp_connect_drop(void *raw){disp_connect_state *state=(disp_connect_state*)raw;if(!state)return;atomic_store_explicit(&state->cancelled,true,memory_order_release);disp_connect_release(state);}
+struct disp_tcp_listener_state { atomic_size_t refs;atomic_bool closed;disp_socket_handle socket; };
+static void disp_tcp_listener_retain(disp_tcp_listener_state *state){atomic_fetch_add_explicit(&state->refs,1,memory_order_relaxed);}
+static void disp_tcp_listener_close(disp_native_tcp_listener *listener){if(!listener->state)return;if(!atomic_exchange_explicit(&listener->state->closed,true,memory_order_acq_rel))disp_socket_close(listener->state->socket);}
+static void disp_tcp_listener_release(disp_tcp_listener_state *state){if(atomic_fetch_sub_explicit(&state->refs,1,memory_order_acq_rel)!=1)return;atomic_thread_fence(memory_order_acquire);if(!atomic_load_explicit(&state->closed,memory_order_acquire))disp_socket_close(state->socket);disp_dealloc(state);}
+static void disp_tcp_listener_drop(disp_native_tcp_listener *listener){if(!listener->state)return;disp_tcp_listener_close(listener);disp_tcp_listener_release(listener->state);listener->state=NULL;}
+static bool disp_tcp_listener_bind(disp_native_socket_address address,disp_native_tcp_listener *listener,disp_native_string *error){disp_network_init();char port[6];snprintf(port,sizeof(port),"%u",(unsigned)address.port);struct addrinfo hints={0},*addresses=NULL;hints.ai_family=AF_UNSPEC;hints.ai_socktype=SOCK_STREAM;hints.ai_protocol=IPPROTO_TCP;hints.ai_flags=AI_PASSIVE;int status=getaddrinfo(address.host,port,&hints,&addresses);if(status!=0){
+#ifdef _WIN32
+const char *message=gai_strerrorA(status);
+#else
+const char *message=gai_strerror(status);
+#endif
+*error=disp_owned_bytes(message?message:"address resolution failed",message?strlen(message):25);disp_socket_address_drop(&address);return false;}int last_error=0;disp_socket_handle bound=DISP_INVALID_SOCKET;for(struct addrinfo *candidate=addresses;candidate;candidate=candidate->ai_next){disp_socket_handle handle=socket(candidate->ai_family,candidate->ai_socktype,candidate->ai_protocol);if(handle==DISP_INVALID_SOCKET){last_error=disp_socket_error_code();continue;}int reuse=1;setsockopt(handle,SOL_SOCKET,SO_REUSEADDR,(const char*)&reuse,sizeof(reuse));if(bind(handle,candidate->ai_addr,(int)candidate->ai_addrlen)==0&&listen(handle,SOMAXCONN)==0&&disp_socket_set_blocking(handle,false)){bound=handle;break;}last_error=disp_socket_error_code();disp_socket_close(handle);}freeaddrinfo(addresses);disp_socket_address_drop(&address);if(bound==DISP_INVALID_SOCKET){*error=disp_network_error_code("TCP bind",last_error);return false;}disp_tcp_listener_state *state=(disp_tcp_listener_state*)disp_alloc(sizeof(disp_tcp_listener_state),_Alignof(disp_tcp_listener_state));atomic_init(&state->refs,1);atomic_init(&state->closed,false);state->socket=bound;listener->state=state;return true;}
+static bool disp_tcp_listener_local_port(const disp_native_tcp_listener *listener,size_t *port,disp_native_string *error){if(!listener->state||atomic_load_explicit(&listener->state->closed,memory_order_acquire)){*error=disp_owned_bytes("TCP listener is closed",22);return false;}struct sockaddr_storage address;socklen_t length=sizeof(address);if(getsockname(listener->state->socket,(struct sockaddr*)&address,&length)!=0){*error=disp_network_error_code("TCP local address",disp_socket_error_code());return false;}if(address.ss_family==AF_INET)*port=(size_t)ntohs(((struct sockaddr_in*)&address)->sin_port);else if(address.ss_family==AF_INET6)*port=(size_t)ntohs(((struct sockaddr_in6*)&address)->sin6_port);else{*error=disp_owned_bytes("TCP listener has an unsupported address family",46);return false;}return true;}
+typedef struct { disp_tcp_listener_state *listener;bool started;bool taken;bool done;bool ok;bool has_deadline;uint64_t timeout;uint64_t deadline;int line;int column;disp_native_tcp_stream stream;disp_native_string error; } disp_accept_state;
+static disp_accept_state *disp_accept_create(const disp_native_tcp_listener *listener,bool has_timeout,uint64_t timeout,int line,int column){if(!listener||!listener->state)dv_panic("TCP listener is unavailable",line,column);disp_accept_state *state=(disp_accept_state*)disp_alloc_zeroed(1,sizeof(disp_accept_state),_Alignof(disp_accept_state));state->listener=listener->state;disp_tcp_listener_retain(state->listener);state->has_deadline=has_timeout;state->timeout=timeout;state->line=line;state->column=column;return state;}
+static bool disp_accept_poll(disp_accept_state *state){if(!state||state->taken)dv_panic("TCP accept future has already completed",0,0);if(state->done)return true;if(!state->started){state->started=true;uint64_t now=disp_time_now_nanos();state->deadline=UINT64_MAX-now<state->timeout?UINT64_MAX:now+state->timeout;}if(atomic_load_explicit(&state->listener->closed,memory_order_acquire)){state->error=disp_owned_bytes("TCP listener is closed",22);state->done=true;return true;}disp_socket_handle accepted=accept(state->listener->socket,NULL,NULL);if(accepted!=DISP_INVALID_SOCKET){if(!disp_socket_set_blocking(accepted,true)){int code=disp_socket_error_code();disp_socket_close(accepted);state->error=disp_network_error_code("TCP accepted socket setup",code);state->done=true;return true;}disp_tcp_state *stream=(disp_tcp_state*)disp_alloc(sizeof(disp_tcp_state),_Alignof(disp_tcp_state));stream->socket=accepted;stream->closed=false;state->stream=(disp_native_tcp_stream){.state=stream};state->ok=true;state->done=true;return true;}int code=disp_socket_error_code();if(!disp_socket_would_block(code)){state->error=disp_network_error_code("TCP accept",code);state->done=true;return true;}uint64_t now=disp_time_now_nanos();if(state->has_deadline&&now>=state->deadline){state->error=disp_owned_bytes("TCP accept timed out",20);state->done=true;return true;}uint64_t wait=1000000ULL;if(state->has_deadline&&state->deadline-now<wait)wait=state->deadline-now;disp_reactor_offer(wait);return false;}
+static void disp_accept_take(disp_accept_state *state,bool *ok,disp_native_tcp_stream *stream,disp_native_string *error){if(!state->done||state->taken)dv_panic("TCP accept result is not ready",0,0);state->taken=true;*ok=state->ok;*stream=state->stream;*error=state->error;state->stream=(disp_native_tcp_stream){0};state->error=(disp_native_string){0};}
+static void disp_accept_drop(void *raw){disp_accept_state *state=(disp_accept_state*)raw;if(!state)return;disp_tcp_stream_drop(&state->stream);disp_string_drop(&state->error);disp_tcp_listener_release(state->listener);disp_dealloc(state);}
 #endif
 static bool disp_directory_create(const disp_native_path *path,disp_native_string *error){
 #ifdef _WIN32

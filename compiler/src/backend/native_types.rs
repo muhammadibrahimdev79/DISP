@@ -18,6 +18,8 @@ pub fn generate(
          typedef struct { char *host; size_t len; uint16_t port; } disp_native_socket_address;\n\
          typedef struct disp_tcp_state disp_tcp_state;\n\
          typedef struct { disp_tcp_state *state; } disp_native_tcp_stream;\n\
+         typedef struct disp_tcp_listener_state disp_tcp_listener_state;\n\
+         typedef struct { disp_tcp_listener_state *state; } disp_native_tcp_listener;\n\
          typedef struct { uint64_t nanos; } disp_native_instant;\n\
          typedef struct { uint64_t nanos; } disp_native_duration;\n\
          typedef struct { uintptr_t handle; void *result; } disp_native_thread;\n\
@@ -280,7 +282,7 @@ fn dependencies(program: &hir::Program, ty: &hir::Type) -> Vec<hir::Type> {
         | hir::Type::Task(_)
         | hir::Type::Mutex(_)
         | hir::Type::MutexGuard(_) => vec![],
-        hir::Type::SocketAddress | hir::Type::TcpStream => vec![],
+        hir::Type::SocketAddress | hir::Type::TcpStream | hir::Type::TcpListener => vec![],
         _ => vec![],
     }
 }
@@ -316,6 +318,7 @@ pub fn c_type(ty: &hir::Type) -> String {
         hir::Type::Path => "disp_native_path".into(),
         hir::Type::SocketAddress => "disp_native_socket_address".into(),
         hir::Type::TcpStream => "disp_native_tcp_stream".into(),
+        hir::Type::TcpListener => "disp_native_tcp_listener".into(),
         hir::Type::Instant => "disp_native_instant".into(),
         hir::Type::Duration => "disp_native_duration".into(),
         hir::Type::Thread(_) => "disp_native_thread".into(),

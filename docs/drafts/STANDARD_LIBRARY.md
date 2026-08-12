@@ -646,8 +646,22 @@ stream.close()
 ```
 
 `read` and `write` return `Result<_, NetworkError>`. Reads are bounded to 16 MiB per call,
-and text protocols must explicitly validate or decode the returned `List<u8>`. Server listeners,
-UDP, readiness-driven stream operations, and high-level protocol clients remain design work.
+and text protocols must explicitly validate or decode the returned `List<u8>`.
+
+Owned TCP servers bind through the same validated address type. Accept futures retain the
+underlying listener state without exposing lifetimes or permitting use-after-close:
+
+```disp
+bound = TcpListener.bind(SocketAddress("127.0.0.1", 8080))
+var listener = bound?
+connection = await listener.accept_timeout(Duration.from_seconds(30))
+var stream = connection?
+```
+
+`local_port()` returns `Result<uint, NetworkError>`, which supports safe operating-system
+port assignment with port zero. `accept()` and `accept_timeout()` are lazy nonblocking futures;
+closing or dropping the listener safely terminates pending accepts. UDP, readiness-driven stream
+reads/writes, and high-level protocol clients remain design work.
 
 ---
 

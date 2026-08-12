@@ -45,7 +45,17 @@ pub fn build(
     let abi = abi::lower(hir, mir, &mono, target)?;
     let native_types = native_types::generate(hir, &mono, target)?;
     let generated = codegen::generate(mir, &mono, &abi, &native_types)?;
-    let networking = generated.source.contains("disp_Async_connect_poll_");
+    let networking = mir.functions.iter().any(|function| {
+        function.blocks.iter().any(|block| {
+            matches!(
+                &block.terminator,
+                mir::Terminator::Call {
+                    target: hir::CallTarget::Intrinsic(name),
+                    ..
+                } if name == "Async.connect" || name.starts_with("TcpListener.") || name.starts_with("TcpStream.")
+            )
+        })
+    });
     let project_root;
     let (stem, parent) = if source_path.is_dir() {
         project_root = if source_path.is_absolute() {
