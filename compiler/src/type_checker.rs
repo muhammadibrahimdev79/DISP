@@ -31,6 +31,7 @@ pub enum Type {
     Set(Box<Type>),
     Thread(Box<Type>),
     Future(Box<Type>),
+    Task(Box<Type>),
     Mutex(Box<Type>),
     MutexGuard(Box<Type>),
     AtomicInt,
@@ -221,11 +222,19 @@ impl TypeChecker {
                 unreachable!();
             };
             self.set_generics(&declaration.generics);
-            let fields = declaration
-                .fields
-                .iter()
-                .map(|field| Ok((field.name.clone(), self.resolve_type(&field.ty)?)))
-                .collect::<Result<HashMap<_, _>, Diagnostic>>()?;
+            let mut fields = HashMap::new();
+            for field in &declaration.fields {
+                let ty = self.resolve_type(&field.ty)?;
+                if type_contains_task(&ty) {
+                    return Err(Diagnostic::new(
+                        DiagnosticKind::Type,
+                        "Task<T> cannot be stored in a struct",
+                        field.ty.span,
+                    )
+                    .with_help("keep spawned tasks in the async scope that owns them and await or cancel them there"));
+                }
+                fields.insert(field.name.clone(), ty);
+            }
             self.structs.get_mut(&id).unwrap().fields = fields;
         }
         for declaration in &program.enums {
@@ -240,7 +249,18 @@ impl TypeChecker {
                     payload: variant
                         .payload
                         .iter()
-                        .map(|ty| self.resolve_type(ty))
+                        .map(|ty| {
+                            let resolved = self.resolve_type(ty)?;
+                            if type_contains_task(&resolved) {
+                                return Err(Diagnostic::new(
+                                    DiagnosticKind::Type,
+                                    "Task<T> cannot be stored in an enum",
+                                    ty.span,
+                                )
+                                .with_help("keep spawned tasks in the async scope that owns them and await or cancel them there"));
+                            }
+                            Ok(resolved)
+                        })
                         .collect::<Result<Vec<_>, _>>()?,
                 };
                 self.variants
@@ -638,6 +658,19 @@ impl TypeChecker {
         function: &Function,
         signature: Signature,
     ) -> Result<(), Diagnostic> {
+        if signature.parameters.iter().any(type_contains_task)
+            || type_contains_task(&signature.result)
+        {
+            return Err(Diagnostic::new(
+                DiagnosticKind::Type,
+                format!(
+                    "Task<T> cannot escape the structured scope of `{}`",
+                    function.name
+                ),
+                function.span,
+            )
+            .with_help("spawn, await, or let the task cancel within the same async function"));
+        }
         if function.asynchronous
             && (signature
                 .parameters
@@ -1235,7 +1268,7 @@ impl TypeChecker {
                     .with_help("make the enclosing function `async`, or wait at an explicit synchronous boundary"));
                 }
                 match self.check_expression(future)? {
-                    Type::Future(output) => Ok(*output),
+                    Type::Future(output) | Type::Task(output) => Ok(*output),
                     other => Err(Diagnostic::new(
                         DiagnosticKind::Type,
                         format!(
@@ -1506,17 +1539,37 @@ impl TypeChecker {
                 if let Expression::FieldAccess { object, field, .. } = &callee.node
                     && matches!(&object.node, Expression::Identifier(name) if name == "Async")
                 {
-                    if field != "yield" || !arguments.is_empty() {
-                        return Err(Diagnostic::new(
-                            DiagnosticKind::Type,
-                            format!(
-                                "no async operation `Async.{field}` with {} arguments",
-                                arguments.len()
-                            ),
-                            expression.span,
-                        ));
+                    if field == "yield" && arguments.is_empty() {
+                        return Ok(Type::Future(Box::new(Type::Unit)));
                     }
-                    return Ok(Type::Future(Box::new(Type::Unit)));
+                    if field == "spawn" && arguments.len() == 1 {
+                        if self.async_depth == 0 {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Type,
+                                "`Async.spawn` is only allowed inside an `async fn`",
+                                expression.span,
+                            ));
+                        }
+                        return match self.check_expression(&arguments[0])? {
+                            Type::Future(output) => Ok(Type::Task(output)),
+                            other => Err(Diagnostic::new(
+                                DiagnosticKind::Type,
+                                format!(
+                                    "`Async.spawn` requires Future<T>, found {}",
+                                    self.format_type(&other)
+                                ),
+                                arguments[0].span,
+                            )),
+                        };
+                    }
+                    return Err(Diagnostic::new(
+                        DiagnosticKind::Type,
+                        format!(
+                            "no async operation `Async.{field}` with {} arguments",
+                            arguments.len()
+                        ),
+                        expression.span,
+                    ));
                 }
                 if matches!(callee.node, Expression::FieldAccess { .. })
                     && let Ok(Type::Function(parameters, result)) = self.check_expression(callee)
@@ -3213,6 +3266,9 @@ impl TypeChecker {
             "Future" if ty.arguments.len() == 1 => {
                 Type::Future(Box::new(self.resolve_type(&ty.arguments[0])?))
             }
+            "Task" if ty.arguments.len() == 1 => {
+                Type::Task(Box::new(self.resolve_type(&ty.arguments[0])?))
+            }
             "Mutex" if ty.arguments.len() == 1 => {
                 Type::Mutex(Box::new(self.resolve_type(&ty.arguments[0])?))
             }
@@ -3516,6 +3572,7 @@ impl TypeChecker {
             Type::Set(element) => format!("Set<{}>", self.format_type(element)),
             Type::Thread(result) => format!("Thread<{}>", self.format_type(result)),
             Type::Future(result) => format!("Future<{}>", self.format_type(result)),
+            Type::Task(result) => format!("Task<{}>", self.format_type(result)),
             Type::Mutex(value) => format!("Mutex<{}>", self.format_type(value)),
             Type::MutexGuard(value) => format!("MutexGuard<{}>", self.format_type(value)),
             Type::AtomicInt => "AtomicInt".into(),
@@ -3766,6 +3823,9 @@ fn types_compatible(expected: &Type, actual: &Type) -> bool {
             types_compatible(lk, rk) && types_compatible(lv, rv)
         }
         (Type::Set(left), Type::Set(right)) => types_compatible(left, right),
+        (Type::Future(left), Type::Future(right)) | (Type::Task(left), Type::Task(right)) => {
+            types_compatible(left, right)
+        }
         (Type::Result(left_ok, left_error), Type::Result(right_ok, right_error)) => {
             types_compatible(left_ok, right_ok) && types_compatible(left_error, right_error)
         }
@@ -3839,6 +3899,8 @@ fn infer_substitutions(
             infer_substitutions(x, y, substitutions, span)?;
         }
         (Type::Thread(x), Type::Thread(y))
+        | (Type::Future(x), Type::Future(y))
+        | (Type::Task(x), Type::Task(y))
         | (Type::Mutex(x), Type::Mutex(y))
         | (Type::MutexGuard(x), Type::MutexGuard(y)) => {
             infer_substitutions(x, y, substitutions, span)?;
@@ -3895,6 +3957,8 @@ fn substitute(ty: &Type, substitutions: &HashMap<String, Type>) -> Type {
         ),
         Type::Set(x) => Type::Set(Box::new(substitute(x, substitutions))),
         Type::Thread(x) => Type::Thread(Box::new(substitute(x, substitutions))),
+        Type::Future(x) => Type::Future(Box::new(substitute(x, substitutions))),
+        Type::Task(x) => Type::Task(Box::new(substitute(x, substitutions))),
         Type::Mutex(x) => Type::Mutex(Box::new(substitute(x, substitutions))),
         Type::MutexGuard(x) => Type::MutexGuard(Box::new(substitute(x, substitutions))),
         Type::Result(a, b) => Type::Result(
@@ -3932,6 +3996,8 @@ fn types_overlap(left: &Type, right: &Type) -> bool {
         (Type::Slice(x), Type::Slice(y)) => types_overlap(x, y),
         (Type::List(x), Type::List(y)) => types_overlap(x, y),
         (Type::Thread(x), Type::Thread(y))
+        | (Type::Future(x), Type::Future(y))
+        | (Type::Task(x), Type::Task(y))
         | (Type::Mutex(x), Type::Mutex(y))
         | (Type::MutexGuard(x), Type::MutexGuard(y)) => types_overlap(x, y),
         (Type::Map(ak, av), Type::Map(bk, bv)) => types_overlap(ak, bk) && types_overlap(av, bv),
@@ -3949,6 +4015,8 @@ fn contains_infer(ty: &Type) -> bool {
         | Type::Slice(element)
         | Type::List(element)
         | Type::Thread(element)
+        | Type::Future(element)
+        | Type::Task(element)
         | Type::Mutex(element)
         | Type::MutexGuard(element) => contains_infer(element),
         Type::Map(key, value) => contains_infer(key) || contains_infer(value),
@@ -4057,9 +4125,37 @@ fn type_crosses_thread_by_borrow(ty: &Type) -> bool {
         | Type::Option(inner)
         | Type::Thread(inner)
         | Type::Future(inner)
+        | Type::Task(inner)
         | Type::Mutex(inner) => type_crosses_thread_by_borrow(inner),
         Type::Map(key, value) | Type::Result(key, value) => {
             type_crosses_thread_by_borrow(key) || type_crosses_thread_by_borrow(value)
+        }
+        _ => false,
+    }
+}
+
+fn type_contains_task(ty: &Type) -> bool {
+    match ty {
+        Type::Task(_) => true,
+        Type::Struct(_, arguments) | Type::Enum(_, arguments) => {
+            arguments.iter().any(type_contains_task)
+        }
+        Type::Option(inner)
+        | Type::Array(inner, _)
+        | Type::Slice(inner)
+        | Type::List(inner)
+        | Type::Set(inner)
+        | Type::Thread(inner)
+        | Type::Future(inner)
+        | Type::Mutex(inner)
+        | Type::MutexGuard(inner)
+        | Type::Reference(inner, _)
+        | Type::RawPointer(inner, _) => type_contains_task(inner),
+        Type::Map(key, value) | Type::Result(key, value) => {
+            type_contains_task(key) || type_contains_task(value)
+        }
+        Type::Function(parameters, result) => {
+            parameters.iter().any(type_contains_task) || type_contains_task(result)
         }
         _ => false,
     }
@@ -4078,6 +4174,10 @@ fn merge_types(left: &Type, right: &Type) -> Type {
         (Type::Thread(left), Type::Thread(right)) => {
             Type::Thread(Box::new(merge_types(left, right)))
         }
+        (Type::Future(left), Type::Future(right)) => {
+            Type::Future(Box::new(merge_types(left, right)))
+        }
+        (Type::Task(left), Type::Task(right)) => Type::Task(Box::new(merge_types(left, right))),
         (Type::Mutex(left), Type::Mutex(right)) => Type::Mutex(Box::new(merge_types(left, right))),
         (Type::MutexGuard(left), Type::MutexGuard(right)) => {
             Type::MutexGuard(Box::new(merge_types(left, right)))

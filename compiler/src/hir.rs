@@ -41,6 +41,7 @@ pub enum Type {
     Set(Box<Type>),
     Thread(Box<Type>),
     Future(Box<Type>),
+    Task(Box<Type>),
     Mutex(Box<Type>),
     MutexGuard(Box<Type>),
     AtomicInt,
@@ -86,6 +87,7 @@ impl Type {
             | Self::Set(_)
             | Self::Thread(_)
             | Self::Future(_)
+            | Self::Task(_)
             | Self::Mutex(_)
             | Self::MutexGuard(_)
             | Self::AtomicInt
@@ -795,6 +797,12 @@ impl<'a> Lowering<'a> {
                     .unwrap_or(Type::Unknown),
             )),
             "Future" => Type::Future(Box::new(
+                ty.arguments
+                    .first()
+                    .map(|x| self.lower_type(x))
+                    .unwrap_or(Type::Unknown),
+            )),
+            "Task" => Type::Task(Box::new(
                 ty.arguments
                     .first()
                     .map(|x| self.lower_type(x))
@@ -1642,7 +1650,7 @@ impl FunctionLowering<'_, '_> {
             ast::Expression::Await(x) => {
                 let x = self.lower_expr(x)?;
                 let ty = match &x.ty {
-                    Type::Future(inner) => (**inner).clone(),
+                    Type::Future(inner) | Type::Task(inner) => (**inner).clone(),
                     _ => Type::Unknown,
                 };
                 (ExprKind::Await(Box::new(x)), ty)
@@ -1683,14 +1691,26 @@ impl FunctionLowering<'_, '_> {
         if let ast::Expression::FieldAccess { object, field, .. } = &callee.node {
             if let ast::Expression::Identifier(owner) = &object.node {
                 if owner == "Async" {
+                    let args = arguments
+                        .iter()
+                        .map(|x| self.lower_expr(x))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let ty = if field == "spawn" {
+                        match args.first().map(|value| &value.ty) {
+                            Some(Type::Future(output)) => Type::Task(output.clone()),
+                            _ => Type::Unknown,
+                        }
+                    } else {
+                        Type::Future(Box::new(Type::Unit))
+                    };
                     return Ok(Expr {
                         kind: ExprKind::Call(Call {
                             target: CallTarget::Intrinsic(format!("Async.{field}")),
-                            arguments: vec![],
+                            arguments: args,
                             receiver: None,
                             substitutions: vec![],
                         }),
-                        ty: Type::Future(Box::new(Type::Unit)),
+                        ty,
                         span,
                     });
                 }
@@ -3186,6 +3206,7 @@ fn surface_type_is_copy(ty: &Type) -> bool {
         | Type::Set(_)
         | Type::Thread(_)
         | Type::Future(_)
+        | Type::Task(_)
         | Type::Mutex(_)
         | Type::MutexGuard(_)
         | Type::AtomicInt
@@ -3300,6 +3321,7 @@ fn infer_named_type(
         | Type::Option(element) => std::slice::from_ref(element),
         Type::Thread(element)
         | Type::Future(element)
+        | Type::Task(element)
         | Type::Mutex(element)
         | Type::MutexGuard(element) => std::slice::from_ref(element),
         _ => &[],
@@ -3347,6 +3369,7 @@ fn infer_hir_type(pattern: &Type, concrete: &Type, inferred: &mut HashMap<String
         (Type::Thread(x), Type::Thread(y)) | (Type::Future(x), Type::Future(y)) => {
             infer_hir_type(x, y, inferred)
         }
+        (Type::Task(x), Type::Task(y)) => infer_hir_type(x, y, inferred),
         (Type::Mutex(x), Type::Mutex(y)) | (Type::MutexGuard(x), Type::MutexGuard(y)) => {
             infer_hir_type(x, y, inferred)
         }
@@ -3418,6 +3441,7 @@ pub(crate) fn substitute_type(ty: &Type, substitutions: &HashMap<String, Type>) 
         Type::Set(inner) => Type::Set(Box::new(substitute_type(inner, substitutions))),
         Type::Thread(inner) => Type::Thread(Box::new(substitute_type(inner, substitutions))),
         Type::Future(inner) => Type::Future(Box::new(substitute_type(inner, substitutions))),
+        Type::Task(inner) => Type::Task(Box::new(substitute_type(inner, substitutions))),
         Type::Mutex(inner) => Type::Mutex(Box::new(substitute_type(inner, substitutions))),
         Type::MutexGuard(inner) => {
             Type::MutexGuard(Box::new(substitute_type(inner, substitutions)))
@@ -3464,6 +3488,7 @@ fn fill_unknown(actual: &mut Type, expected: &Type) {
         (Type::Set(actual), Type::Set(expected)) => fill_unknown(actual, expected),
         (Type::Thread(actual), Type::Thread(expected)) => fill_unknown(actual, expected),
         (Type::Future(actual), Type::Future(expected)) => fill_unknown(actual, expected),
+        (Type::Task(actual), Type::Task(expected)) => fill_unknown(actual, expected),
         (Type::Mutex(actual), Type::Mutex(expected))
         | (Type::MutexGuard(actual), Type::MutexGuard(expected)) => fill_unknown(actual, expected),
         (Type::Result(actual_ok, actual_error), Type::Result(expected_ok, expected_error)) => {
@@ -3682,6 +3707,7 @@ fn contains_unknown(ty: &Type) -> bool {
         | Type::List(inner)
         | Type::Thread(inner) => contains_unknown(inner),
         Type::Future(inner) => contains_unknown(inner),
+        Type::Task(inner) => contains_unknown(inner),
         Type::Map(key, value) => contains_unknown(key) || contains_unknown(value),
         Type::Set(inner) => contains_unknown(inner),
         Type::Result(ok, error) => contains_unknown(ok) || contains_unknown(error),

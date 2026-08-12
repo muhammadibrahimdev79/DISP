@@ -9,7 +9,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::{
-        Arc, Mutex as StdMutex,
+        Arc, Mutex as StdMutex, Weak,
         atomic::{AtomicBool, AtomicI64, Ordering},
     },
     thread,
@@ -118,6 +118,37 @@ impl std::fmt::Debug for RuntimeFuture {
 }
 
 impl PartialEq for RuntimeFuture {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeTask(Arc<StdMutex<RuntimeTaskWork>>);
+
+enum RuntimeTaskWork {
+    Future(RuntimeFuture),
+    Running,
+    Ready(Value),
+    Consumed,
+}
+
+impl RuntimeTask {
+    fn new(future: RuntimeFuture) -> Self {
+        Self(Arc::new(StdMutex::new(RuntimeTaskWork::Future(future))))
+    }
+}
+
+impl std::fmt::Debug for RuntimeTask {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("Task")
+            .field(&Arc::as_ptr(&self.0))
+            .finish()
+    }
+}
+
+impl PartialEq for RuntimeTask {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
@@ -477,6 +508,7 @@ enum Value {
     Duration(StdDuration),
     Thread(RuntimeThread),
     Future(RuntimeFuture),
+    Task(RuntimeTask),
     Mutex(RuntimeMutex),
     MutexGuard(RuntimeMutexGuard),
     AtomicInt(RuntimeAtomicInt),
@@ -566,6 +598,7 @@ pub struct Interpreter {
     scope_orders: Vec<Vec<String>>,
     output: Arc<StdMutex<Vec<String>>>,
     call_depth: usize,
+    tasks: Vec<Weak<StdMutex<RuntimeTaskWork>>>,
 }
 
 impl Interpreter {
@@ -575,6 +608,7 @@ impl Interpreter {
             scope_orders: Vec::new(),
             output: Arc::new(StdMutex::new(Vec::new())),
             call_depth: 0,
+            tasks: Vec::new(),
         }
     }
 
@@ -609,6 +643,7 @@ impl Interpreter {
             .expect("interpreter output lock poisoned")
             .clear();
         self.call_depth = 0;
+        self.tasks.clear();
         let main = program
             .functions
             .iter()
@@ -727,8 +762,52 @@ impl Interpreter {
             FutureWork::Function(function, arguments) => {
                 self.call_function_body(program, &function, arguments, span)
             }
-            FutureWork::Yield => Ok(Value::Unit),
+            FutureWork::Yield => {
+                self.progress_tasks(program, span)?;
+                Ok(Value::Unit)
+            }
         }
+    }
+
+    fn progress_tasks(&mut self, program: &Program, span: Span) -> RuntimeResult<()> {
+        self.tasks.retain(|task| task.strong_count() > 0);
+        let tasks = self.tasks.clone();
+        for weak in tasks {
+            let Some(state) = weak.upgrade() else {
+                continue;
+            };
+            let work = {
+                let mut work = state
+                    .lock()
+                    .map_err(|_| self.error("task state is poisoned", span))?;
+                match &*work {
+                    RuntimeTaskWork::Future(_) => {
+                        std::mem::replace(&mut *work, RuntimeTaskWork::Running)
+                    }
+                    RuntimeTaskWork::Running
+                    | RuntimeTaskWork::Ready(_)
+                    | RuntimeTaskWork::Consumed => continue,
+                }
+            };
+            let RuntimeTaskWork::Future(future) = work else {
+                unreachable!()
+            };
+            match self.await_future(program, future, span) {
+                Ok(value) => {
+                    *state
+                        .lock()
+                        .map_err(|_| self.error("task state is poisoned", span))? =
+                        RuntimeTaskWork::Ready(value);
+                }
+                Err(error) => {
+                    if let Ok(mut work) = state.lock() {
+                        *work = RuntimeTaskWork::Consumed;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn call_closure(
@@ -1590,9 +1669,22 @@ impl Interpreter {
                 }
                 if let Expression::FieldAccess { object, field, .. } = &callee.node
                     && matches!(&object.node, Expression::Identifier(name) if name == "Async")
-                    && field == "yield"
                 {
-                    return Ok(Value::Future(RuntimeFuture::yielding()));
+                    return match field.as_str() {
+                        "yield" => Ok(Value::Future(RuntimeFuture::yielding())),
+                        "spawn" => {
+                            let value = self.consume(program, &arguments[0])?;
+                            let Value::Future(future) = value else {
+                                return Err(
+                                    self.error("Async.spawn requires a Future", arguments[0].span)
+                                );
+                            };
+                            let task = RuntimeTask::new(future);
+                            self.tasks.push(Arc::downgrade(&task.0));
+                            Ok(Value::Task(task))
+                        }
+                        _ => Err(self.error("unknown Async operation", callee.span)),
+                    };
                 }
                 if let Expression::FieldAccess { object, field, .. } = &callee.node
                     && let Expression::Identifier(owner) = &object.node
@@ -2795,10 +2887,31 @@ impl Interpreter {
             Expression::Spawn(task) => self.spawn_task(program, task, expression.span),
             Expression::Await(future) => {
                 let value = self.consume(program, future)?;
-                let Value::Future(future) = value else {
-                    return Err(self.error("`await` requires a Future", future.span));
-                };
-                self.await_future(program, future, expression.span)
+                match value {
+                    Value::Future(future) => self.await_future(program, future, expression.span),
+                    Value::Task(task) => {
+                        let work = {
+                            let mut work = task
+                                .0
+                                .lock()
+                                .map_err(|_| self.error("task state is poisoned", future.span))?;
+                            std::mem::replace(&mut *work, RuntimeTaskWork::Consumed)
+                        };
+                        match work {
+                            RuntimeTaskWork::Future(future) => {
+                                self.await_future(program, future, expression.span)
+                            }
+                            RuntimeTaskWork::Ready(value) => Ok(value),
+                            RuntimeTaskWork::Running => {
+                                Err(self.error("task cannot await itself", future.span))
+                            }
+                            RuntimeTaskWork::Consumed => {
+                                Err(self.error("task has already been awaited", future.span))
+                            }
+                        }
+                    }
+                    _ => Err(self.error("`await` requires a Future or Task", future.span)),
+                }
             }
             Expression::Borrow { mutable, target } => {
                 let place = self
@@ -2858,6 +2971,7 @@ impl Interpreter {
                     scope_orders: Vec::new(),
                     output,
                     call_depth: 0,
+                    tasks: Vec::new(),
                 };
                 child
                     .call_function(&child_program, &function, values, call_span)
@@ -3458,6 +3572,7 @@ fn value_type_name(value: &Value) -> &str {
         Value::Duration(_) => "Duration",
         Value::Thread(_) => "Thread",
         Value::Future(_) => "Future",
+        Value::Task(_) => "Task",
         Value::Mutex(_) => "Mutex",
         Value::MutexGuard(_) => "MutexGuard",
         Value::AtomicInt(_) => "AtomicInt",
@@ -3514,6 +3629,7 @@ fn value_is_copy(program: &Program, value: &Value) -> bool {
         | Value::Set { .. }
         | Value::Thread(_)
         | Value::Future(_)
+        | Value::Task(_)
         | Value::Mutex(_)
         | Value::MutexGuard(_)
         | Value::AtomicInt(_)
@@ -3887,6 +4003,7 @@ fn display_value(value: Value) -> String {
         Value::Duration(value) => format!("{}ns", value.as_nanos()),
         Value::Thread(_) => "<Thread>".into(),
         Value::Future(_) => "<Future>".into(),
+        Value::Task(_) => "<Task>".into(),
         Value::Mutex(_) => "<Mutex>".into(),
         Value::MutexGuard(_) => "<MutexGuard>".into(),
         Value::AtomicInt(_) => "<AtomicInt>".into(),

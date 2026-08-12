@@ -1234,7 +1234,12 @@ impl Parser {
                     span,
                 };
             } else if self.match_token(&TokenKind::Dot) {
-                let (field, field_span) = self.expect_identifier("expected field after `.`")?;
+                let (field, field_span) = if self.check(&TokenKind::Spawn) {
+                    let token = self.advance().clone();
+                    ("spawn".into(), token.span)
+                } else {
+                    self.expect_identifier("expected field after `.`")?
+                };
                 let span = expression.span.through(field_span);
                 expression = Spanned {
                     node: Expression::FieldAccess {

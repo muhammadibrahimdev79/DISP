@@ -21,6 +21,7 @@ enum Ty {
     Set(Box<Ty>),
     Thread(Box<Ty>),
     Future(Box<Ty>),
+    Task(Box<Ty>),
     Mutex(Box<Ty>),
     MutexGuard(Box<Ty>),
     AtomicInt,
@@ -1114,7 +1115,7 @@ impl<'a> Analyzer<'a> {
                 )))
             }
             Expression::Await(future) => match self.check_expr(future, UseMode::Consume)? {
-                Ty::Future(output) => Ok(*output),
+                Ty::Future(output) | Ty::Task(output) => Ok(*output),
                 _ => Ok(Ty::Owned("future-output".into())),
             },
             Expression::Match { value, arms } => {
@@ -1234,11 +1235,14 @@ impl<'a> Analyzer<'a> {
         }
         if let Expression::FieldAccess { object, field, .. } = &callee.node {
             if matches!(&object.node, Expression::Identifier(name) if name == "Async") {
-                return Ok(if field == "yield" {
-                    Ty::Future(Box::new(Ty::Unit))
-                } else {
-                    Ty::Unit
-                });
+                return match field.as_str() {
+                    "yield" => Ok(Ty::Future(Box::new(Ty::Unit))),
+                    "spawn" => match self.check_expr(&arguments[0], UseMode::Consume)? {
+                        Ty::Future(output) => Ok(Ty::Task(output)),
+                        _ => Ok(Ty::Task(Box::new(Ty::Owned("task-output".into())))),
+                    },
+                    _ => Ok(Ty::Unit),
+                };
             }
             if let Expression::Identifier(owner) = &object.node
                 && matches!(
@@ -2257,6 +2261,7 @@ impl<'a> Analyzer<'a> {
             | Ty::Set(inner)
             | Ty::Thread(inner)
             | Ty::Future(inner)
+            | Ty::Task(inner)
             | Ty::Mutex(inner)
             | Ty::MutexGuard(inner) => self.ty_contains_function_inner(inner, visiting),
             Ty::Map(key, value) | Ty::Result(key, value) => {
@@ -2462,6 +2467,9 @@ impl<'a> Analyzer<'a> {
             "Future" if ty.arguments.len() == 1 => {
                 Ty::Future(Box::new(self.ty_from_name(&ty.arguments[0])))
             }
+            "Task" if ty.arguments.len() == 1 => {
+                Ty::Task(Box::new(self.ty_from_name(&ty.arguments[0])))
+            }
             "Mutex" if ty.arguments.len() == 1 => {
                 Ty::Mutex(Box::new(self.ty_from_name(&ty.arguments[0])))
             }
@@ -2525,6 +2533,7 @@ impl<'a> Analyzer<'a> {
             | Ty::Set(_)
             | Ty::Thread(_)
             | Ty::Future(_)
+            | Ty::Task(_)
             | Ty::Mutex(_)
             | Ty::MutexGuard(_)
             | Ty::AtomicInt
@@ -2781,6 +2790,7 @@ fn ty_contains_reference(ty: &Ty) -> bool {
         | Ty::Set(inner)
         | Ty::Thread(inner)
         | Ty::Future(inner)
+        | Ty::Task(inner)
         | Ty::Mutex(inner) => ty_contains_reference(inner),
         Ty::MutexGuard(_) => false,
         Ty::Map(key, value) => ty_contains_reference(key) || ty_contains_reference(value),
@@ -2802,6 +2812,7 @@ fn ty_contains_mutable_reference(ty: &Ty) -> bool {
         | Ty::Set(inner)
         | Ty::Thread(inner)
         | Ty::Future(inner)
+        | Ty::Task(inner)
         | Ty::Mutex(inner) => ty_contains_mutable_reference(inner),
         Ty::Map(key, value) | Ty::Result(key, value) => {
             ty_contains_mutable_reference(key) || ty_contains_mutable_reference(value)

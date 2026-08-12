@@ -1,0 +1,10 @@
+async fn calculate(value: int) -> int {
+    await Async.yield()
+    return value * 2
+}
+
+async fn main() {
+    left = Async.spawn(calculate(20))
+    right = Async.spawn(calculate(1))
+    print(await left + await right)
+}

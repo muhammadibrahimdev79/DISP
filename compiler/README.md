@@ -16,6 +16,7 @@ Implemented executable subset:
 - typed/resolved HIR with stable semantic identities and source spans
 - ownership-explicit MIR with basic blocks, calls, moves, copies, borrows, drop flags, and cleanup
 - typed native threads with owned `spawn`, consuming `join`, Send-style boundary checks, and deterministic joining
+- lazy `Future<T>` state machines and structured `Task<T>` values with `Async.spawn`, cooperative scheduling, consuming `await`, cancellation, and deterministic result cleanup
 - explicitly shared `Mutex<T>`, owning lock guards, and checked sequentially consistent `AtomicInt`
 - defined `extern C` declarations, fixed C ABI aliases, checked `CString`, borrowed `CStr`, and native library linking
 - owned aligned `Memory`, bounds-checked byte operations, raw pointer views, and explicit unsafe pointer arithmetic/read/write

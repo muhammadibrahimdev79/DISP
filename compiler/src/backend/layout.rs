@@ -118,6 +118,10 @@ impl<'a> LayoutEngine<'a> {
                 self.target.pointer_alignment,
                 self.target.pointer_alignment,
             ]),
+            hir::Type::Task(_) => scalar(
+                u64::from(self.target.pointer_width) / 8,
+                self.target.pointer_alignment,
+            ),
             hir::Type::Mutex(_) | hir::Type::MutexGuard(_) | hir::Type::AtomicInt => {
                 aggregate(&[self.target.pointer_alignment])
             }

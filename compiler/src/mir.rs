@@ -1807,12 +1807,15 @@ pub fn validate(program: &Program) -> Result<(), Diagnostic> {
                             ));
                         }
                     };
-                    let hir::Type::Future(output) = future_ty else {
-                        return Err(Diagnostic::new(
-                            DiagnosticKind::Internal,
-                            "MIR await operand is not a Future",
-                            *span,
-                        ));
+                    let output = match future_ty {
+                        hir::Type::Future(output) | hir::Type::Task(output) => output,
+                        _ => {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Internal,
+                                "MIR await operand is not a Future or Task",
+                                *span,
+                            ));
+                        }
                     };
                     let destination_ty = check_place(program, function, destination, *span)?;
                     if *output != destination_ty {

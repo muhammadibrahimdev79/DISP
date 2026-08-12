@@ -742,7 +742,7 @@ impl Resolver {
             "List" => Some(1),
             "Map" => Some(2),
             "Set" => Some(1),
-            "Thread" | "Future" => Some(1),
+            "Thread" | "Future" | "Task" => Some(1),
             "Mutex" | "MutexGuard" => Some(1),
             "AtomicInt" => Some(0),
             "CString" | "CStr" | "Memory" | "CInt" | "CUInt" | "CSize" | "CSSize" | "CChar"

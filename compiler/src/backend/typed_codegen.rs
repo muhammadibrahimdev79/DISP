@@ -45,6 +45,9 @@ pub fn generate(
         .unwrap();
         prototype(program, instance, &mut output);
     }
+    for result in task_result_types(program, instances) {
+        task_result_drop_wrapper(program, &result, &mut output);
+    }
     for target in callable_targets(program, instances)? {
         callable_wrapper(program, &target, &mut output);
     }
@@ -116,6 +119,35 @@ fn callable_targets(
         }
     }
     Ok(targets)
+}
+
+fn task_result_types(program: &mir::Program, instances: &mono::MonoProgram) -> BTreeSet<hir::Type> {
+    let mut results = BTreeSet::new();
+    for instance in &instances.instances {
+        let function = &program.functions[instance.function.0];
+        let substitutions = mono::mapping(function, instance);
+        for local in &function.locals {
+            if let hir::Type::Task(result) = substitute(&local.ty, &substitutions) {
+                results.insert(*result);
+            }
+        }
+    }
+    results
+}
+
+fn task_result_drop_name(result: &hir::Type) -> String {
+    format!("disp_task_result_drop_{}", mono::type_code(result))
+}
+
+fn task_result_drop_wrapper(program: &mir::Program, result: &hir::Type, output: &mut String) {
+    let result_c = native_types::c_type(result);
+    let drop = drop_value(program, &format!("*({result_c}*)raw"), result);
+    writeln!(
+        output,
+        "static void {}(void *raw){{(void)raw;{drop}}}",
+        task_result_drop_name(result)
+    )
+    .unwrap();
 }
 
 fn callable_wrapper_name(program: &mir::Program, target: &mono::FunctionInstance) -> String {
@@ -336,7 +368,7 @@ pub fn supported(program: &mir::Program, ty: &hir::Type) -> bool {
         | hir::Type::Float { .. } => true,
         hir::Type::AtomicInt => true,
         hir::Type::Thread(result) => supported(program, result),
-        hir::Type::Future(result) => supported(program, result),
+        hir::Type::Future(result) | hir::Type::Task(result) => supported(program, result),
         hir::Type::Mutex(value) | hir::Type::MutexGuard(value) => supported(program, value),
         hir::Type::Struct(id, arguments) => {
             let declaration = &program.structs[id.0];
@@ -786,6 +818,19 @@ fn terminator(
             let call = match target {
                 hir::CallTarget::Intrinsic(name) if name == "Async.yield" => {
                     "disp_future_yield()".into()
+                }
+                hir::CallTarget::Intrinsic(name) if name == "Async.spawn" => {
+                    let future_ty = operand_ty(program, function, &arguments[0], substitutions);
+                    let future =
+                        operand(program, function, &arguments[0], &future_ty, substitutions);
+                    let hir::Type::Task(result) = &destination_ty else {
+                        unreachable!("Async.spawn destination must be Task<T>")
+                    };
+                    let result_c = native_types::c_type(result);
+                    format!(
+                        "disp_task_spawn({future},sizeof({result_c}),_Alignof({result_c}),{})",
+                        task_result_drop_name(result)
+                    )
                 }
                 hir::CallTarget::Callable => {
                     let callable_ty = operand_ty(program, function, &arguments[0], substitutions);
@@ -1751,7 +1796,23 @@ fn terminator(
             let future_ty = operand_ty(program, function, future, substitutions);
             let future = operand(program, function, future, &future_ty, substitutions);
             let destination = place_expr(program, function, destination, substitutions);
-            if async_poll {
+            if matches!(future_ty, hir::Type::Task(_)) {
+                if async_poll {
+                    writeln!(
+                        output,
+                        "if(!disp_task_poll(&({future}),&({destination}),{},{})){{context->pc={block_index};return false;}}goto bb{};",
+                        span.start.line, span.start.column, next.0
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(
+                        output,
+                        "disp_task_wait(&({future}),&({destination}),{},{});goto bb{};",
+                        span.start.line, span.start.column, next.0
+                    )
+                    .unwrap();
+                }
+            } else if async_poll {
                 writeln!(
                     output,
                     "if(!({future}).poll(({future}).context,&({destination}))){{context->pc={block_index};return false;}}if(({future}).drop)({future}).drop(({future}).context);({future})=(disp_native_future){{0}};goto bb{};",
@@ -2820,6 +2881,7 @@ fn drop_value_depth(program: &mir::Program, value: &str, ty: &hir::Type, depth: 
         hir::Type::Future(_) => format!(
             "{{if(({value}).drop)({value}).drop(({value}).context);({value})=(disp_native_future){{0}};}}"
         ),
+        hir::Type::Task(_) => format!("disp_task_drop(&({value}));"),
         _ => String::new(),
     }
 }

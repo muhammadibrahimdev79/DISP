@@ -21,13 +21,39 @@ pub const C_RUNTIME: &str = r#"
 #endif
 
 static void dv_panic(const char *message,int line,int column);
-static void disp_future_wait(disp_native_future *future,void *output,int line,int column){if(!future->context||!future->poll)dv_panic("future has already been awaited",line,column);while(!future->poll(future->context,output)){
+struct disp_task_state {
+    struct disp_task_state *next;
+    disp_native_future future;
+    void *result;
+    size_t result_size;
+    size_t refs;
+    bool complete;
+    bool taken;
+    bool cancelled;
+    void (*result_drop)(void *);
+};
+static _Thread_local disp_task_state *disp_task_head;
+static _Thread_local disp_task_state **disp_task_tail;
+static void disp_task_release(disp_task_state *state){if(!state)return;if(--state->refs)return;if(state->future.context&&state->future.drop)state->future.drop(state->future.context);if(state->result){if(state->complete&&!state->taken&&state->result_drop)state->result_drop(state->result);disp_dealloc(state->result);}disp_dealloc(state);}
+static void disp_task_unlink(disp_task_state **link,disp_task_state *state){*link=state->next;if(!state->next)disp_task_tail=link;state->next=NULL;disp_task_release(state);}
+static void disp_executor_tick(void){disp_task_state **link=&disp_task_head;while(*link){disp_task_state *state=*link;if(state->cancelled){if(state->future.context&&state->future.drop)state->future.drop(state->future.context);state->future=(disp_native_future){0};disp_task_unlink(link,state);continue;}if(!state->complete&&state->future.poll(state->future.context,state->result)){if(state->future.drop)state->future.drop(state->future.context);state->future=(disp_native_future){0};state->complete=true;disp_task_unlink(link,state);continue;}link=&state->next;}}
+static disp_native_task disp_task_spawn(disp_native_future future,size_t result_size,size_t result_align,void (*result_drop)(void *)){if(!future.context||!future.poll)dv_panic("cannot spawn an empty Future",0,0);disp_task_state *state=(disp_task_state*)disp_alloc_zeroed(1,sizeof(disp_task_state),_Alignof(disp_task_state));state->future=future;state->refs=2;state->result_size=result_size;state->result_drop=result_drop;state->result=disp_alloc_zeroed(1,result_size?result_size:1,result_align);if(!disp_task_tail)disp_task_tail=&disp_task_head;*disp_task_tail=state;disp_task_tail=&state->next;return (disp_native_task){.state=state};}
+static bool disp_task_poll(disp_native_task *task,void *output,int line,int column){disp_task_state *state=task->state;if(!state||state->taken)dv_panic("task has already been awaited",line,column);if(state->cancelled)dv_panic("cancelled task cannot be awaited",line,column);if(!state->complete)return false;if(state->result_size)memcpy(output,state->result,state->result_size);state->taken=true;disp_dealloc(state->result);state->result=NULL;task->state=NULL;disp_task_release(state);return true;}
+static void disp_task_drop(disp_native_task *task){disp_task_state *state=task->state;if(!state)return;if(!state->complete)state->cancelled=true;task->state=NULL;disp_task_release(state);}
+static void disp_task_wait(disp_native_task *task,void *output,int line,int column){while(!disp_task_poll(task,output,line,column)){
 #ifdef _WIN32
 SwitchToThread();
 #else
 sched_yield();
 #endif
-}if(future->drop)future->drop(future->context);*future=(disp_native_future){0};}
+disp_executor_tick();}}
+static void disp_future_wait(disp_native_future *future,void *output,int line,int column){if(!future->context||!future->poll)dv_panic("future has already been awaited",line,column);while(!future->poll(future->context,output)){disp_executor_tick();
+#ifdef _WIN32
+SwitchToThread();
+#else
+sched_yield();
+#endif
+}if(future->drop)future->drop(future->context);*future=(disp_native_future){0};disp_executor_tick();}
 typedef struct { bool yielded; } disp_yield_future;
 static bool disp_yield_poll(void *raw,void *output){disp_yield_future *state=(disp_yield_future*)raw;if(!state->yielded){state->yielded=true;return false;}*(disp_native_unit*)output=(disp_native_unit){0};return true;}
 static void disp_yield_drop(void *raw){disp_dealloc(raw);}

@@ -17,7 +17,10 @@ foundations, native concurrency, checked C interoperability, explicit system-mem
 control, deterministic multi-file modules, content-locked local package dependencies,
 and lazy owned `Future<T>` values compiled to resumable native `async fn` state machines.
 `await` is available inside async functions, `Async.yield()` provides cooperative suspension,
-and an `async fn main()` is driven automatically. The implementation
+and `Async.spawn(future)` creates a structured, cooperatively scheduled `Task<T>` that must be
+awaited or is cancelled with deterministic cleanup before its async scope exits. The separate
+`spawn function()` syntax creates an operating-system thread. An `async fn main()` is driven
+automatically. The implementation
 remains under active development and should not
 yet be treated as a stable production language.
 
