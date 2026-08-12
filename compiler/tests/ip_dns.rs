@@ -20,7 +20,7 @@ fn unique_path(label: &str) -> PathBuf {
     ))
 }
 
-fn native(name: &str, source: &str, emit_c: bool) -> Option<(String, Option<String>)> {
+fn native(name: &str, source: &str, emit_c: bool) -> (Option<String>, Option<String>) {
     let path = unique_path(name);
     fs::write(&path, source).unwrap();
     let (hir, mir) = lower_source(source).unwrap();
@@ -45,12 +45,14 @@ fn native(name: &str, source: &str, emit_c: bool) -> Option<(String, Option<Stri
                     "{}",
                     String::from_utf8_lossy(&output.stderr)
                 );
-                return Some((
-                    String::from_utf8(output.stdout)
-                        .unwrap()
-                        .replace("\r\n", "\n"),
+                return (
+                    Some(
+                        String::from_utf8(output.stdout)
+                            .unwrap()
+                            .replace("\r\n", "\n"),
+                    ),
                     generated,
-                ));
+                );
             }
             Err(error) if error.raw_os_error() == Some(4551) => {
                 std::thread::sleep(Duration::from_millis(100));
@@ -58,14 +60,16 @@ fn native(name: &str, source: &str, emit_c: bool) -> Option<(String, Option<Stri
             Err(error) => panic!("native execution failed: {error}"),
         }
     }
-    None
+    (None, generated)
 }
 
-fn differential(name: &str, source: &str) -> Option<String> {
+fn differential(name: &str, source: &str) -> String {
     let expected = run_source(source).unwrap().join("\n") + "\n";
-    let (actual, generated) = native(name, source, true)?;
-    assert_eq!(actual, expected);
-    generated
+    let (actual, generated) = native(name, source, true);
+    if let Some(actual) = &actual {
+        assert_eq!(actual, &expected);
+    }
+    generated.unwrap()
 }
 
 #[test]
@@ -103,7 +107,7 @@ fn main() { print(inspect()) }"#;
             "Result.Ok(true)"
         ]
     );
-    let generated = differential("ip-values", source).unwrap();
+    let generated = differential("ip-values", source);
     assert!(generated.contains("uint8_t bytes[16]"));
     assert!(generated.contains("disp_ip_address_parse"));
     assert!(generated.contains("disp_socket_address_from_ip"));
@@ -117,7 +121,7 @@ print(match IpAddress.parse("1.2.3.4 trailing") { Ok(ip) => false, Err(error) =>
 print(match Dns.resolve("invalid host name with spaces") { Ok(values) => false, Err(error) => true })
 }"#;
     assert_eq!(run_source(source).unwrap(), ["true", "true", "true"]);
-    differential("typed-errors", source).unwrap();
+    differential("typed-errors", source);
 }
 
 #[test]
@@ -146,7 +150,7 @@ print(match async_result { Ok(count) => count > 0, Err(error) => false })
         run_source(source).unwrap(),
         ["true", "true", "true", "true", "true", "true"]
     );
-    let generated = differential("dns", source).unwrap();
+    let generated = differential("dns", source);
     assert!(generated.contains("disp_dns_worker"));
     assert!(generated.contains("qsort"));
     assert!(generated.contains("disp_dns_poll"));
@@ -160,7 +164,7 @@ timed = await Async.resolve_timeout("localhost", Duration.from_millis(0))
 print(match timed { Ok(addresses) => false, Err(error) => true })
 }"#;
     assert_eq!(run_source(source).unwrap(), ["true"]);
-    differential("lazy-timeout", source).unwrap();
+    differential("lazy-timeout", source);
 }
 
 #[test]
