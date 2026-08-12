@@ -186,7 +186,7 @@ static DV *dv_field(DV *base,size_t index){ if(base->tag!=DV_AGG||index>=base->a
 static DV *dv_deref(DV *base){ if((base->tag!=DV_REF&&base->tag!=DV_RAW)||!base->as.reference){fputs("DISP runtime error: invalid pointer dereference\n",stderr);exit(101);}return base->as.reference; }
 static uint64_t dv_disc(DV v){ if(v.tag!=DV_AGG){fputs("DISP runtime error: discriminant of non-enum\n",stderr);exit(101);}return v.as.agg->disc; }
 static bool dv_truth(DV v){ if(v.tag==DV_BOOL)return v.as.boolean; if(v.tag==DV_SIGNED)return v.as.si!=0; if(v.tag==DV_UNSIGNED)return v.as.ui!=0; return false; }
-static void dv_panic(const char *message,int line,int column){fprintf(stderr,"DISP runtime error at %d:%d: %s\n",line,column,message);exit(101);}
+static void dv_panic(const char *message,int line,int column){const char *file=disp_source_location(&line);if(file)fprintf(stderr,"DISP runtime error at %s:%d:%d: %s\n",file,line,column,message);else fprintf(stderr,"DISP runtime error at %d:%d: %s\n",line,column,message);exit(101);}
 static unsigned __int128 umax(uint16_t w){return w>=128?~(unsigned __int128)0:(((unsigned __int128)1<<w)-1);}
 static __int128 smax(uint16_t w){return w>=128?(__int128)(~(unsigned __int128)0>>1):(((__int128)1<<(w-1))-1);}
 static __int128 smin(uint16_t w){return w>=128?-smax(128)-1:-((__int128)1<<(w-1));}

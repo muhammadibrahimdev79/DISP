@@ -1,0 +1,24 @@
+module math
+
+pub struct Point {
+    x: int,
+    y: int,
+}
+
+pub enum Sign {
+    Positive(int),
+    Negative(int),
+}
+
+fn square(value: int) -> int = value * value
+
+pub fn length_squared(point: Point) -> int {
+    return square(point.x) + square(point.y)
+}
+
+pub fn classify(value: int) -> Sign {
+    if value >= 0 {
+        return Sign.Positive(value)
+    }
+    return Sign.Negative(value)
+}

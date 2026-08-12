@@ -1,0 +1,5 @@
+module statistics
+
+pub fn average(left: int, right: int) -> int {
+    return (left + right) / 2
+}

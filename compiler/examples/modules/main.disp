@@ -1,0 +1,14 @@
+module main
+
+use math
+
+fn main() {
+    let point = Point { x: 3, y: 4 }
+    print(length_squared(point))
+
+    let sign = classify(-7)
+    print(match sign {
+        Sign.Positive(value) => value,
+        Sign.Negative(value) => 0 - value,
+    })
+}

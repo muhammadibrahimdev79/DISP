@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, path::PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Position {
@@ -24,6 +24,45 @@ impl Span {
 
     pub fn through(self, other: Self) -> Self {
         Self::new(self.start, other.end)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceFile {
+    pub path: PathBuf,
+    pub start_line: usize,
+    pub end_line: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceMap {
+    pub files: Vec<SourceFile>,
+}
+
+impl SourceMap {
+    pub fn remap(&self, mut diagnostic: Diagnostic) -> Diagnostic {
+        if diagnostic.file.is_some() {
+            return diagnostic;
+        }
+        let Some(source) = self.files.iter().find(|source| {
+            diagnostic.span.start.line >= source.start_line
+                && diagnostic.span.start.line <= source.end_line
+        }) else {
+            return diagnostic;
+        };
+        let offset = source.start_line - 1;
+        diagnostic.span = Span::new(
+            Position {
+                line: diagnostic.span.start.line.saturating_sub(offset),
+                column: diagnostic.span.start.column,
+            },
+            Position {
+                line: diagnostic.span.end.line.saturating_sub(offset),
+                column: diagnostic.span.end.column,
+            },
+        );
+        diagnostic.file = Some(source.path.display().to_string());
+        diagnostic
     }
 }
 
@@ -59,6 +98,7 @@ pub struct Diagnostic {
     pub message: String,
     pub span: Span,
     pub help: Option<String>,
+    pub file: Option<String>,
 }
 
 impl Diagnostic {
@@ -68,6 +108,7 @@ impl Diagnostic {
             message: message.into(),
             span,
             help: None,
+            file: None,
         }
     }
 
@@ -76,7 +117,13 @@ impl Diagnostic {
         self
     }
 
+    pub fn with_file(mut self, file: impl Into<String>) -> Self {
+        self.file = Some(file.into());
+        self
+    }
+
     pub fn render(&self, file: &str) -> String {
+        let file = self.file.as_deref().unwrap_or(file);
         let mut rendered = format!(
             "{file}:{}:{}: {} error: {}",
             self.span.start.line, self.span.start.column, self.kind, self.message

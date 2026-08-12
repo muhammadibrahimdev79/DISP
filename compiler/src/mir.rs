@@ -1,5 +1,5 @@
 use crate::ast::{AssignmentOperator, BinaryOperator, UnaryOperator};
-use crate::diagnostics::{Diagnostic, DiagnosticKind, Span};
+use crate::diagnostics::{Diagnostic, DiagnosticKind, SourceFile, Span};
 use crate::hir;
 use std::collections::{HashMap, HashSet};
 
@@ -10,6 +10,7 @@ pub struct BlockId(pub usize);
 
 #[derive(Debug, Clone)]
 pub struct Program {
+    pub source_files: Vec<SourceFile>,
     pub functions: Vec<Function>,
     pub structs: Vec<hir::Struct>,
     pub enums: Vec<hir::Enum>,
@@ -180,6 +181,7 @@ pub fn lower(program: &hir::Program) -> Result<Program, Diagnostic> {
         .map(|function| Builder::new(program, function).lower())
         .collect::<Result<Vec<_>, _>>()?;
     let mir = Program {
+        source_files: program.source_files.clone(),
         functions,
         structs: program.structs.clone(),
         enums: program.enums.clone(),

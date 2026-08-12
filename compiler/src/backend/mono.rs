@@ -459,8 +459,8 @@ fn error(message: &str) -> Diagnostic {
 
 pub fn mangle(program: &mir::Program, instance: &FunctionInstance) -> String {
     let function = &program.functions[instance.function.0];
-    if function.external.is_some() {
-        return function.name.clone();
+    if let Some(external) = &function.external {
+        return external.link_name.clone();
     }
     let name = &function.name;
     let mut symbol = format!("disp_f{}_{}", instance.function.0, sanitize(name));

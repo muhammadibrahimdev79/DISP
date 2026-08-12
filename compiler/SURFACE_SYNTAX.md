@@ -38,6 +38,63 @@ print(word)
 Both are zero-copy and retain the same ownership and lifetime rules as explicit DISP
 references.
 
+## Modules and local packages
+
+One source file is one module. The declaration is optional, but when present it must
+match the file path so a module cannot silently impersonate another module:
+
+```disp
+module geometry
+
+pub struct Point { x: int, y: int }
+fn square(value: int) -> int = value * value
+pub fn length_squared(point: Point) -> int = square(point.x) + square(point.y)
+```
+
+An entry file imports the public surface with the module path. Selective imports keep
+large programs explicit, and aliases resolve same-named APIs without weakening nominal
+type identity:
+
+```disp
+use geometry
+use left.{Token as LeftToken}
+use right.{Token as RightToken}
+```
+
+`pub use geometry.{Point}` re-exports selected public items. Wildcard module imports
+fail on name conflicts instead of guessing. A public signature cannot expose a private
+type or trait. Import cycles, path escapes, duplicate module identities, excessive
+depth, excessive module counts, and excessive aggregate source size are rejected before
+semantic compilation. Interpreter and native runtime diagnostics identify the actual
+module and local source position.
+
+The ordinary project layout is:
+
+```text
+hello/
+|-- DISP.toml
+`-- src/
+    |-- main.disp
+    `-- geometry.disp
+```
+
+The implemented manifest is deliberately strict:
+
+```toml
+[package]
+name = "hello"
+version = "0.1.0"
+edition = "1"
+entry = "src/main.disp"
+```
+
+Run `disp new hello` to create this layout. `disp check hello`, `disp build hello`,
+`disp run hello`, and `disp interpret hello` accept the directory directly. Package
+names are bounded lowercase ASCII identifiers, versions use numeric
+`MAJOR.MINOR.PATCH`, and entries must remain inside the project. Unknown manifest
+sections and fields are errors; dependency and registry syntax will only be documented
+when the corresponding verified resolver exists.
+
 Shared function parameters also borrow named storage automatically:
 
 ```disp

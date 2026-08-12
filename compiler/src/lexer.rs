@@ -25,6 +25,7 @@ pub enum TokenKind {
     Type,
     Module,
     Use,
+    As,
     Pub,
     Async,
     Await,
@@ -106,10 +107,17 @@ pub struct Lexer {
 
 impl Lexer {
     pub fn new(source: &str) -> Self {
+        Self::with_start_line(source, 1)
+    }
+
+    pub fn with_start_line(source: &str, start_line: usize) -> Self {
         Self {
             source: source.chars().collect(),
             current: 0,
-            position: Position { line: 1, column: 1 },
+            position: Position {
+                line: start_line,
+                column: 1,
+            },
         }
     }
 
@@ -232,6 +240,7 @@ impl Lexer {
             "type" => TokenKind::Type,
             "module" => TokenKind::Module,
             "use" => TokenKind::Use,
+            "as" => TokenKind::As,
             "pub" => TokenKind::Pub,
             "async" => TokenKind::Async,
             "await" => TokenKind::Await,

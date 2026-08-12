@@ -32,6 +32,7 @@ pub fn generate(
     }
     let mut output = String::from(C_ALLOCATOR);
     output.push_str(declarations);
+    emit_source_map(program, &mut output);
     output.push_str(C_RUNTIME);
     for instance in &instances.instances {
         writeln!(
@@ -58,6 +59,32 @@ pub fn generate(
     )
     .unwrap();
     Ok(Some(output))
+}
+
+fn emit_source_map(program: &mir::Program, output: &mut String) {
+    output.push_str("static const char *disp_source_location(int *line){");
+    for source in &program.source_files {
+        let path = source.path.to_string_lossy().replace('\\', "/");
+        let path = path
+            .chars()
+            .flat_map(|character| match character {
+                '\\' => "\\\\".chars().collect::<Vec<_>>(),
+                '"' => "\\\"".chars().collect(),
+                character if character.is_control() => "?".chars().collect(),
+                character => vec![character],
+            })
+            .collect::<String>();
+        writeln!(
+            output,
+            "if(*line>={}&&*line<={}){{*line-={};return \"{}\";}}",
+            source.start_line,
+            source.end_line,
+            source.start_line - 1,
+            path
+        )
+        .unwrap();
+    }
+    output.push_str("return NULL;}\n");
 }
 
 fn thread_targets(

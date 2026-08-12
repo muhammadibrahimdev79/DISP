@@ -19,6 +19,8 @@ Implemented executable subset:
 - explicitly shared `Mutex<T>`, owning lock guards, and checked sequentially consistent `AtomicInt`
 - defined `extern C` declarations, fixed C ABI aliases, checked `CString`, borrowed `CStr`, and native library linking
 - owned aligned `Memory`, bounds-checked byte operations, raw pointer views, and explicit unsafe pointer arithmetic/read/write
+- deterministic file modules with `pub`, selective imports, aliases, re-exports, cycle checks, and source-aware diagnostics
+- strict local `DISP.toml` packages, directory builds, and `disp new`
 - CFG predecessor/successor, reachability, reverse-postorder, and back-edge analysis
 - checked integer arithmetic and an explicit `disp interpret` semantic oracle
 - deterministic monomorphization, target-aware layouts, ABI classification, and native MIR lowering
@@ -41,6 +43,14 @@ cargo run -- check --dump-hir examples/control_flow.disp
 cargo run -- check --dump-mir examples/control_flow.disp
 cargo run -- run examples/c_interop.disp
 cargo run -- run examples/system_memory.disp
+cargo run -- run examples/modules/main.disp
+cargo run -- run examples/package
+cargo run -- new hello
 ```
+
+A directory project contains a strict `DISP.toml` and an entry source under `src/`.
+Current manifests cover local package identity and entry selection. External dependency
+resolution, registries, and lockfiles are not implemented yet and are not silently
+accepted as manifest fields.
 
 Fuzz targets for the lexer and complete frontend live under `fuzz/` and can be run with `cargo fuzz run lexer` and `cargo fuzz run frontend` when `cargo-fuzz` and its required Rust toolchain are installed.

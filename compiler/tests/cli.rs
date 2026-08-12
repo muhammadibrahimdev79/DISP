@@ -100,3 +100,53 @@ fn developer_hir_and_mir_dumps_are_available() {
     let mir = String::from_utf8(mir.stdout).unwrap();
     assert!(mir.contains("mir fn0 main") && mir.contains("bb0:"));
 }
+
+#[test]
+fn new_creates_a_runnable_directory_project() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("disp-new-{}-{unique}", std::process::id()));
+    let Some(created) = disp(&["new", root.to_str().unwrap()]) else {
+        return;
+    };
+    assert!(created.status.success());
+    assert!(root.join("DISP.toml").is_file());
+    assert!(root.join("src/main.disp").is_file());
+
+    let Some(checked) = disp(&["check", root.to_str().unwrap()]) else {
+        return;
+    };
+    assert!(checked.status.success());
+    let Some(interpreted) = disp(&["interpret", root.to_str().unwrap()]) else {
+        return;
+    };
+    assert!(interpreted.status.success());
+    assert_eq!(
+        String::from_utf8(interpreted.stdout).unwrap().trim(),
+        "Hello from DISP"
+    );
+    let Some(native) = disp(&["run", root.to_str().unwrap()]) else {
+        return;
+    };
+    if !native.status.success() && String::from_utf8_lossy(&native.stderr).contains("os error 4551")
+    {
+        return;
+    }
+    assert!(native.status.success());
+    assert_eq!(
+        String::from_utf8(native.stdout).unwrap().trim(),
+        "Hello from DISP"
+    );
+
+    let Some(second) = disp(&["new", root.to_str().unwrap()]) else {
+        return;
+    };
+    assert!(!second.status.success());
+    assert!(
+        String::from_utf8(second.stderr)
+            .unwrap()
+            .contains("refusing to overwrite")
+    );
+}

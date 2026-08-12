@@ -526,7 +526,7 @@ impl TypeChecker {
                 function.span,
             ));
         }
-        if !is_c_identifier(&function.name) {
+        if !is_c_identifier(&function.external.as_ref().unwrap().link_name) {
             return Err(Diagnostic::new(
                 DiagnosticKind::Type,
                 "an external C symbol must use a safe, non-reserved ASCII C identifier",

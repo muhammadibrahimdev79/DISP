@@ -12,8 +12,8 @@ examples, fuzz targets, test suites, and the evolving design material.
 The current compiler includes static typing, ownership and borrowing, native
 code generation, algebraic data types, generics and traits, strings, slices,
 lists, maps, sets, iteration, paths, filesystem operations, and time
-foundations, native concurrency, checked C interoperability, and explicit system-memory
-control. The implementation
+foundations, native concurrency, checked C interoperability, explicit system-memory
+control, and deterministic multi-file modules with local package manifests. The implementation
 remains under active development and should not
 yet be treated as a stable production language.
 
@@ -41,4 +41,11 @@ Run the same program through the interpreter:
 
 ```sh
 cargo run -- interpret examples/easy_disp.disp
+```
+
+Create and run a directory project:
+
+```sh
+cargo run -- new hello
+cargo run -- run hello
 ```

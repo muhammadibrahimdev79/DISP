@@ -1,8 +1,9 @@
 use crate::ast::{
     AssignmentOperator, BinaryOperator, BindingKind, Block, EnumDeclaration, Expr, Expression,
     ExternalAbi, ExternalFunction, FieldDeclaration, Function, FunctionSignature, GenericParameter,
-    Implementation, MatchArm, Parameter, Pattern, Program, Spanned, Statement, StructDeclaration,
-    StructFieldValue, TraitDeclaration, TypeName, TypeQualifier, UnaryOperator, VariantDeclaration,
+    Implementation, ImportDeclaration, ImportItem, MatchArm, ModuleDeclaration, Parameter, Pattern,
+    Program, Spanned, Statement, StructDeclaration, StructFieldValue, TraitDeclaration, TypeName,
+    TypeQualifier, UnaryOperator, VariantDeclaration,
 };
 use crate::diagnostics::{Diagnostic, DiagnosticKind, Position, Span};
 use crate::lexer::{Token, TokenKind};
@@ -31,39 +32,178 @@ impl Parser {
     }
 
     pub fn parse(&mut self) -> Result<Program, Diagnostic> {
+        let module = if self.check(&TokenKind::Module) {
+            Some(self.parse_module_declaration()?)
+        } else {
+            None
+        };
+        let mut imports = Vec::new();
+        let mut public_items = Vec::new();
         let mut structs = Vec::new();
         let mut enums = Vec::new();
         let mut traits = Vec::new();
         let mut implementations = Vec::new();
         let mut functions = Vec::new();
         while !self.check(&TokenKind::Eof) {
+            let public = self.match_token(&TokenKind::Pub);
+            if self.check(&TokenKind::Use) {
+                imports.push(self.parse_import(public)?);
+                continue;
+            }
             if self.check(&TokenKind::Struct) {
-                structs.push(self.parse_struct()?);
+                let declaration = self.parse_struct()?;
+                if public {
+                    public_items.push(Spanned {
+                        node: declaration.name.clone(),
+                        span: declaration.name_span,
+                    });
+                }
+                structs.push(declaration);
             } else if self.check(&TokenKind::Enum) {
-                enums.push(self.parse_enum()?);
+                let declaration = self.parse_enum()?;
+                if public {
+                    public_items.push(Spanned {
+                        node: declaration.name.clone(),
+                        span: declaration.name_span,
+                    });
+                }
+                enums.push(declaration);
             } else if self.check(&TokenKind::Fn) {
-                functions.push(self.parse_function()?);
+                let declaration = self.parse_function()?;
+                if public {
+                    public_items.push(Spanned {
+                        node: declaration.name.clone(),
+                        span: declaration.name_span,
+                    });
+                }
+                functions.push(declaration);
             } else if self.check(&TokenKind::Extern) {
-                functions.extend(self.parse_extern_block()?);
+                let declarations = self.parse_extern_block()?;
+                if public {
+                    public_items.extend(declarations.iter().map(|declaration| Spanned {
+                        node: declaration.name.clone(),
+                        span: declaration.name_span,
+                    }));
+                }
+                functions.extend(declarations);
             } else if self.check(&TokenKind::Trait) {
-                traits.push(self.parse_trait()?);
+                let declaration = self.parse_trait()?;
+                if public {
+                    public_items.push(Spanned {
+                        node: declaration.name.clone(),
+                        span: declaration.name_span,
+                    });
+                }
+                traits.push(declaration);
             } else if self.check(&TokenKind::Impl) {
+                if public {
+                    return Err(Diagnostic::new(
+                        DiagnosticKind::Parse,
+                        "`pub` applies to named declarations, not implementation blocks",
+                        self.previous().span,
+                    ));
+                }
                 implementations.push(self.parse_implementation()?);
             } else {
                 return Err(Diagnostic::new(
                     DiagnosticKind::Parse,
-                    "expected a top-level `struct`, `enum`, `fn`, or `extern` declaration",
+                    "expected a top-level declaration or `use` import",
                     self.peek().span,
                 ));
             }
         }
         Ok(Program {
+            source_files: vec![],
+            module,
+            imports,
+            public_items,
             structs,
             enums,
             traits,
             implementations,
             functions,
         })
+    }
+
+    fn parse_module_declaration(&mut self) -> Result<ModuleDeclaration, Diagnostic> {
+        let start = self.expect(TokenKind::Module, "expected `module`")?.span;
+        let path = self.parse_module_path("expected module name")?;
+        let end = path.last().map_or(start, |part| part.span);
+        self.match_token(&TokenKind::Semicolon);
+        Ok(ModuleDeclaration {
+            path,
+            span: start.through(end),
+        })
+    }
+
+    fn parse_import(&mut self, public: bool) -> Result<ImportDeclaration, Diagnostic> {
+        let start = self.expect(TokenKind::Use, "expected `use`")?.span;
+        let mut path = Vec::new();
+        let (first, first_span) = self.expect_identifier("expected module name after `use`")?;
+        path.push(Spanned {
+            node: first,
+            span: first_span,
+        });
+        let mut items = None;
+        while self.match_token(&TokenKind::Dot) {
+            if self.match_token(&TokenKind::LeftBrace) {
+                let mut selected = Vec::new();
+                if !self.check(&TokenKind::RightBrace) {
+                    loop {
+                        let (name, span) = self.expect_identifier("expected imported item name")?;
+                        let (alias, alias_span) = if self.match_token(&TokenKind::As) {
+                            self.expect_identifier("expected import alias after `as`")?
+                        } else {
+                            (name.clone(), span)
+                        };
+                        selected.push(ImportItem {
+                            name,
+                            name_span: span,
+                            alias,
+                            alias_span,
+                            span: span.through(alias_span),
+                        });
+                        if !self.match_token(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                }
+                if selected.is_empty() {
+                    return Err(Diagnostic::new(
+                        DiagnosticKind::Parse,
+                        "an import item list cannot be empty",
+                        self.peek().span,
+                    ));
+                }
+                self.expect(TokenKind::RightBrace, "expected `}` after imported items")?;
+                items = Some(selected);
+                break;
+            }
+            let (part, span) = self.expect_identifier("expected module path component")?;
+            path.push(Spanned { node: part, span });
+        }
+        let end = self.previous().span;
+        self.match_token(&TokenKind::Semicolon);
+        Ok(ImportDeclaration {
+            path,
+            items,
+            public,
+            span: start.through(end),
+        })
+    }
+
+    fn parse_module_path(
+        &mut self,
+        message: &'static str,
+    ) -> Result<Vec<Spanned<String>>, Diagnostic> {
+        let mut path = Vec::new();
+        let (first, span) = self.expect_identifier(message)?;
+        path.push(Spanned { node: first, span });
+        while self.match_token(&TokenKind::Dot) {
+            let (part, span) = self.expect_identifier("expected module path component")?;
+            path.push(Spanned { node: part, span });
+        }
+        Ok(path)
     }
 
     fn parse_struct(&mut self) -> Result<StructDeclaration, Diagnostic> {
@@ -398,7 +538,7 @@ impl Parser {
             self.match_token(&TokenKind::Semicolon);
             self.match_token(&TokenKind::Comma);
             functions.push(Function {
-                name,
+                name: name.clone(),
                 name_span,
                 generics,
                 parameters,
@@ -410,6 +550,7 @@ impl Parser {
                 external: Some(ExternalFunction {
                     abi: ExternalAbi::C,
                     library: library.clone(),
+                    link_name: name.clone(),
                 }),
                 span: function_start.through(end),
             });

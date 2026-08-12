@@ -654,7 +654,13 @@ impl Interpreter {
                 call_span,
             ));
         }
-        match function.name.as_str() {
+        let link_name = function
+            .external
+            .as_ref()
+            .map_or(function.name.as_str(), |external| {
+                external.link_name.as_str()
+            });
+        match link_name {
             "abs" => {
                 let value = match arguments.into_iter().next().unwrap() {
                     Value::Signed(value, 32) => i32::try_from(value).ok(),

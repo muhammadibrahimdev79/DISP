@@ -1,5 +1,5 @@
 use crate::ast::{self, BinaryOperator, BindingKind, TypeQualifier, UnaryOperator};
-use crate::diagnostics::{Diagnostic, DiagnosticKind, Span};
+use crate::diagnostics::{Diagnostic, DiagnosticKind, SourceFile, Span};
 use std::collections::{HashMap, HashSet};
 
 macro_rules! id {
@@ -93,6 +93,7 @@ impl Type {
 
 #[derive(Debug, Clone)]
 pub struct Program {
+    pub source_files: Vec<SourceFile>,
     pub structs: Vec<Struct>,
     pub enums: Vec<Enum>,
     pub traits: Vec<Trait>,
@@ -173,6 +174,7 @@ pub struct Function {
 pub struct ExternalFunction {
     pub abi: ExternalAbi,
     pub library: Option<String>,
+    pub link_name: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -557,6 +559,7 @@ impl<'a> Lowering<'a> {
             }
         }
         let program = Program {
+            source_files: self.ast.source_files.clone(),
             structs,
             enums,
             traits,
@@ -634,6 +637,7 @@ impl<'a> Lowering<'a> {
                     ast::ExternalAbi::C => ExternalAbi::C,
                 },
                 library: external.library.clone(),
+                link_name: external.link_name.clone(),
             }),
             span: function.span,
         })

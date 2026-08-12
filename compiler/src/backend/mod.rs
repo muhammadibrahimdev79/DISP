@@ -45,10 +45,27 @@ pub fn build(
     let abi = abi::lower(hir, mir, &mono, target)?;
     let native_types = native_types::generate(hir, &mono, target)?;
     let generated = codegen::generate(mir, &mono, &abi, &native_types)?;
-    let stem = source_path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .ok_or_else(|| error("source file has no valid output name"))?;
+    let project_root;
+    let (stem, parent) = if source_path.is_dir() {
+        project_root = if source_path.is_absolute() {
+            source_path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|cause| error(&format!("could not resolve current directory: {cause}")))?
+                .join(source_path)
+        };
+        let stem = project_root
+            .file_name()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| error("project directory has no valid output name"))?;
+        (stem, project_root.as_path())
+    } else {
+        let stem = source_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| error("source file has no valid output name"))?;
+        (stem, source_path.parent().unwrap_or_else(|| Path::new(".")))
+    };
     let safe_stem = stem
         .chars()
         .map(|character| {
@@ -59,7 +76,6 @@ pub fn build(
             }
         })
         .collect::<String>();
-    let parent = source_path.parent().unwrap_or_else(|| Path::new("."));
     let build_dir = parent.join("build").join(&safe_stem);
     fs::create_dir_all(&build_dir)
         .map_err(|cause| error(&format!("could not create native build directory: {cause}")))?;

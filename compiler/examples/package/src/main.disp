@@ -1,0 +1,7 @@
+module main
+
+use statistics.{average}
+
+fn main() {
+    print(average(10, 20))
+}

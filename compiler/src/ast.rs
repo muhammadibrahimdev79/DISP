@@ -1,12 +1,39 @@
-use crate::diagnostics::Span;
+use crate::diagnostics::{SourceFile, Span};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
+    pub source_files: Vec<SourceFile>,
+    pub module: Option<ModuleDeclaration>,
+    pub imports: Vec<ImportDeclaration>,
+    pub public_items: Vec<Spanned<String>>,
     pub structs: Vec<StructDeclaration>,
     pub enums: Vec<EnumDeclaration>,
     pub traits: Vec<TraitDeclaration>,
     pub implementations: Vec<Implementation>,
     pub functions: Vec<Function>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModuleDeclaration {
+    pub path: Vec<Spanned<String>>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportDeclaration {
+    pub path: Vec<Spanned<String>>,
+    pub items: Option<Vec<ImportItem>>,
+    pub public: bool,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportItem {
+    pub name: String,
+    pub name_span: Span,
+    pub alias: String,
+    pub alias_span: Span,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -64,6 +91,7 @@ pub struct Function {
 pub struct ExternalFunction {
     pub abi: ExternalAbi,
     pub library: Option<String>,
+    pub link_name: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
