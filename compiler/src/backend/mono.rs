@@ -53,6 +53,40 @@ pub fn collect(program: &mir::Program) -> Result<MonoProgram, Diagnostic> {
             )));
         }
         for block in &function.blocks {
+            for statement in &block.statements {
+                if let mir::StatementKind::Assign(_, mir::Rvalue::Function(target)) =
+                    &statement.kind
+                {
+                    let target = program.functions.get(target.0).ok_or_else(|| {
+                        error("function value references an invalid function identity")
+                    })?;
+                    if !target.generic_parameters.is_empty() {
+                        return Err(error(
+                            "generic function value reached monomorphization without substitutions",
+                        ));
+                    }
+                    queue.push_back(FunctionInstance {
+                        function: target.id,
+                        substitutions: vec![],
+                    });
+                }
+                if let mir::StatementKind::Assign(
+                    _,
+                    mir::Rvalue::Closure {
+                        function: target, ..
+                    },
+                ) = &statement.kind
+                {
+                    let target = program
+                        .functions
+                        .get(target.0)
+                        .ok_or_else(|| error("closure references an invalid function identity"))?;
+                    queue.push_back(FunctionInstance {
+                        function: target.id,
+                        substitutions: instance.substitutions.clone(),
+                    });
+                }
+            }
             if let mir::Terminator::Call {
                 target,
                 substitutions,
@@ -272,7 +306,7 @@ pub fn resolve_target(
 ) -> Result<Option<FunctionInstance>, Diagnostic> {
     let caller_map = mapping(caller, instance);
     match target {
-        hir::CallTarget::Intrinsic(_) => Ok(None),
+        hir::CallTarget::Intrinsic(_) | hir::CallTarget::Callable => Ok(None),
         hir::CallTarget::Function(function) => {
             let callee = program
                 .functions

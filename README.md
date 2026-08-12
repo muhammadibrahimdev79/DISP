@@ -10,7 +10,8 @@ examples, fuzz targets, test suites, and the evolving design material.
 ## Current implementation
 
 The current compiler includes static typing, ownership and borrowing, native
-code generation, algebraic data types, generics and traits, strings, slices,
+code generation, first-class functions and ownership-safe closures, algebraic
+data types, generics and traits, strings, slices,
 lists, maps, sets, iteration, paths, filesystem operations, and time
 foundations, native concurrency, checked C interoperability, explicit system-memory
 control, deterministic multi-file modules, and content-locked local package dependencies. The implementation

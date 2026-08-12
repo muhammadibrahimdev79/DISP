@@ -1510,6 +1510,30 @@ impl<'a> Renamer<'a> {
                     self.rename_expr(value);
                 }
             }
+            Expression::Closure {
+                parameters,
+                return_type,
+                body,
+                ..
+            } => {
+                for parameter in parameters.iter_mut() {
+                    self.rename_type(&mut parameter.ty);
+                }
+                if let Some(return_type) = return_type {
+                    self.rename_type(return_type);
+                }
+                self.scopes.push(
+                    parameters
+                        .iter()
+                        .map(|parameter| parameter.name.clone())
+                        .collect(),
+                );
+                match body {
+                    crate::ast::ClosureBody::Expression(value) => self.rename_expr(value),
+                    crate::ast::ClosureBody::Block(block) => self.rename_block(block),
+                }
+                self.scopes.pop();
+            }
             Expression::Identifier(name) => {
                 if !self.is_local(name)
                     && let Some(definition) = self.namespace.get(name)

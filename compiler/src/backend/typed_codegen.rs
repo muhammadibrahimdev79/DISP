@@ -45,6 +45,9 @@ pub fn generate(
         .unwrap();
         prototype(program, instance, &mut output);
     }
+    for target in callable_targets(program, instances)? {
+        callable_wrapper(program, &target, &mut output);
+    }
     for target in thread_targets(program, instances)? {
         thread_wrapper(program, &target, &mut output);
     }
@@ -59,6 +62,140 @@ pub fn generate(
     )
     .unwrap();
     Ok(Some(output))
+}
+
+fn callable_targets(
+    program: &mir::Program,
+    instances: &mono::MonoProgram,
+) -> Result<BTreeSet<mono::FunctionInstance>, Diagnostic> {
+    let mut targets = BTreeSet::new();
+    for caller in &instances.instances {
+        let function = &program.functions[caller.function.0];
+        for block in &function.blocks {
+            for statement in &block.statements {
+                if let mir::StatementKind::Assign(_, mir::Rvalue::Function(target)) =
+                    &statement.kind
+                {
+                    let target_function = program.functions.get(target.0).ok_or_else(|| {
+                        Diagnostic::new(
+                            crate::diagnostics::DiagnosticKind::Internal,
+                            "native callable references an invalid function",
+                            statement.span,
+                        )
+                    })?;
+                    targets.insert(mono::FunctionInstance {
+                        function: target_function.id,
+                        substitutions: vec![],
+                    });
+                }
+                if let mir::StatementKind::Assign(
+                    _,
+                    mir::Rvalue::Closure {
+                        function: target, ..
+                    },
+                ) = &statement.kind
+                {
+                    targets.insert(mono::FunctionInstance {
+                        function: *target,
+                        substitutions: caller.substitutions.clone(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(targets)
+}
+
+fn callable_wrapper_name(program: &mir::Program, target: &mono::FunctionInstance) -> String {
+    format!("disp_callable_wrap_{}", mono::mangle(program, target))
+}
+
+fn callable_env_name(program: &mir::Program, target: &mono::FunctionInstance) -> String {
+    format!("disp_callable_env_{}", mono::mangle(program, target))
+}
+
+fn callable_drop_name(program: &mir::Program, target: &mono::FunctionInstance) -> String {
+    format!("disp_callable_drop_{}", mono::mangle(program, target))
+}
+
+fn callable_wrapper(program: &mir::Program, target: &mono::FunctionInstance, output: &mut String) {
+    let function = &program.functions[target.function.0];
+    let substitutions = mono::mapping(function, target);
+    let result = substitute(&function.locals[function.return_local.0].ty, &substitutions);
+    if function.capture_count > 0 {
+        let environment = callable_env_name(program, target);
+        writeln!(output, "typedef struct {environment} {{").unwrap();
+        for index in 0..function.capture_count {
+            writeln!(
+                output,
+                "{} f{index};",
+                c_local_type(function, mir::LocalId(index + 1), &substitutions)
+            )
+            .unwrap();
+        }
+        writeln!(output, "}} {environment};").unwrap();
+        writeln!(
+            output,
+            "static void {}(void *_raw){{{environment} *_captures=({environment}*)_raw;",
+            callable_drop_name(program, target)
+        )
+        .unwrap();
+        for index in 0..function.capture_count {
+            let ty = substitute(&function.locals[index + 1].ty, &substitutions);
+            output.push_str(&drop_value(program, &format!("_captures->f{index}"), &ty));
+        }
+        output.push_str("disp_dealloc(_captures);}\n");
+    }
+    write!(
+        output,
+        "static {} {}(void *_env",
+        native_types::c_type(&result),
+        callable_wrapper_name(program, target)
+    )
+    .unwrap();
+    for index in function.capture_count..function.argument_count {
+        let local = mir::LocalId(index + 1);
+        write!(
+            output,
+            ",{} a{}",
+            c_local_type(function, local, &substitutions),
+            index - function.capture_count + 1
+        )
+        .unwrap();
+    }
+    let external_unit = function.external.is_some() && matches!(result, hir::Type::Unit);
+    output.push_str("){(void)_env;");
+    if function.capture_count > 0 {
+        write!(
+            output,
+            "{} *_captures=({}*)_env;",
+            callable_env_name(program, target),
+            callable_env_name(program, target)
+        )
+        .unwrap();
+    }
+    write!(
+        output,
+        "{}{}(",
+        if external_unit { "" } else { "return " },
+        mono::mangle(program, target)
+    )
+    .unwrap();
+    for index in 0..function.argument_count {
+        if index > 0 {
+            output.push(',');
+        }
+        if index < function.capture_count {
+            write!(output, "_captures->f{index}").unwrap();
+        } else {
+            write!(output, "a{}", index - function.capture_count + 1).unwrap();
+        }
+    }
+    if external_unit {
+        output.push_str(");return (disp_native_unit){0};}\n");
+    } else {
+        output.push_str(");}\n");
+    }
 }
 
 fn emit_source_map(program: &mir::Program, output: &mut String) {
@@ -220,6 +357,12 @@ pub fn supported(program: &mir::Program, ty: &hir::Type) -> bool {
         hir::Type::Reference { inner, .. } | hir::Type::RawPointer { inner, .. } => {
             supported(program, inner)
         }
+        hir::Type::Function(arguments, result) => {
+            arguments
+                .iter()
+                .all(|argument| supported(program, argument))
+                && supported(program, result)
+        }
         hir::Type::Generic(name) => matches!(name.as_str(), "ConversionError" | "IoError"),
         _ => false,
     }
@@ -314,7 +457,14 @@ fn function(
     for (index, block) in function.blocks.iter().enumerate() {
         writeln!(output, "bb{index}:;").unwrap();
         for statement in &block.statements {
-            emit_statement(program, function, statement, &substitutions, output)?;
+            emit_statement(
+                program,
+                function,
+                instance,
+                statement,
+                &substitutions,
+                output,
+            )?;
         }
         terminator(
             program,
@@ -332,6 +482,7 @@ fn function(
 fn emit_statement(
     program: &mir::Program,
     function: &mir::Function,
+    instance: &mono::FunctionInstance,
     statement: &mir::Statement,
     substitutions: &HashMap<String, hir::Type>,
     output: &mut String,
@@ -371,7 +522,15 @@ fn emit_statement(
         .unwrap(),
         mir::StatementKind::Assign(place, value) => {
             let ty = place_ty(program, function, place, substitutions);
-            let expression = rvalue(program, function, value, &ty, statement.span, substitutions);
+            let expression = rvalue(
+                program,
+                function,
+                instance,
+                value,
+                &ty,
+                statement.span,
+                substitutions,
+            );
             writeln!(
                 output,
                 "{}={expression};",
@@ -464,6 +623,37 @@ fn terminator(
         } => {
             let destination_ty = place_ty(program, function, destination, substitutions);
             let call = match target {
+                hir::CallTarget::Callable => {
+                    let callable_ty = operand_ty(program, function, &arguments[0], substitutions);
+                    let hir::Type::Function(parameters, result) = &callable_ty else {
+                        unreachable!("validated callable target must have function type")
+                    };
+                    let callable = operand(
+                        program,
+                        function,
+                        &arguments[0],
+                        &callable_ty,
+                        substitutions,
+                    );
+                    let mut signature = format!("{} (*)(void *", native_types::c_type(result));
+                    for parameter in parameters {
+                        write!(signature, ",{}", native_types::c_type(parameter)).unwrap();
+                    }
+                    signature.push(')');
+                    let values = arguments[1..]
+                        .iter()
+                        .zip(parameters)
+                        .map(|(argument, expected)| {
+                            operand(program, function, argument, expected, substitutions)
+                        })
+                        .collect::<Vec<_>>();
+                    let suffix = if values.is_empty() {
+                        String::new()
+                    } else {
+                        format!(",{}", values.join(","))
+                    };
+                    format!("((({signature})(({callable}).code))(({callable}).env{suffix}))")
+                }
                 hir::CallTarget::Intrinsic(name) if name == "print" => {
                     let argument_ty = operand_ty(program, function, &arguments[0], substitutions);
                     format!(
@@ -1399,6 +1589,7 @@ fn terminator(
 fn rvalue(
     program: &mir::Program,
     function: &mir::Function,
+    instance: &mono::FunctionInstance,
     value: &mir::Rvalue,
     expected: &hir::Type,
     span: crate::diagnostics::Span,
@@ -1406,6 +1597,50 @@ fn rvalue(
 ) -> String {
     match value {
         mir::Rvalue::Use(value) => operand(program, function, value, expected, substitutions),
+        mir::Rvalue::Function(target) => {
+            let target = mono::FunctionInstance {
+                function: *target,
+                substitutions: vec![],
+            };
+            format!(
+                "(disp_native_callable){{.code=(void (*)(void)){},.env=NULL,.drop=NULL}}",
+                callable_wrapper_name(program, &target)
+            )
+        }
+        mir::Rvalue::Closure {
+            function: target,
+            captures,
+        } => {
+            let target = mono::FunctionInstance {
+                function: *target,
+                substitutions: instance.substitutions.clone(),
+            };
+            let target_function = &program.functions[target.function.0];
+            let target_map = mono::mapping(target_function, &target);
+            if captures.is_empty() {
+                return format!(
+                    "(disp_native_callable){{.code=(void (*)(void)){},.env=NULL,.drop=NULL}}",
+                    callable_wrapper_name(program, &target)
+                );
+            }
+            let environment = callable_env_name(program, &target);
+            let stores = captures
+                .iter()
+                .enumerate()
+                .map(|(index, capture)| {
+                    let ty = substitute(&target_function.locals[index + 1].ty, &target_map);
+                    format!(
+                        "_captures->f{index}={};",
+                        operand(program, function, capture, &ty, substitutions)
+                    )
+                })
+                .collect::<String>();
+            format!(
+                "({{{environment} *_captures=({environment}*)disp_alloc(sizeof({environment}),_Alignof({environment}));{stores}(disp_native_callable){{.code=(void (*)(void)){},.env=_captures,.drop={}}};}})",
+                callable_wrapper_name(program, &target),
+                callable_drop_name(program, &target)
+            )
+        }
         mir::Rvalue::UnaryOp(operator, value) => {
             let input_ty = operand_ty(program, function, value, substitutions);
             from_dv(
@@ -2384,6 +2619,9 @@ fn drop_value_depth(program: &mir::Program, value: &str, ty: &hir::Type, depth: 
             );
             format!("{{if(({value}).tag==0){{{ok_drop}}}else{{{error_drop}}}}}")
         }
+        hir::Type::Function(_, _) => format!(
+            "{{if(({value}).drop)({value}).drop(({value}).env);({value})=(disp_native_callable){{0}};}}"
+        ),
         _ => String::new(),
     }
 }

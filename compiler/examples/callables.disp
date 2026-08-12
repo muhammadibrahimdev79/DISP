@@ -1,0 +1,21 @@
+fn apply<T>(operation: fn(T) -> T, value: T) -> T = operation(value)
+
+fn make_adder(offset: int) -> fn(int) -> int {
+    return move |value: int| value + offset
+}
+
+fn main() {
+    let double = |value: int| value * 2
+    print(apply(double, 21))
+
+    var calls = 0
+    let next = || -> int {
+        calls += 1
+        return calls
+    }
+    print(next())
+    print(next())
+
+    let add = make_adder(20)
+    print(add(22))
+}

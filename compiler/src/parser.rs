@@ -1,9 +1,9 @@
 use crate::ast::{
-    AssignmentOperator, BinaryOperator, BindingKind, Block, EnumDeclaration, Expr, Expression,
-    ExternalAbi, ExternalFunction, FieldDeclaration, Function, FunctionSignature, GenericParameter,
-    Implementation, ImportDeclaration, ImportItem, MatchArm, ModuleDeclaration, Parameter, Pattern,
-    Program, Spanned, Statement, StructDeclaration, StructFieldValue, TraitDeclaration, TypeName,
-    TypeQualifier, UnaryOperator, VariantDeclaration,
+    AssignmentOperator, BinaryOperator, BindingKind, Block, ClosureBody, EnumDeclaration, Expr,
+    Expression, ExternalAbi, ExternalFunction, FieldDeclaration, Function, FunctionSignature,
+    GenericParameter, Implementation, ImportDeclaration, ImportItem, MatchArm, ModuleDeclaration,
+    Parameter, Pattern, Program, Spanned, Statement, StructDeclaration, StructFieldValue,
+    TraitDeclaration, TypeName, TypeQualifier, UnaryOperator, VariantDeclaration,
 };
 use crate::diagnostics::{Diagnostic, DiagnosticKind, Position, Span};
 use crate::lexer::{Token, TokenKind};
@@ -599,6 +599,36 @@ impl Parser {
     }
 
     fn parse_type_name(&mut self) -> Result<TypeName, Diagnostic> {
+        if self.match_token(&TokenKind::Fn) {
+            let start = self.previous().span;
+            self.expect(
+                TokenKind::LeftParen,
+                "expected `(` after `fn` in function type",
+            )?;
+            let mut arguments = Vec::new();
+            if !self.check(&TokenKind::RightParen) {
+                loop {
+                    arguments.push(self.parse_type_name()?);
+                    if !self.match_token(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect(
+                TokenKind::RightParen,
+                "expected `)` after function parameters",
+            )?;
+            self.expect(TokenKind::Arrow, "expected `->` in function type")?;
+            let result = self.parse_type_name()?;
+            let end = result.span;
+            arguments.push(result);
+            return Ok(TypeName {
+                name: "fn".into(),
+                arguments,
+                qualifier: TypeQualifier::Owned,
+                span: start.through(end),
+            });
+        }
         if self.match_token(&TokenKind::LeftBracket) {
             let start = self.previous().span;
             let element = self.parse_type_name()?;
@@ -1062,6 +1092,12 @@ impl Parser {
         }
         if self.match_token(&TokenKind::Move) {
             let start = self.previous().span;
+            if self.match_token(&TokenKind::Or) {
+                return self.parse_closure(start, true, false);
+            }
+            if self.match_token(&TokenKind::OrOr) {
+                return self.parse_closure(start, true, true);
+            }
             let operand = self.with_recursion(Self::parse_unary)?;
             return Ok(Spanned {
                 span: start.through(operand.span),
@@ -1245,6 +1281,8 @@ impl Parser {
             TokenKind::Character(value) => Expression::Character(value),
             TokenKind::True => Expression::Bool(true),
             TokenKind::False => Expression::Bool(false),
+            TokenKind::Or => return self.parse_closure(span, false, false),
+            TokenKind::OrOr => return self.parse_closure(span, false, true),
             TokenKind::Identifier(name)
                 if is_type_style(&name) && self.looks_like_struct_construct() =>
             {
@@ -1286,6 +1324,67 @@ impl Parser {
             }
         };
         Ok(Spanned { node, span })
+    }
+
+    fn parse_closure(
+        &mut self,
+        start: Span,
+        move_captures: bool,
+        parameters_closed: bool,
+    ) -> Result<Expr, Diagnostic> {
+        let mut parameters = Vec::new();
+        if !parameters_closed {
+            if !self.check(&TokenKind::Or) {
+                loop {
+                    let (name, name_span) =
+                        self.expect_identifier("expected closure parameter name")?;
+                    self.expect(
+                        TokenKind::Colon,
+                        "closure parameters require a type annotation",
+                    )?;
+                    parameters.push(Parameter {
+                        name,
+                        name_span,
+                        ty: self.parse_type_name()?,
+                    });
+                    if !self.match_token(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect(TokenKind::Or, "expected `|` after closure parameters")?;
+        }
+        let return_type = if self.match_token(&TokenKind::Arrow) {
+            Some(self.parse_type_name()?)
+        } else {
+            None
+        };
+        let body = if self.check(&TokenKind::LeftBrace) {
+            ClosureBody::Block(self.parse_block()?)
+        } else {
+            ClosureBody::Expression(Box::new(self.parse_expression()?))
+        };
+        if matches!(body, ClosureBody::Block(_)) && return_type.is_none() {
+            return Err(Diagnostic::new(
+                DiagnosticKind::Parse,
+                "a block closure requires an explicit return type",
+                start,
+            )
+            .with_help("write `|arguments| -> ResultType { ... }`"));
+        }
+        let end = match &body {
+            ClosureBody::Expression(expression) => expression.span,
+            ClosureBody::Block(block) => block.span,
+        };
+        Ok(Spanned {
+            span: start.through(end),
+            node: Expression::Closure {
+                move_captures,
+                parameters,
+                return_type,
+                body,
+            },
+        })
     }
 
     fn parse_struct_construct(

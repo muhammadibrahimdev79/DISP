@@ -460,6 +460,8 @@ enum Value {
     Char(char),
     Bool(bool),
     Function(String),
+    Closure(Box<RuntimeClosure>),
+    CaptureReference(Place, bool),
     Constructor {
         type_name: String,
         variant: String,
@@ -475,6 +477,20 @@ enum Value {
     },
     Unit,
     Uninitialized,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeClosure {
+    parameters: Vec<crate::ast::Parameter>,
+    return_type: Option<crate::ast::TypeName>,
+    body: crate::ast::ClosureBody,
+    captures: Arc<StdMutex<HashMap<String, Value>>>,
+}
+
+impl PartialEq for RuntimeClosure {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.captures, &other.captures)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -637,6 +653,80 @@ impl Interpreter {
         }
     }
 
+    fn call_closure(
+        &mut self,
+        program: &Program,
+        closure: RuntimeClosure,
+        arguments: Vec<Value>,
+        call_span: Span,
+    ) -> RuntimeResult<Value> {
+        if closure.parameters.len() != arguments.len() {
+            return Err(self.error(
+                format!(
+                    "closure expects {} arguments, found {}",
+                    closure.parameters.len(),
+                    arguments.len()
+                ),
+                call_span,
+            ));
+        }
+        const MAX_CALL_DEPTH: usize = 32;
+        if self.call_depth >= MAX_CALL_DEPTH {
+            return Err(self.error(
+                format!("call depth exceeds the runtime limit of {MAX_CALL_DEPTH}"),
+                call_span,
+            ));
+        }
+        self.call_depth += 1;
+        let captures = closure
+            .captures
+            .lock()
+            .map_err(|_| self.error("closure capture state is poisoned", call_span))?
+            .clone();
+        self.push_scope(captures);
+        self.push_scope(HashMap::new());
+        for (parameter, value) in closure.parameters.iter().zip(arguments) {
+            let value = coerce_value(value, &parameter.ty)
+                .map_err(|message| self.error(message, call_span))?;
+            self.scopes
+                .last_mut()
+                .unwrap()
+                .insert(parameter.name.clone(), value);
+            self.scope_orders
+                .last_mut()
+                .unwrap()
+                .push(parameter.name.clone());
+        }
+        let flow = match &closure.body {
+            crate::ast::ClosureBody::Expression(value) => {
+                self.evaluate(program, value).map(Flow::Return)
+            }
+            crate::ast::ClosureBody::Block(block) => self.execute_block_contents(program, block),
+        };
+        self.pop_scope();
+        let captures = self.scopes.pop().unwrap_or_default();
+        self.scope_orders.pop();
+        *closure
+            .captures
+            .lock()
+            .map_err(|_| self.error("closure capture state is poisoned", call_span))? = captures;
+        self.call_depth -= 1;
+        let value = match flow {
+            Err(RuntimeFault::Propagate(value)) => value,
+            Err(error) => return Err(error),
+            Ok(Flow::Return(value)) => value,
+            Ok(Flow::Normal) => Value::Unit,
+            Ok(Flow::Break | Flow::Continue) => {
+                return Err(self.error("loop control escaped a closure body", call_span));
+            }
+        };
+        if let Some(return_type) = &closure.return_type {
+            coerce_value(value, return_type).map_err(|message| self.error(message, call_span))
+        } else {
+            Ok(value)
+        }
+    }
+
     fn call_external(
         &mut self,
         function: &Function,
@@ -745,7 +835,10 @@ impl Interpreter {
                 ..
             } => {
                 let mut right = self.consume(program, value)?;
-                if let Some(existing) = self.lookup(name) {
+                if let Some(existing) = self.lookup(name).and_then(|value| match value {
+                    Value::CaptureReference(place, _) => self.read_place(&place),
+                    value => Some(value),
+                }) {
                     right = coerce_like(right, &existing)
                         .map_err(|message| self.error(message, span))?;
                 }
@@ -754,6 +847,10 @@ impl Interpreter {
                 } else {
                     let left = self
                         .lookup(name)
+                        .and_then(|value| match value {
+                            Value::CaptureReference(place, _) => self.read_place(&place),
+                            value => Some(value),
+                        })
                         .ok_or_else(|| self.error(format!("undefined variable `{name}`"), span))?;
                     let binary = match operator {
                         AssignmentOperator::Add => BinaryOperator::Add,
@@ -954,6 +1051,43 @@ impl Interpreter {
                 .map(|value| self.consume(program, value))
                 .collect::<Result<Vec<_>, _>>()
                 .map(Value::Array),
+            Expression::Closure {
+                move_captures,
+                parameters,
+                return_type,
+                body,
+            } => {
+                let mut captures = HashMap::new();
+                for (name, usage) in crate::ast::closure_capture_uses(parameters, body) {
+                    let Some(place) = self.expression_place(&crate::ast::Spanned {
+                        node: Expression::Identifier(name.clone()),
+                        span: usage.span,
+                    }) else {
+                        continue;
+                    };
+                    let value = if *move_captures {
+                        let value = self.read_place(&place).ok_or_else(|| {
+                            self.error(format!("invalid capture `{name}`"), usage.span)
+                        })?;
+                        if !value_is_copy(program, &value) {
+                            self.write_place(&place, Value::Uninitialized)
+                                .ok_or_else(|| {
+                                    self.error(format!("invalid capture `{name}`"), usage.span)
+                                })?;
+                        }
+                        value
+                    } else {
+                        Value::CaptureReference(place, usage.mutated)
+                    };
+                    captures.insert(name, value);
+                }
+                Ok(Value::Closure(Box::new(RuntimeClosure {
+                    parameters: parameters.clone(),
+                    return_type: return_type.clone(),
+                    body: body.clone(),
+                    captures: Arc::new(StdMutex::new(captures)),
+                })))
+            }
             Expression::Index { object, index } => {
                 let values = self.evaluate(program, object)?;
                 let index_value = self.evaluate(program, index)?;
@@ -1048,6 +1182,11 @@ impl Interpreter {
             }
             Expression::Identifier(name) => {
                 if let Some(value) = self.lookup(name) {
+                    if let Value::CaptureReference(place, _) = value {
+                        return self.read_place(&place).ok_or_else(|| {
+                            self.error(format!("dangling capture `{name}`"), expression.span)
+                        });
+                    }
                     return Ok(value);
                 }
                 if program
@@ -2479,6 +2618,19 @@ impl Interpreter {
                         payload,
                     });
                 }
+                if let Value::Closure(closure) = callee_value {
+                    let mut values = Vec::with_capacity(arguments.len());
+                    for (argument, parameter) in arguments.iter().zip(&closure.parameters) {
+                        values.push(
+                            if parameter.ty.qualifier == crate::ast::TypeQualifier::Owned {
+                                self.consume(program, argument)?
+                            } else {
+                                self.evaluate(program, argument)?
+                            },
+                        );
+                    }
+                    return self.call_closure(program, *closure, values, expression.span);
+                }
                 let Value::Function(name) = callee_value else {
                     return Err(self.error("expression is not callable", callee.span));
                 };
@@ -2781,6 +2933,12 @@ impl Interpreter {
     }
 
     fn assign(&mut self, name: &str, value: Value) -> Option<()> {
+        if let Some(Value::CaptureReference(place, mutable)) = self.lookup(name) {
+            if !mutable {
+                return None;
+            }
+            return self.write_place(&place, value);
+        }
         let scope = self
             .scopes
             .iter_mut()
@@ -2804,6 +2962,9 @@ impl Interpreter {
     fn expression_place(&self, expression: &Expr) -> Option<Place> {
         match &expression.node {
             Expression::Identifier(name) => {
+                if let Some(Value::CaptureReference(place, _)) = self.lookup(name) {
+                    return Some(place);
+                }
                 let scope = self
                     .scopes
                     .iter()
@@ -3195,8 +3356,8 @@ fn value_type_name(value: &Value) -> &str {
         Value::Unsigned(_, _) => "<unsigned>",
         Value::Float(_) => "f64",
         Value::Float32(_) => "f32",
-        Value::Reference(_, false) => "&",
-        Value::Reference(_, true) => "&mut",
+        Value::Reference(_, false) | Value::CaptureReference(_, false) => "&",
+        Value::Reference(_, true) | Value::CaptureReference(_, true) => "&mut",
         Value::String(_) => "String",
         Value::CString(_) => "CString",
         Value::CStr(_) => "CStr",
@@ -3217,7 +3378,7 @@ fn value_type_name(value: &Value) -> &str {
         Value::Bool(_) => "bool",
         Value::Struct { type_name, .. } | Value::Enum { type_name, .. } => type_name,
         Value::Unit => "Unit",
-        Value::Function(_) | Value::Constructor { .. } => "<callable>",
+        Value::Function(_) | Value::Closure(_) | Value::Constructor { .. } => "<callable>",
         Value::Uninitialized => "<uninitialized>",
     }
 }
@@ -3235,6 +3396,7 @@ fn value_is_copy(program: &Program, value: &Value) -> bool {
         | Value::Char(_)
         | Value::Bool(_)
         | Value::Reference(_, _)
+        | Value::CaptureReference(_, _)
         | Value::CStr(_)
         | Value::Function(_)
         | Value::Constructor { .. }
@@ -3266,6 +3428,7 @@ fn value_is_copy(program: &Program, value: &Value) -> bool {
         | Value::String(_)
         | Value::CString(_)
         | Value::Memory(_)
+        | Value::Closure(_)
         | Value::Uninitialized => false,
     }
 }
@@ -3617,8 +3780,12 @@ fn display_value(value: Value) -> String {
         Value::Unsigned(value, _) => value.to_string(),
         Value::Float(value) => value.to_string(),
         Value::Float32(value) => value.to_string(),
-        Value::Reference(_, false) => "<shared reference>".into(),
-        Value::Reference(_, true) => "<mutable reference>".into(),
+        Value::Reference(_, false) | Value::CaptureReference(_, false) => {
+            "<shared reference>".into()
+        }
+        Value::Reference(_, true) | Value::CaptureReference(_, true) => {
+            "<mutable reference>".into()
+        }
         Value::String(value) => value.text,
         Value::CString(value) | Value::CStr(value) => value.text(),
         Value::Memory(_) => "<Memory>".into(),
@@ -3672,6 +3839,7 @@ fn display_value(value: Value) -> String {
         Value::Char(value) => value.to_string(),
         Value::Bool(value) => value.to_string(),
         Value::Function(name) => format!("<fn {name}>"),
+        Value::Closure(_) => "<closure>".into(),
         Value::Constructor { type_name, variant } => format!("<{type_name}.{variant}>"),
         Value::Struct { type_name, .. } => format!("{type_name} {{ .. }}"),
         Value::Enum {

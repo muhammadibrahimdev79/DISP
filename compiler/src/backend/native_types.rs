@@ -22,7 +22,8 @@ pub fn generate(
          typedef struct { disp_mutex_state *state; } disp_native_mutex;\n\
          typedef struct { disp_mutex_state *state; } disp_native_mutex_guard;\n\
          typedef struct disp_atomic_int_state disp_atomic_int_state;\n\
-         typedef struct { disp_atomic_int_state *state; } disp_native_atomic_int;\n",
+         typedef struct { disp_atomic_int_state *state; } disp_native_atomic_int;\n\
+         typedef struct { void (*code)(void); void *env; void (*drop)(void *); } disp_native_callable;\n",
     );
     for instance in &mono_program.types {
         writeln!(
@@ -336,7 +337,7 @@ pub fn c_type(ty: &hir::Type) -> String {
         | hir::Type::Option(_)
         | hir::Type::Result(_, _) => name(ty),
         hir::Type::Generic(_) => "disp_native_string".into(),
-        hir::Type::Function(_, _) => "uintptr_t".into(),
+        hir::Type::Function(_, _) => "disp_native_callable".into(),
         hir::Type::Unknown => "void".into(),
     }
 }

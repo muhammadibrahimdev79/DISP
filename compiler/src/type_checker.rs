@@ -987,6 +987,64 @@ impl TypeChecker {
                 }
                 Ok(Type::Array(Box::new(element), values.len()))
             }
+            Expression::Closure {
+                parameters,
+                return_type,
+                body,
+                ..
+            } => {
+                let parameter_types = parameters
+                    .iter()
+                    .map(|parameter| self.resolve_type(&parameter.ty))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let declared_result = return_type
+                    .as_ref()
+                    .map(|result| self.resolve_type(result))
+                    .transpose()?;
+                let previous_return = self.expected_return.clone();
+                self.expected_return = declared_result.clone().unwrap_or(Type::Infer);
+                self.begin_scope();
+                for (parameter, ty) in parameters.iter().zip(&parameter_types) {
+                    self.scopes.last_mut().unwrap().insert(
+                        parameter.name.clone(),
+                        Variable {
+                            ty: ty.clone(),
+                            constant: false,
+                        },
+                    );
+                }
+                let checked = match body {
+                    crate::ast::ClosureBody::Expression(value) => {
+                        let actual = materialize_literal(self.check_expression(value)?);
+                        if let Some(expected) = &declared_result {
+                            self.require_same(expected, &actual, value.span, "closure result")?;
+                            expected.clone()
+                        } else {
+                            actual
+                        }
+                    }
+                    crate::ast::ClosureBody::Block(block) => {
+                        let expected = declared_result
+                            .clone()
+                            .expect("parser requires result type");
+                        let always_returns = self.check_block_contents(block)?;
+                        if expected != Type::Unit && !always_returns {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Type,
+                                format!(
+                                    "closure may finish without returning {}",
+                                    self.format_type(&expected)
+                                ),
+                                block.span,
+                            ));
+                        }
+                        expected
+                    }
+                };
+                self.end_scope();
+                self.expected_return = previous_return;
+                Ok(Type::Function(parameter_types, Box::new(checked)))
+            }
             Expression::Index { object, index } => {
                 let object_ty = self.check_expression(object)?;
                 let index_ty = self.check_expression(index)?;
@@ -1196,6 +1254,18 @@ impl TypeChecker {
                     return Ok(variable.ty);
                 }
                 if let Some(signature) = self.functions.get(name) {
+                    if !signature.generics.is_empty() {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            format!(
+                                "generic function `{name}` needs concrete type arguments before it can become a value"
+                            ),
+                            expression.span,
+                        )
+                        .with_help(
+                            "call the generic function directly, or wrap a concrete call in a closure",
+                        ));
+                    }
                     return Ok(Type::Function(
                         signature.parameters.clone(),
                         Box::new(signature.result.clone()),
@@ -1358,6 +1428,35 @@ impl TypeChecker {
                 self.check_binary(*operator, left_type, right_type, expression.span)
             }
             Expression::Call { callee, arguments } => {
+                if matches!(callee.node, Expression::FieldAccess { .. })
+                    && let Ok(Type::Function(parameters, result)) = self.check_expression(callee)
+                {
+                    if parameters.len() != arguments.len() {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            format!(
+                                "function expects {} arguments, found {}",
+                                parameters.len(),
+                                arguments.len()
+                            ),
+                            expression.span,
+                        ));
+                    }
+                    let mut substitutions = HashMap::new();
+                    for (parameter, argument) in parameters.iter().zip(arguments) {
+                        let actual = self.check_expression(argument)?;
+                        infer_substitutions(parameter, &actual, &mut substitutions, argument.span)?;
+                        self.require_same(
+                            &substitute(parameter, &substitutions),
+                            &actual,
+                            argument.span,
+                            "function argument",
+                        )?;
+                    }
+                    let result = substitute(&result, &substitutions);
+                    self.validate_instantiated_type(&result, expression.span)?;
+                    return Ok(result);
+                }
                 if let Expression::Identifier(name) = &callee.node
                     && self.external_functions.contains(name)
                     && self.unsafe_depth == 0
@@ -2950,6 +3049,16 @@ impl TypeChecker {
             });
         }
         let resolved = match ty.name.as_str() {
+            "fn" if !ty.arguments.is_empty() => {
+                let (result, parameters) = ty.arguments.split_last().unwrap();
+                Type::Function(
+                    parameters
+                        .iter()
+                        .map(|parameter| self.resolve_type(parameter))
+                        .collect::<Result<Vec<_>, _>>()?,
+                    Box::new(self.resolve_type(result)?),
+                )
+            }
             "int" if ty.arguments.is_empty() => Type::Int,
             "uint" if ty.arguments.is_empty() => Type::UInt,
             "f64" if ty.arguments.is_empty() => Type::Float,
@@ -3391,6 +3500,7 @@ impl TypeChecker {
             Expression::Try(_)
             | Expression::Spawn(_)
             | Expression::Call { .. }
+            | Expression::Closure { .. }
             | Expression::Move(_)
             | Expression::Borrow { .. }
             | Expression::Dereference(_) => false,
@@ -3637,6 +3747,14 @@ fn infer_substitutions(
         (Type::Result(a, b), Type::Result(x, y)) => {
             infer_substitutions(a, x, substitutions, span)?;
             infer_substitutions(b, y, substitutions, span)?;
+        }
+        (Type::Function(parameters, result), Type::Function(actual_parameters, actual_result))
+            if parameters.len() == actual_parameters.len() =>
+        {
+            for (parameter, actual) in parameters.iter().zip(actual_parameters) {
+                infer_substitutions(parameter, actual, substitutions, span)?;
+            }
+            infer_substitutions(result, actual_result, substitutions, span)?;
         }
         (Type::Reference(x, xm), Type::Reference(y, ym)) if !*xm || *ym => {
             infer_substitutions(x, y, substitutions, span)?;

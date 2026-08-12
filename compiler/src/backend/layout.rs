@@ -125,9 +125,14 @@ impl<'a> LayoutEngine<'a> {
                 let bytes = u64::from(*width) / 8;
                 scalar(bytes, bytes)
             }
-            hir::Type::Reference { .. }
-            | hir::Type::RawPointer { .. }
-            | hir::Type::Function(_, _) => scalar(
+            hir::Type::Function(_, _) => {
+                let pointer = scalar(
+                    u64::from(self.target.pointer_width) / 8,
+                    self.target.pointer_alignment,
+                );
+                aggregate_layout(&[pointer.clone(), pointer.clone(), pointer])
+            }
+            hir::Type::Reference { .. } | hir::Type::RawPointer { .. } => scalar(
                 u64::from(self.target.pointer_width) / 8,
                 self.target.pointer_alignment,
             ),

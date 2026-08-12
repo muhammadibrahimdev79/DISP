@@ -395,6 +395,42 @@ impl Resolver {
                 }
                 Ok(())
             }
+            Expression::Closure {
+                parameters,
+                return_type,
+                body,
+                ..
+            } => {
+                for parameter in parameters {
+                    self.resolve_type_name(&parameter.ty)?;
+                }
+                if let Some(return_type) = return_type {
+                    self.resolve_type_name(return_type)?;
+                }
+                let outer_loop_depth = std::mem::replace(&mut self.loop_depth, 0);
+                self.begin_scope();
+                let result = (|| {
+                    for parameter in parameters {
+                        self.declare_local(
+                            &parameter.name,
+                            parameter.name_span,
+                            SymbolKind::Local {
+                                mutable: false,
+                                constant: false,
+                            },
+                        )?;
+                    }
+                    match body {
+                        crate::ast::ClosureBody::Expression(expression) => {
+                            self.resolve_expression(expression)
+                        }
+                        crate::ast::ClosureBody::Block(block) => self.resolve_block_contents(block),
+                    }
+                })();
+                self.end_scope();
+                self.loop_depth = outer_loop_depth;
+                result
+            }
             Expression::Index { object, index } => {
                 self.resolve_expression(object)?;
                 self.resolve_expression(index)
@@ -686,6 +722,19 @@ impl Resolver {
             };
         }
         let expected_arguments = match ty.name.as_str() {
+            "fn" => {
+                if ty.arguments.is_empty() {
+                    return Err(Diagnostic::new(
+                        DiagnosticKind::Resolve,
+                        "function type is missing its result type",
+                        ty.span,
+                    ));
+                }
+                for argument in &ty.arguments {
+                    self.resolve_type_name(argument)?;
+                }
+                return Ok(());
+            }
             "Option" => Some(1),
             "Result" => Some(2),
             "List" => Some(1),

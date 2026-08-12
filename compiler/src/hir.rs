@@ -1,6 +1,9 @@
 use crate::ast::{self, BinaryOperator, BindingKind, TypeQualifier, UnaryOperator};
 use crate::diagnostics::{Diagnostic, DiagnosticKind, SourceFile, Span};
-use std::collections::{HashMap, HashSet};
+use std::{
+    cell::{Cell, RefCell},
+    collections::{HashMap, HashSet},
+};
 
 macro_rules! id {
     ($name:ident) => {
@@ -161,6 +164,7 @@ pub struct Function {
     pub id: FunctionId,
     pub name: String,
     pub parameters: Vec<LocalId>,
+    pub capture_count: usize,
     pub locals: Vec<Local>,
     pub return_type: Type,
     pub body: Block,
@@ -266,6 +270,10 @@ pub enum ExprKind {
     Constant(Constant),
     Local(LocalId),
     Function(FunctionId),
+    Closure {
+        function: FunctionId,
+        captures: Vec<Expr>,
+    },
     Struct {
         id: StructId,
         fields: Vec<(usize, Expr)>,
@@ -319,6 +327,7 @@ pub struct Call {
 pub enum CallTarget {
     Function(FunctionId),
     TraitMethod { trait_id: TraitId, method: usize },
+    Callable,
     Intrinsic(String),
 }
 
@@ -387,6 +396,8 @@ struct Lowering<'a> {
     function_names: HashMap<String, FunctionId>,
     method_ids: HashMap<(usize, usize), FunctionId>,
     next_variant: usize,
+    next_function: Cell<usize>,
+    generated_functions: RefCell<Vec<Function>>,
 }
 
 impl<'a> Lowering<'a> {
@@ -429,6 +440,8 @@ impl<'a> Lowering<'a> {
             function_names,
             method_ids,
             next_variant: 0,
+            next_function: Cell::new(next),
+            generated_functions: RefCell::new(Vec::new()),
         }
     }
 
@@ -544,6 +557,8 @@ impl<'a> Lowering<'a> {
                 )?);
             }
         }
+        functions.extend(self.generated_functions.take());
+        functions.sort_by_key(|function| function.id);
         let mut copy_types = HashSet::new();
         for implementation in &implementations {
             if implementation.trait_id == Some(TraitId(usize::MAX)) {
@@ -583,8 +598,19 @@ impl<'a> Lowering<'a> {
             root: self,
             scopes: vec![HashMap::new()],
             locals: Vec::new(),
+            capture_bindings: HashMap::new(),
             self_ty,
             expected_return: Type::Unit,
+            generic_parameters: owner_impl
+                .into_iter()
+                .flat_map(|owner| {
+                    self.ast.implementations[owner.0]
+                        .generics
+                        .iter()
+                        .map(|generic| generic.name.clone())
+                })
+                .chain(function.generics.iter().map(|generic| generic.name.clone()))
+                .collect(),
             generic_traits: function
                 .generics
                 .iter()
@@ -618,6 +644,7 @@ impl<'a> Lowering<'a> {
             id,
             name: function.name.clone(),
             parameters,
+            capture_count: 0,
             locals: cx.locals,
             return_type,
             body,
@@ -660,6 +687,16 @@ impl<'a> Lowering<'a> {
             };
         }
         let base = match ty.name.as_str() {
+            "fn" if !ty.arguments.is_empty() => {
+                let (result, parameters) = ty.arguments.split_last().unwrap();
+                Type::Function(
+                    parameters
+                        .iter()
+                        .map(|parameter| self.lower_type(parameter))
+                        .collect(),
+                    Box::new(self.lower_type(result)),
+                )
+            }
             "unit" | "Unit" => Type::Unit,
             "bool" => Type::Bool,
             "char" => Type::Char,
@@ -858,9 +895,16 @@ struct FunctionLowering<'a, 'b> {
     root: &'a Lowering<'b>,
     scopes: Vec<HashMap<String, LocalId>>,
     locals: Vec<Local>,
+    capture_bindings: HashMap<String, CaptureBinding>,
     self_ty: Option<Type>,
     expected_return: Type,
+    generic_parameters: Vec<String>,
     generic_traits: HashMap<String, Vec<TraitId>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CaptureBinding {
+    local: LocalId,
 }
 
 impl FunctionLowering<'_, '_> {
@@ -992,6 +1036,21 @@ impl FunctionLowering<'_, '_> {
                         operator: *operator,
                         value,
                     }
+                } else if let Some(capture) = self.capture_bindings.get(name).copied() {
+                    let projections =
+                        if matches!(self.locals[capture.local.0].ty, Type::Reference { .. }) {
+                            vec![Projection::SafeDereference]
+                        } else {
+                            vec![]
+                        };
+                    StatementKind::Assign {
+                        target: Place {
+                            local: capture.local,
+                            projections,
+                        },
+                        operator: *operator,
+                        value,
+                    }
                 } else {
                     let ty = value.ty.clone();
                     let local = self.declare(name, ty, true, false, statement.span)?;
@@ -1118,6 +1177,144 @@ impl FunctionLowering<'_, '_> {
 
     fn lower_expr(&mut self, expression: &ast::Expr) -> Result<Expr, Diagnostic> {
         let (kind, ty) = match &expression.node {
+            ast::Expression::Closure {
+                move_captures,
+                parameters,
+                return_type,
+                body,
+            } => {
+                let uses = ast::closure_capture_uses(parameters, body);
+                let mut capture_expressions = Vec::new();
+                let mut capture_definitions = Vec::new();
+                for (name, usage) in uses {
+                    if self.lookup_optional(&name).is_none()
+                        && !self.capture_bindings.contains_key(&name)
+                    {
+                        continue;
+                    }
+                    let source = ast::Spanned {
+                        node: ast::Expression::Identifier(name.clone()),
+                        span: usage.span,
+                    };
+                    let source_value = self.lower_expr(&source)?;
+                    let source_ty = source_value.ty.clone();
+                    let capture_ty = if *move_captures {
+                        source_ty.clone()
+                    } else {
+                        Type::Reference {
+                            mutable: usage.mutated,
+                            inner: Box::new(source_ty.clone()),
+                        }
+                    };
+                    let place = self.lower_place(&source)?;
+                    capture_expressions.push(Expr {
+                        kind: if *move_captures {
+                            if surface_type_is_copy(&source_ty) {
+                                source_value.kind
+                            } else {
+                                ExprKind::Move(place)
+                            }
+                        } else {
+                            ExprKind::Borrow {
+                                mutable: usage.mutated,
+                                place,
+                            }
+                        },
+                        ty: capture_ty.clone(),
+                        span: usage.span,
+                    });
+                    capture_definitions.push((name, capture_ty));
+                }
+                let id = FunctionId(self.root.next_function.get());
+                self.root.next_function.set(id.0 + 1);
+                let mut closure = FunctionLowering {
+                    root: self.root,
+                    scopes: vec![HashMap::new()],
+                    locals: Vec::new(),
+                    capture_bindings: HashMap::new(),
+                    self_ty: self.self_ty.clone(),
+                    expected_return: return_type
+                        .as_ref()
+                        .map(|ty| self.lower_type(ty))
+                        .unwrap_or(Type::Unknown),
+                    generic_parameters: self.generic_parameters.clone(),
+                    generic_traits: self.generic_traits.clone(),
+                };
+                for (name, ty) in capture_definitions {
+                    let local = closure.declare(
+                        &format!("@capture:{name}"),
+                        ty.clone(),
+                        false,
+                        true,
+                        expression.span,
+                    )?;
+                    closure
+                        .capture_bindings
+                        .insert(name, CaptureBinding { local });
+                }
+                let capture_count = closure.locals.len();
+                let mut parameter_ids = (0..capture_count).map(LocalId).collect::<Vec<_>>();
+                for parameter in parameters {
+                    let ty = closure.lower_type(&parameter.ty);
+                    parameter_ids.push(closure.declare(
+                        &parameter.name,
+                        ty,
+                        false,
+                        true,
+                        parameter.name_span,
+                    )?);
+                }
+                let (closure_body, inferred_result) = match body {
+                    ast::ClosureBody::Expression(value) => {
+                        let value = closure.lower_expr(value)?;
+                        let result = value.ty.clone();
+                        (
+                            Block {
+                                statements: vec![Statement {
+                                    kind: StatementKind::Return(Some(value)),
+                                    span: expression.span,
+                                }],
+                                span: expression.span,
+                            },
+                            result,
+                        )
+                    }
+                    ast::ClosureBody::Block(block) => (
+                        closure.lower_block_contents(block)?,
+                        closure.expected_return.clone(),
+                    ),
+                };
+                let result = return_type
+                    .as_ref()
+                    .map(|ty| self.lower_type(ty))
+                    .unwrap_or(inferred_result);
+                self.root.generated_functions.borrow_mut().push(Function {
+                    id,
+                    name: format!("@closure{}", id.0),
+                    parameters: parameter_ids,
+                    capture_count,
+                    locals: closure.locals,
+                    return_type: result.clone(),
+                    body: closure_body,
+                    generic_parameters: closure.generic_parameters,
+                    owner_impl: None,
+                    external: None,
+                    span: expression.span,
+                });
+                (
+                    ExprKind::Closure {
+                        function: id,
+                        captures: capture_expressions,
+                    },
+                    Type::Function(
+                        parameters
+                            .iter()
+                            .map(|parameter| self.lower_type(&parameter.ty))
+                            .collect(),
+                        Box::new(result),
+                    ),
+                )
+            }
             ast::Expression::Array(values) => {
                 let values = values
                     .iter()
@@ -1190,6 +1387,25 @@ impl FunctionLowering<'_, '_> {
             ast::Expression::Identifier(name) => {
                 if let Ok(local) = self.lookup(name, expression.span) {
                     (ExprKind::Local(local), self.locals[local.0].ty.clone())
+                } else if let Some(capture) = self.capture_bindings.get(name).copied() {
+                    let capture_ty = self.locals[capture.local.0].ty.clone();
+                    match capture_ty {
+                        Type::Reference { inner, mutable } => (
+                            ExprKind::Dereference(
+                                Box::new(Expr {
+                                    kind: ExprKind::Local(capture.local),
+                                    ty: Type::Reference {
+                                        inner: inner.clone(),
+                                        mutable,
+                                    },
+                                    span: expression.span,
+                                }),
+                                false,
+                            ),
+                            *inner,
+                        ),
+                        other => (ExprKind::Local(capture.local), other),
+                    }
                 } else if let Some(function) = self.root.function_names.get(name).copied() {
                     let f = &self.root.ast.functions[function.0];
                     (
@@ -2424,19 +2640,73 @@ impl FunctionLowering<'_, '_> {
                 });
             }
         }
-        Err(Diagnostic::new(
-            DiagnosticKind::Internal,
-            "HIR lowering encountered an unresolved call target",
+        let callable = self.lower_expr(callee)?;
+        let Type::Function(parameters, result) = callable.ty.clone() else {
+            return Err(Diagnostic::new(
+                DiagnosticKind::Internal,
+                "HIR lowering encountered an unresolved call target",
+                span,
+            ));
+        };
+        let mut args = Vec::with_capacity(arguments.len() + 1);
+        args.push(callable);
+        for (source, expected) in arguments.iter().zip(&parameters) {
+            let mut argument = self.lower_expr(source)?;
+            if matches!(expected, Type::Reference { mutable: false, .. })
+                && !matches!(argument.ty, Type::Reference { .. })
+            {
+                let place = self.lower_place(source)?;
+                argument = Expr {
+                    kind: ExprKind::Borrow {
+                        mutable: false,
+                        place,
+                    },
+                    ty: expected.clone(),
+                    span: argument.span,
+                };
+            }
+            coerce_str_view(&mut argument, expected);
+            args.push(argument);
+        }
+        Ok(Expr {
+            kind: ExprKind::Call(Call {
+                target: CallTarget::Callable,
+                arguments: args,
+                receiver: Some(ReceiverMode::Shared),
+                substitutions: vec![],
+            }),
+            ty: *result,
             span,
-        ))
+        })
     }
 
     fn lower_place(&mut self, expr: &ast::Expr) -> Result<Place, Diagnostic> {
         match &expr.node {
-            ast::Expression::Identifier(name) => Ok(Place {
-                local: self.lookup(name, expr.span)?,
-                projections: vec![],
-            }),
+            ast::Expression::Identifier(name) => {
+                if let Some(local) = self.lookup_optional(name) {
+                    return Ok(Place {
+                        local,
+                        projections: vec![],
+                    });
+                }
+                let capture = self.capture_bindings.get(name).ok_or_else(|| {
+                    Diagnostic::new(
+                        DiagnosticKind::Internal,
+                        format!("HIR lowering lost captured local `{name}`"),
+                        expr.span,
+                    )
+                })?;
+                let projections =
+                    if matches!(self.locals[capture.local.0].ty, Type::Reference { .. }) {
+                        vec![Projection::SafeDereference]
+                    } else {
+                        vec![]
+                    };
+                Ok(Place {
+                    local: capture.local,
+                    projections,
+                })
+            }
             ast::Expression::FieldAccess { object, field, .. } => {
                 let mut place = self.lower_place(object)?;
                 let ty = self.place_type(&place);
@@ -3284,6 +3554,18 @@ fn validate_semantics_expr(expr: &Expr, functions: usize) -> Result<(), Diagnost
                 validate_semantics_expr(argument, functions)?;
             }
         }
+        ExprKind::Closure { function, captures } => {
+            if function.0 >= functions {
+                return Err(Diagnostic::new(
+                    DiagnosticKind::Internal,
+                    "HIR closure target is out of range",
+                    expr.span,
+                ));
+            }
+            for capture in captures {
+                validate_semantics_expr(capture, functions)?;
+            }
+        }
         ExprKind::Struct { fields, .. } => {
             for (_, value) in fields {
                 validate_semantics_expr(value, functions)?;
@@ -3492,6 +3774,11 @@ fn validate_expr(expr: &Expr, locals: usize) -> Result<(), Diagnostic> {
         ExprKind::Call(call) | ExprKind::Spawn(call) => {
             for argument in &call.arguments {
                 validate_expr(argument, locals)?;
+            }
+        }
+        ExprKind::Closure { captures, .. } => {
+            for capture in captures {
+                validate_expr(capture, locals)?;
             }
         }
         ExprKind::Constant(_) | ExprKind::Function(_) | ExprKind::Variant { .. } => {}

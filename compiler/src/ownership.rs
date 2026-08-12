@@ -30,6 +30,7 @@ enum Ty {
     Path,
     Instant,
     Duration,
+    Function,
     Unit,
 }
 
@@ -60,6 +61,7 @@ struct Slot {
     scope_depth: usize,
     parameter: bool,
     reference_origin: Option<Place>,
+    closure_origins: Vec<(Place, bool)>,
 }
 
 #[derive(Debug, Clone)]
@@ -279,6 +281,18 @@ impl<'a> Analyzer<'a> {
                     fields: vec![],
                 });
             }
+            if matches!(ty, Ty::Function) {
+                // A callable parameter may carry captures chosen by its caller.
+                // Keep that hidden lifetime symbolic so it cannot be smuggled
+                // into a return value or longer-lived aggregate.
+                slot.closure_origins.push((
+                    Place {
+                        root: id,
+                        fields: vec![],
+                    },
+                    false,
+                ));
+            }
         }
         self.check_block_contents(&function.body)?;
         self.pop_scope(function.body.span, DropReason::ScopeEnd);
@@ -431,6 +445,10 @@ impl<'a> Analyzer<'a> {
                     }
                     return Ok(());
                 }
+                let closure_origins = value
+                    .as_ref()
+                    .map(|value| self.closure_origins(value))
+                    .unwrap_or_default();
                 let (ty, origin) = if let Some(value) = value {
                     let ty = self.check_expr(value, UseMode::Consume)?;
                     (
@@ -454,6 +472,7 @@ impl<'a> Analyzer<'a> {
                     value.is_some(),
                     origin.clone(),
                 )?;
+                self.attach_closure_origins(id, closure_origins, *name_span);
                 if let Some(origin) = origin
                     && ty_contains_reference(&ty)
                 {
@@ -508,10 +527,12 @@ impl<'a> Analyzer<'a> {
                         }
                         return Ok(());
                     }
+                    let closure_origins = self.closure_origins(value);
                     let ty = self.check_expr(value, UseMode::Consume)?;
                     let origin = self.reference_origin(value);
                     let id =
                         self.declare(name, ty.clone(), *name_span, true, true, origin.clone())?;
+                    self.attach_closure_origins(id, closure_origins, *name_span);
                     if let Some(origin) = origin
                         && ty_contains_reference(&ty)
                     {
@@ -533,7 +554,11 @@ impl<'a> Analyzer<'a> {
                     root: id,
                     fields: vec![],
                 };
+                let closure_origins = self.closure_origins(value);
                 self.check_assignment(&place, value, span)?;
+                self.loans.retain(|loan| loan.borrower != Some(id));
+                self.slots.get_mut(&id).unwrap().closure_origins.clear();
+                self.attach_closure_origins(id, closure_origins, *name_span);
             }
             Statement::PlaceAssignment { target, value, .. } => {
                 let place = self.place(target)?;
@@ -544,6 +569,32 @@ impl<'a> Analyzer<'a> {
             }
             Statement::Return(value) => {
                 if let Some(value) = value {
+                    let closure_origins = self.closure_origins(value);
+                    if let Expression::Identifier(name) = &value.node
+                        && self.lookup(name).is_some_and(|id| {
+                            self.slots[&id].parameter && matches!(self.slots[&id].ty, Ty::Function)
+                        })
+                    {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            "returning a callable parameter could hide borrowed captures",
+                            value.span,
+                        )
+                        .with_help(
+                            "return a newly created `move` closure or an owned data value",
+                        ));
+                    }
+                    if let Some((origin, _)) = closure_origins.first() {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            format!(
+                                "closure borrowing `{}` cannot escape its owner's scope",
+                                self.slots[&origin.root].name
+                            ),
+                            value.span,
+                        )
+                        .with_help("return a `move` closure that owns every captured value"));
+                    }
                     let ty = self.check_expr(value, UseMode::Consume)?;
                     if ty_contains_reference(&ty) {
                         let direct_reference_parameter = match &value.node {
@@ -607,9 +658,14 @@ impl<'a> Analyzer<'a> {
                 let before = self.clone();
                 let mut body_state = before.clone();
                 body_state.check_block(body)?;
-                self.merge_loop(&before, &body_state);
+                let mut repeated_entry = before.clone();
+                repeated_entry.merge_loop(&before, &body_state);
+                repeated_entry.check_expr(condition, UseMode::Read)?;
+                let mut repeated_body = repeated_entry.clone();
+                repeated_body.check_block(body)?;
+                self.merge_loop(&before, &repeated_body);
                 self.report.drops.extend(
-                    body_state
+                    repeated_body
                         .report
                         .drops
                         .into_iter()
@@ -632,9 +688,16 @@ impl<'a> Analyzer<'a> {
                 body_state.declare(name, Ty::Copy, *name_span, false, true, None)?;
                 body_state.check_block_contents(body)?;
                 body_state.pop_scope(body.span, DropReason::ScopeEnd);
-                self.merge_loop(&before, &body_state);
+                let mut repeated_entry = before.clone();
+                repeated_entry.merge_loop(&before, &body_state);
+                let mut repeated_body = repeated_entry.clone();
+                repeated_body.push_scope();
+                repeated_body.declare(name, Ty::Copy, *name_span, false, true, None)?;
+                repeated_body.check_block_contents(body)?;
+                repeated_body.pop_scope(body.span, DropReason::ScopeEnd);
+                self.merge_loop(&before, &repeated_body);
                 self.report.drops.extend(
-                    body_state
+                    repeated_body
                         .report
                         .drops
                         .into_iter()
@@ -688,13 +751,13 @@ impl<'a> Analyzer<'a> {
                 let mut body_state = before.clone();
                 body_state.push_scope();
                 let item_ty = if body_state.ty_is_copy(&element) {
-                    element
+                    element.clone()
                 } else {
-                    Ty::Reference(Box::new(element), false)
+                    Ty::Reference(Box::new(element.clone()), false)
                 };
                 let item =
                     body_state.declare(name, item_ty, *name_span, false, true, origin.clone())?;
-                if let Some(place) = origin {
+                if let Some(place) = origin.clone() {
                     body_state.loans.push(Loan {
                         place,
                         mutable: false,
@@ -704,9 +767,36 @@ impl<'a> Analyzer<'a> {
                 }
                 body_state.check_block_contents(body)?;
                 body_state.pop_scope(body.span, DropReason::ScopeEnd);
-                self.merge_loop(&before, &body_state);
+                let mut repeated_entry = before.clone();
+                repeated_entry.merge_loop(&before, &body_state);
+                let mut repeated_body = repeated_entry.clone();
+                repeated_body.push_scope();
+                let item_ty = if repeated_body.ty_is_copy(&element) {
+                    element
+                } else {
+                    Ty::Reference(Box::new(element), false)
+                };
+                let item = repeated_body.declare(
+                    name,
+                    item_ty,
+                    *name_span,
+                    false,
+                    true,
+                    origin.clone(),
+                )?;
+                if let Some(place) = origin {
+                    repeated_body.loans.push(Loan {
+                        place,
+                        mutable: false,
+                        borrower: Some(item),
+                        at: iterable.span,
+                    });
+                }
+                repeated_body.check_block_contents(body)?;
+                repeated_body.pop_scope(body.span, DropReason::ScopeEnd);
+                self.merge_loop(&before, &repeated_body);
                 self.report.drops.extend(
-                    body_state
+                    repeated_body
                         .report
                         .drops
                         .into_iter()
@@ -717,9 +807,13 @@ impl<'a> Analyzer<'a> {
                 let before = self.clone();
                 let mut body_state = before.clone();
                 body_state.check_block(body)?;
-                self.merge_loop(&before, &body_state);
+                let mut repeated_entry = before.clone();
+                repeated_entry.merge_loop(&before, &body_state);
+                let mut repeated_body = repeated_entry.clone();
+                repeated_body.check_block(body)?;
+                self.merge_loop(&before, &repeated_body);
                 self.report.drops.extend(
-                    body_state
+                    repeated_body
                         .report
                         .drops
                         .into_iter()
@@ -798,6 +892,90 @@ impl<'a> Analyzer<'a> {
                     element = self.check_expr(value, UseMode::Consume)?;
                 }
                 Ok(Ty::Array(Box::new(element)))
+            }
+            Expression::Closure {
+                move_captures,
+                parameters,
+                body,
+                ..
+            } => {
+                let captures = crate::ast::closure_capture_uses(parameters, body);
+                let mut nested = self.clone();
+                for (name, usage) in &captures {
+                    let Some(root) = self.lookup(name) else {
+                        continue;
+                    };
+                    let place = Place {
+                        root,
+                        fields: vec![],
+                    };
+                    let ty = self.slots[&root].ty.clone();
+                    if usage.consumed && !self.ty_is_copy(&ty) {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            format!(
+                                "cannot move captured `{name}` out of a reusable closure"
+                            ),
+                            usage.span,
+                        )
+                        .with_help(
+                            "return or pass a borrow, or move a separately owned value into the called operation",
+                        ));
+                    }
+                    if *move_captures {
+                        self.use_place(&place, UseMode::Consume, usage.span)?;
+                    } else {
+                        self.check_borrow(&place, usage.mutated, usage.span)?;
+                        self.loans.push(Loan {
+                            place,
+                            mutable: usage.mutated,
+                            borrower: None,
+                            at: usage.span,
+                        });
+                    }
+                }
+                nested.push_scope();
+                for parameter in parameters {
+                    let parameter_ty = nested.ty_from_name(&parameter.ty);
+                    let id = nested.declare(
+                        &parameter.name,
+                        parameter_ty.clone(),
+                        parameter.name_span,
+                        false,
+                        true,
+                        None,
+                    )?;
+                    if matches!(parameter_ty, Ty::Function) {
+                        nested.slots.get_mut(&id).unwrap().closure_origins.push((
+                            Place {
+                                root: id,
+                                fields: vec![],
+                            },
+                            false,
+                        ));
+                    }
+                }
+                match body {
+                    crate::ast::ClosureBody::Expression(value) => {
+                        if let Some((origin, _)) = nested.closure_origins(value).first() {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Type,
+                                format!(
+                                    "closure borrowing `{}` cannot escape through another closure",
+                                    nested.slots[&origin.root].name
+                                ),
+                                value.span,
+                            )
+                            .with_help("return a `move` closure that owns every captured value"));
+                        }
+                        nested.check_expr(value, UseMode::Consume)?;
+                    }
+                    crate::ast::ClosureBody::Block(block) => {
+                        nested.check_block_contents(block)?;
+                    }
+                }
+                nested.pop_scope(expression.span, DropReason::ScopeEnd);
+                Ok(Ty::Function)
             }
             Expression::Index { object: _, index } => {
                 self.check_expr(index, UseMode::Read)?;
@@ -1932,6 +2110,200 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    fn closure_origins(&self, expression: &Expr) -> Vec<(Place, bool)> {
+        let mut origins = match &expression.node {
+            Expression::Closure {
+                move_captures,
+                parameters,
+                body,
+                ..
+            } => crate::ast::closure_capture_uses(parameters, body)
+                .into_iter()
+                .flat_map(|(name, usage)| {
+                    let Some(root) = self.lookup(&name) else {
+                        return vec![];
+                    };
+                    let slot = &self.slots[&root];
+                    if !slot.closure_origins.is_empty() {
+                        return slot.closure_origins.clone();
+                    }
+                    if ty_contains_reference(&slot.ty) {
+                        return vec![(
+                            slot.reference_origin.clone().unwrap_or(Place {
+                                root,
+                                fields: vec![],
+                            }),
+                            usage.mutated || ty_contains_mutable_reference(&slot.ty),
+                        )];
+                    }
+                    if *move_captures {
+                        vec![]
+                    } else {
+                        vec![(
+                            Place {
+                                root,
+                                fields: vec![],
+                            },
+                            usage.mutated,
+                        )]
+                    }
+                })
+                .collect(),
+            Expression::Identifier(name) => self
+                .lookup(name)
+                .map(|id| self.slots[&id].closure_origins.clone())
+                .unwrap_or_default(),
+            Expression::Move(value) => self.closure_origins(value),
+            Expression::Array(values) => values
+                .iter()
+                .flat_map(|value| self.closure_origins(value))
+                .collect(),
+            Expression::StructConstruct { fields, .. } => fields
+                .iter()
+                .flat_map(|field| self.closure_origins(&field.value))
+                .collect(),
+            Expression::FieldAccess { object, .. } | Expression::Index { object, .. }
+                if self
+                    .expr_ty(expression)
+                    .is_ok_and(|ty| self.ty_contains_function(&ty)) =>
+            {
+                self.closure_origins(object)
+            }
+            Expression::Match { value, arms } => {
+                let mut origins = self.closure_origins(value);
+                origins.extend(arms.iter().flat_map(|arm| self.closure_origins(&arm.value)));
+                origins
+            }
+            Expression::Try(value) => self.closure_origins(value),
+            Expression::Call { callee, arguments }
+                if matches!(
+                    &callee.node,
+                    Expression::Identifier(name)
+                        if matches!(name.as_str(), "Some" | "Ok" | "Err")
+                ) || matches!(
+                    &callee.node,
+                    Expression::FieldAccess { object, field, .. }
+                        if matches!(&object.node, Expression::Identifier(name)
+                            if matches!(name.as_str(), "List" | "Map" | "Set" | "Mutex"))
+                            && matches!(field.as_str(), "of" | "new")
+                ) =>
+            {
+                arguments
+                    .iter()
+                    .flat_map(|argument| self.closure_origins(argument))
+                    .collect()
+            }
+            Expression::Call { callee, .. }
+                if matches!(
+                    &callee.node,
+                    Expression::FieldAccess { field, .. }
+                        if matches!(field.as_str(), "pop" | "remove")
+                ) =>
+            {
+                let Expression::FieldAccess { object, .. } = &callee.node else {
+                    unreachable!()
+                };
+                self.closure_origins(object)
+            }
+            _ => vec![],
+        };
+        origins.sort_by(|(left, mutable_left), (right, mutable_right)| {
+            left.root
+                .0
+                .cmp(&right.root.0)
+                .then_with(|| left.fields.cmp(&right.fields))
+                .then_with(|| mutable_left.cmp(mutable_right))
+        });
+        origins.dedup();
+        origins
+    }
+
+    fn ty_contains_function(&self, ty: &Ty) -> bool {
+        self.ty_contains_function_inner(ty, &mut HashSet::new())
+    }
+
+    fn ty_contains_function_inner(&self, ty: &Ty, visiting: &mut HashSet<String>) -> bool {
+        match ty {
+            Ty::Function | Ty::Generic(_) => true,
+            Ty::Reference(inner, _)
+            | Ty::RawPointer(inner, _)
+            | Ty::Option(inner)
+            | Ty::Array(inner)
+            | Ty::Slice(inner)
+            | Ty::List(inner)
+            | Ty::Set(inner)
+            | Ty::Thread(inner)
+            | Ty::Mutex(inner)
+            | Ty::MutexGuard(inner) => self.ty_contains_function_inner(inner, visiting),
+            Ty::Map(key, value) | Ty::Result(key, value) => {
+                self.ty_contains_function_inner(key, visiting)
+                    || self.ty_contains_function_inner(value, visiting)
+            }
+            Ty::Owned(name) => {
+                if !visiting.insert(name.clone()) {
+                    return false;
+                }
+                let contains = self
+                    .program
+                    .structs
+                    .iter()
+                    .find(|declaration| declaration.name == *name)
+                    .is_some_and(|declaration| {
+                        declaration.fields.iter().any(|field| {
+                            self.ty_contains_function_inner(&self.ty_from_name(&field.ty), visiting)
+                        })
+                    })
+                    || self
+                        .program
+                        .enums
+                        .iter()
+                        .find(|declaration| declaration.name == *name)
+                        .is_some_and(|declaration| {
+                            declaration.variants.iter().any(|variant| {
+                                variant.payload.iter().any(|payload| {
+                                    self.ty_contains_function_inner(
+                                        &self.ty_from_name(payload),
+                                        visiting,
+                                    )
+                                })
+                            })
+                        });
+                visiting.remove(name);
+                contains
+            }
+            _ => false,
+        }
+    }
+
+    fn attach_closure_origins(&mut self, id: SlotId, origins: Vec<(Place, bool)>, span: Span) {
+        if origins.is_empty() {
+            return;
+        }
+        let source_borrowers = origins
+            .iter()
+            .filter_map(|(origin, _)| {
+                self.loans
+                    .iter()
+                    .find(|loan| loan.place == *origin)
+                    .and_then(|loan| loan.borrower)
+            })
+            .collect::<HashSet<_>>();
+        self.loans.retain(|loan| {
+            !source_borrowers.contains(&loan.borrower.unwrap_or(SlotId(usize::MAX)))
+                && !(loan.borrower.is_none()
+                    && origins.iter().any(|(origin, _)| *origin == loan.place))
+        });
+        for (place, mutable) in &origins {
+            self.loans.push(Loan {
+                place: place.clone(),
+                mutable: *mutable,
+                borrower: Some(id),
+                at: span,
+            });
+        }
+        self.slots.get_mut(&id).unwrap().closure_origins = origins;
+    }
+
     fn bind_pattern(
         &mut self,
         pattern: &Pattern,
@@ -2032,6 +2404,7 @@ impl<'a> Analyzer<'a> {
 
     fn ty_from_name(&self, ty: &TypeName) -> Ty {
         let base = match ty.name.as_str() {
+            "fn" => Ty::Function,
             "i8" | "i16" | "i32" | "i64" | "i128" | "u8" | "u16" | "u32" | "u64" | "u128"
             | "int" | "uint" | "f32" | "f64" | "bool" | "char" | "Unit" => Ty::Copy,
             "Option" if ty.arguments.len() == 1 => {
@@ -2124,7 +2497,8 @@ impl<'a> Analyzer<'a> {
             | Ty::Thread(_)
             | Ty::Mutex(_)
             | Ty::MutexGuard(_)
-            | Ty::AtomicInt => false,
+            | Ty::AtomicInt
+            | Ty::Function => false,
             Ty::Owned(name) => self.copy_types.contains(name),
             Ty::Generic(name) => self.generic_copy.contains(name),
             Ty::Unit => true,
@@ -2140,6 +2514,7 @@ impl<'a> Analyzer<'a> {
             | "int" | "uint" | "f32" | "f64" | "bool" | "char" | "Unit" | "CStr" | "CInt"
             | "CUInt" | "CSize" | "CSSize" | "CChar" | "CUChar" | "CShort" | "CUShort"
             | "CLongLong" | "CULongLong" | "CFloat" | "CDouble" => true,
+            "fn" => false,
             "Option" => ty
                 .arguments
                 .first()
@@ -2185,6 +2560,7 @@ impl<'a> Analyzer<'a> {
                 scope_depth: self.scopes.len() - 1,
                 parameter: false,
                 reference_origin,
+                closure_origins: vec![],
             },
         );
         let scope = self.scopes.last_mut().unwrap();
@@ -2231,11 +2607,15 @@ impl<'a> Analyzer<'a> {
     }
 
     fn expire_loans(&mut self, index: usize, last_uses: &HashMap<String, usize>) {
+        let current_depth = self.scopes.len().saturating_sub(1);
         self.loans.retain(|loan| match loan.borrower {
-            Some(id) => self
-                .slots
-                .get(&id)
-                .is_some_and(|slot| last_uses.get(&slot.name).copied().unwrap_or(0) >= index),
+            Some(id) => self.slots.get(&id).is_some_and(|slot| {
+                // A nested branch or loop does not own liveness for a value
+                // declared outside it. Its loan is expired by the enclosing
+                // block after the control-flow construct, never inside it.
+                slot.scope_depth < current_depth
+                    || last_uses.get(&slot.name).copied().unwrap_or(0) >= index
+            }),
             None => false,
         });
     }
@@ -2246,18 +2626,28 @@ impl<'a> Analyzer<'a> {
                 continue;
             };
             slot.state = merge_init(&a.state, &b.state);
+            slot.closure_origins = a.closure_origins.clone();
+            slot.closure_origins.extend(b.closure_origins.clone());
+            slot.closure_origins
+                .sort_by(|(left, left_mutable), (right, right_mutable)| {
+                    left.root
+                        .0
+                        .cmp(&right.root.0)
+                        .then_with(|| left.fields.cmp(&right.fields))
+                        .then_with(|| left_mutable.cmp(right_mutable))
+                });
+            slot.closure_origins.dedup();
         }
-        self.loans = left
-            .loans
-            .iter()
-            .filter(|loan| {
-                right
-                    .loans
-                    .iter()
-                    .any(|other| other.borrower == loan.borrower && other.place == loan.place)
-            })
-            .cloned()
-            .collect();
+        self.loans = left.loans.clone();
+        for loan in &right.loans {
+            if !self.loans.iter().any(|existing| {
+                existing.borrower == loan.borrower
+                    && existing.place == loan.place
+                    && existing.mutable == loan.mutable
+            }) {
+                self.loans.push(loan.clone());
+            }
+        }
     }
 
     fn merge_loop(&mut self, before: &Self, body: &Self) {
@@ -2274,6 +2664,27 @@ impl<'a> Analyzer<'a> {
                 },
                 _ => a.state.clone(),
             };
+            slot.closure_origins = a.closure_origins.clone();
+            slot.closure_origins.extend(b.closure_origins.clone());
+            slot.closure_origins
+                .sort_by(|(left, left_mutable), (right, right_mutable)| {
+                    left.root
+                        .0
+                        .cmp(&right.root.0)
+                        .then_with(|| left.fields.cmp(&right.fields))
+                        .then_with(|| left_mutable.cmp(right_mutable))
+                });
+            slot.closure_origins.dedup();
+        }
+        self.loans = before.loans.clone();
+        for loan in &body.loans {
+            if !self.loans.iter().any(|existing| {
+                existing.borrower == loan.borrower
+                    && existing.place == loan.place
+                    && existing.mutable == loan.mutable
+            }) {
+                self.loans.push(loan.clone());
+            }
         }
     }
 
@@ -2491,6 +2902,15 @@ fn collect_expr_names(expression: &Expr, names: &mut HashSet<String>) {
             for value in values {
                 collect_expr_names(value, names);
             }
+        }
+        Expression::Closure {
+            parameters, body, ..
+        } => {
+            names.extend(
+                crate::ast::closure_capture_uses(parameters, body)
+                    .into_keys()
+                    .filter(|name| !parameters.iter().any(|parameter| parameter.name == *name)),
+            );
         }
         Expression::Index { object, index } => {
             collect_expr_names(object, names);

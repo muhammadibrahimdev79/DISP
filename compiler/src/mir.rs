@@ -24,6 +24,7 @@ pub struct Function {
     pub name: String,
     pub locals: Vec<Local>,
     pub argument_count: usize,
+    pub capture_count: usize,
     pub return_local: LocalId,
     pub blocks: Vec<BasicBlock>,
     pub span: Span,
@@ -156,15 +157,26 @@ pub enum Constant {
 #[derive(Debug, Clone)]
 pub enum Rvalue {
     Use(Operand),
+    Function(hir::FunctionId),
+    Closure {
+        function: hir::FunctionId,
+        captures: Vec<Operand>,
+    },
     UnaryOp(UnaryOperator, Operand),
     BinaryOp(BinaryOperator, Operand, Operand),
     Aggregate(AggregateKind, Vec<Operand>),
     BorrowShared(Place),
     BorrowMut(Place),
-    RawAddress { mutable: bool, place: Place },
+    RawAddress {
+        mutable: bool,
+        place: Place,
+    },
     Discriminant(Place),
     Len(Place),
-    Cast { operand: Operand, target: hir::Type },
+    Cast {
+        operand: Operand,
+        target: hir::Type,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -272,6 +284,7 @@ impl<'a> Builder<'a> {
             name: self.function.name.clone(),
             locals: self.locals,
             argument_count: self.function.parameters.len(),
+            capture_count: self.function.capture_count,
             return_local: LocalId(0),
             blocks: self.blocks,
             span: self.function.span,
@@ -864,7 +877,38 @@ impl<'a> Builder<'a> {
                 self.set_initialized(result, true, expr.span);
                 Ok(Operand::Move(self.place(result)))
             }
-            hir::ExprKind::Function(_) => Ok(Operand::Constant(Constant::Unit)),
+            hir::ExprKind::Function(function) => {
+                let result = self.temp(expr.ty.clone(), expr.span);
+                self.push(
+                    StatementKind::Assign(self.place(result), Rvalue::Function(*function)),
+                    expr.span,
+                );
+                self.set_initialized(result, true, expr.span);
+                Ok(Operand::Move(self.place(result)))
+            }
+            hir::ExprKind::Closure { function, captures } => {
+                let mut values = Vec::with_capacity(captures.len());
+                for capture in captures {
+                    values.push(self.lower_expr(capture)?);
+                }
+                let consumed = values.clone();
+                let result = self.temp(expr.ty.clone(), expr.span);
+                self.push(
+                    StatementKind::Assign(
+                        self.place(result),
+                        Rvalue::Closure {
+                            function: *function,
+                            captures: values,
+                        },
+                    ),
+                    expr.span,
+                );
+                for value in &consumed {
+                    self.consume_operand(value, expr.span);
+                }
+                self.set_initialized(result, true, expr.span);
+                Ok(Operand::Move(self.place(result)))
+            }
             hir::ExprKind::Call(call) => self.lower_call(call, &expr.ty, expr.span),
             hir::ExprKind::Spawn(call) => self.lower_spawn(call, &expr.ty, expr.span),
             hir::ExprKind::Match { value, arms } => {
@@ -882,6 +926,21 @@ impl<'a> Builder<'a> {
     ) -> Result<Operand, Diagnostic> {
         let mut arguments = Vec::new();
         for (index, argument) in call.arguments.iter().enumerate() {
+            if index == 0 && matches!(call.target, hir::CallTarget::Callable) {
+                // Invoking a callable borrows its code/environment pair for
+                // the duration of the call. Reading a named callable must not
+                // clear its drop flag as an ownership move would.
+                let value = if let Some(place) = self.expr_place(argument) {
+                    Operand::Copy(place)
+                } else {
+                    self.lower_expr(argument)?
+                };
+                arguments.push(match value {
+                    Operand::Move(place) | Operand::Copy(place) => Operand::Copy(place),
+                    constant => constant,
+                });
+                continue;
+            }
             let borrow = if index == 0
                 && matches!(&call.target, hir::CallTarget::Intrinsic(name) if name == "CString.new")
             {
@@ -910,7 +969,10 @@ impl<'a> Builder<'a> {
             });
         }
         let destination = self.temp(ty.clone(), span);
-        for argument in &arguments {
+        for (index, argument) in arguments.iter().enumerate() {
+            if index == 0 && matches!(call.target, hir::CallTarget::Callable) {
+                continue;
+            }
             self.consume_operand(argument, span);
         }
         let next = self.new_block();
@@ -1865,6 +1927,7 @@ fn validate_operand(
         if matches!(operand, Operand::Copy(_))
             && place.projections.is_empty()
             && function.locals[place.local.0].needs_drop
+            && !matches!(function.locals[place.local.0].ty, hir::Type::Function(_, _))
         {
             return Err(Diagnostic::new(
                 DiagnosticKind::Internal,
@@ -1887,6 +1950,37 @@ fn validate_rvalue(
     span: Span,
 ) -> Result<(), Diagnostic> {
     match rvalue {
+        Rvalue::Function(target) => {
+            if target.0 >= program.functions.len() {
+                return Err(Diagnostic::new(
+                    DiagnosticKind::Internal,
+                    "MIR function value target is out of range",
+                    span,
+                ));
+            }
+        }
+        Rvalue::Closure {
+            function: target,
+            captures,
+        } => {
+            if target.0 >= program.functions.len() {
+                return Err(Diagnostic::new(
+                    DiagnosticKind::Internal,
+                    "MIR closure target is out of range",
+                    span,
+                ));
+            }
+            if program.functions[target.0].capture_count != captures.len() {
+                return Err(Diagnostic::new(
+                    DiagnosticKind::Internal,
+                    "MIR closure capture count does not match its target",
+                    span,
+                ));
+            }
+            for capture in captures {
+                validate_operand(program, function, capture, span)?;
+            }
+        }
         Rvalue::Use(x) | Rvalue::UnaryOp(_, x) | Rvalue::Cast { operand: x, .. } => {
             validate_operand(program, function, x, span)?
         }
