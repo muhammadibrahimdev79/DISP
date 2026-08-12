@@ -1562,6 +1562,58 @@ impl TypeChecker {
                             )),
                         };
                     }
+                    if field == "sleep" && arguments.len() == 1 {
+                        let duration = self.check_expression(&arguments[0])?;
+                        self.require_same(
+                            &Type::Duration,
+                            &duration,
+                            arguments[0].span,
+                            "async sleep duration",
+                        )?;
+                        return Ok(Type::Future(Box::new(Type::Unit)));
+                    }
+                    if matches!(field.as_str(), "read_text" | "read_bytes") && arguments.len() == 1
+                    {
+                        self.require_path(&arguments[0])?;
+                        let value = if field == "read_text" {
+                            Type::String
+                        } else {
+                            Type::List(Box::new(Type::Unsigned(8)))
+                        };
+                        return Ok(Type::Future(Box::new(Type::Result(
+                            Box::new(value),
+                            Box::new(Type::IoError),
+                        ))));
+                    }
+                    if matches!(field.as_str(), "write_text" | "write_bytes")
+                        && arguments.len() == 2
+                    {
+                        self.require_path(&arguments[0])?;
+                        let value = self.check_expression(&arguments[1])?;
+                        let valid = if field == "write_text" {
+                            matches!(value, Type::String)
+                        } else {
+                            matches!(value, Type::List(ref element) if matches!(**element, Type::Unsigned(8)))
+                        };
+                        if !valid {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Type,
+                                if field == "write_text" {
+                                    "async file text must be an owned String"
+                                } else {
+                                    "async file bytes must be an owned List<u8>"
+                                },
+                                arguments[1].span,
+                            )
+                            .with_help(
+                                "the future owns its input until completion or cancellation",
+                            ));
+                        }
+                        return Ok(Type::Future(Box::new(Type::Result(
+                            Box::new(Type::Unit),
+                            Box::new(Type::IoError),
+                        ))));
+                    }
                     return Err(Diagnostic::new(
                         DiagnosticKind::Type,
                         format!(

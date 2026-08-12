@@ -1,0 +1,26 @@
+async fn exercise() -> Result<Unit, IoError> {
+    started = Time.now()
+    await Async.sleep(Duration.from_millis(2))
+    print(started.elapsed().millis() >= 1)
+
+    write = await Async.write_text(Path("disp-async-example.txt"), "async DISP")
+    write?
+    read = await Async.read_text(Path("disp-async-example.txt"))
+    text = read?
+    print(text)
+
+    let values: List<u8> = List.of(u8(0), u8(255), u8(7))
+    write_binary = await Async.write_bytes(Path("disp-async-example.bin"), values)
+    write_binary?
+    read_binary = await Async.read_bytes(Path("disp-async-example.bin"))
+    loaded = read_binary?
+    print(loaded.len())
+    print(loaded[1])
+
+    File.remove(Path("disp-async-example.txt"))?
+    return File.remove(Path("disp-async-example.bin"))
+}
+
+async fn main() {
+    print(await exercise())
+}

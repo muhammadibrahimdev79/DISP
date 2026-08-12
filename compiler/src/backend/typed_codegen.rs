@@ -48,6 +48,9 @@ pub fn generate(
     for result in task_result_types(program, instances) {
         task_result_drop_wrapper(program, &result, &mut output);
     }
+    for (operation, result) in async_io_operations(program, instances) {
+        async_io_poll_wrapper(&operation, &result, &mut output);
+    }
     for target in callable_targets(program, instances)? {
         callable_wrapper(program, &target, &mut output);
     }
@@ -148,6 +151,75 @@ fn task_result_drop_wrapper(program: &mir::Program, result: &hir::Type, output: 
         task_result_drop_name(result)
     )
     .unwrap();
+}
+
+fn async_io_operations(
+    program: &mir::Program,
+    instances: &mono::MonoProgram,
+) -> BTreeSet<(String, hir::Type)> {
+    let mut operations = BTreeSet::new();
+    for instance in &instances.instances {
+        let function = &program.functions[instance.function.0];
+        let substitutions = mono::mapping(function, instance);
+        for block in &function.blocks {
+            if let mir::Terminator::Call {
+                target: hir::CallTarget::Intrinsic(name),
+                destination,
+                ..
+            } = &block.terminator
+                && matches!(
+                    name.as_str(),
+                    "Async.read_text"
+                        | "Async.read_bytes"
+                        | "Async.write_text"
+                        | "Async.write_bytes"
+                )
+            {
+                let hir::Type::Future(result) =
+                    place_ty(program, function, destination, &substitutions)
+                else {
+                    continue;
+                };
+                operations.insert((name.clone(), *result));
+            }
+        }
+    }
+    operations
+}
+
+fn async_io_poll_name(operation: &str, result: &hir::Type) -> String {
+    format!(
+        "disp_{}_poll_{}",
+        operation.replace('.', "_"),
+        mono::type_code(result)
+    )
+}
+
+fn async_io_poll_wrapper(operation: &str, result: &hir::Type, output: &mut String) {
+    let result_c = native_types::c_type(result);
+    let poll = async_io_poll_name(operation, result);
+    writeln!(
+        output,
+        "static bool {poll}(void *raw,void *output){{disp_async_file_state *state=(disp_async_file_state*)raw;if(!disp_async_file_poll(state))return false;bool ok=false;disp_native_string value={{0}},error={{0}};disp_async_file_take(state,&ok,&value,&error);{result_c} *result=({result_c}*)output;*result=({result_c}){{0}};if(ok){{"
+    )
+    .unwrap();
+    match operation {
+        "Async.read_text" => output.push_str("result->tag=0;result->payload.v0.f0=value;"),
+        "Async.read_bytes" => {
+            let hir::Type::Result(value, _) = result else {
+                unreachable!()
+            };
+            let list_c = native_types::c_type(value);
+            write!(output,"result->tag=0;result->payload.v0.f0=({list_c}){{.data=(uint8_t*)value.data,.len=value.len,.cap=value.cap}};").unwrap();
+        }
+        "Async.write_text" | "Async.write_bytes" => {
+            output.push_str("result->tag=0;disp_string_drop(&value);")
+        }
+        _ => unreachable!(),
+    }
+    output.push_str(
+        "}else{result->tag=1;result->payload.v1.f0=error;disp_string_drop(&value);}return true;}\n",
+    );
 }
 
 fn callable_wrapper_name(program: &mir::Program, target: &mono::FunctionInstance) -> String {
@@ -832,6 +904,60 @@ fn terminator(
                         task_result_drop_name(result)
                     )
                 }
+                hir::CallTarget::Intrinsic(name) if name == "Async.sleep" => {
+                    let duration_ty = operand_ty(program, function, &arguments[0], substitutions);
+                    let duration = operand(
+                        program,
+                        function,
+                        &arguments[0],
+                        &duration_ty,
+                        substitutions,
+                    );
+                    format!("disp_future_sleep({duration})")
+                }
+                hir::CallTarget::Intrinsic(name)
+                    if matches!(
+                        name.as_str(),
+                        "Async.read_text"
+                            | "Async.read_bytes"
+                            | "Async.write_text"
+                            | "Async.write_bytes"
+                    ) =>
+                {
+                    let hir::Type::Future(result) = &destination_ty else {
+                        unreachable!("async I/O destination must be Future<T>")
+                    };
+                    let path_ty = operand_ty(program, function, &arguments[0], substitutions);
+                    let path = operand(program, function, &arguments[0], &path_ty, substitutions);
+                    let operation = match name.as_str() {
+                        "Async.read_text" => "DISP_ASYNC_READ_TEXT",
+                        "Async.read_bytes" => "DISP_ASYNC_READ_BYTES",
+                        "Async.write_text" => "DISP_ASYNC_WRITE_TEXT",
+                        "Async.write_bytes" => "DISP_ASYNC_WRITE_BYTES",
+                        _ => unreachable!(),
+                    };
+                    let poll = async_io_poll_name(name, result);
+                    let input = if matches!(name.as_str(), "Async.write_text" | "Async.write_bytes")
+                    {
+                        let input_ty = operand_ty(program, function, &arguments[1], substitutions);
+                        let input =
+                            operand(program, function, &arguments[1], &input_ty, substitutions);
+                        if name == "Async.write_text" {
+                            format!("disp_native_string _input={input};")
+                        } else {
+                            let input_c = native_types::c_type(&input_ty);
+                            format!(
+                                "{input_c} _bytes={input};disp_native_string _input={{.data=(char*)_bytes.data,.len=_bytes.len,.cap=_bytes.cap}};"
+                            )
+                        }
+                    } else {
+                        "disp_native_string _input={0};".into()
+                    };
+                    format!(
+                        "({{{input}disp_async_file_state *_state=disp_async_file_create({operation},{path},_input,{},{});(disp_native_future){{.context=_state,.poll={poll},.drop=disp_async_file_drop}};}})",
+                        span.start.line, span.start.column
+                    )
+                }
                 hir::CallTarget::Callable => {
                     let callable_ty = operand_ty(program, function, &arguments[0], substitutions);
                     let hir::Type::Function(parameters, result) = &callable_ty else {
@@ -1131,7 +1257,7 @@ fn terminator(
                                 };
                                 let list_c = native_types::c_type(ok);
                                 format!(
-                                    "({{{result_c} _r={{0}};disp_native_string _bytes={{0}},_error={{0}};if(disp_file_read_text({path},&_bytes,&_error)){{_r.tag=0;_r.payload.v0.f0=({list_c}){{.data=(uint8_t*)_bytes.data,.len=_bytes.len,.cap=_bytes.cap}};}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                                    "({{{result_c} _r={{0}};disp_native_string _bytes={{0}},_error={{0}};if(disp_file_read_bytes({path},&_bytes,&_error)){{_r.tag=0;_r.payload.v0.f0=({list_c}){{.data=(uint8_t*)_bytes.data,.len=_bytes.len,.cap=_bytes.cap}};}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
                                 )
                             }
                             "File.size" | "File.modified_seconds" => {

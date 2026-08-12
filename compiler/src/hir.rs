@@ -1695,13 +1695,27 @@ impl FunctionLowering<'_, '_> {
                         .iter()
                         .map(|x| self.lower_expr(x))
                         .collect::<Result<Vec<_>, _>>()?;
-                    let ty = if field == "spawn" {
-                        match args.first().map(|value| &value.ty) {
+                    let ty = match field.as_str() {
+                        "spawn" => match args.first().map(|value| &value.ty) {
                             Some(Type::Future(output)) => Type::Task(output.clone()),
                             _ => Type::Unknown,
-                        }
-                    } else {
-                        Type::Future(Box::new(Type::Unit))
+                        },
+                        "read_text" => Type::Future(Box::new(Type::Result(
+                            Box::new(Type::String),
+                            Box::new(Type::Generic("IoError".into())),
+                        ))),
+                        "read_bytes" => Type::Future(Box::new(Type::Result(
+                            Box::new(Type::List(Box::new(Type::Int {
+                                signed: false,
+                                width: Some(8),
+                            }))),
+                            Box::new(Type::Generic("IoError".into())),
+                        ))),
+                        "write_text" | "write_bytes" => Type::Future(Box::new(Type::Result(
+                            Box::new(Type::Unit),
+                            Box::new(Type::Generic("IoError".into())),
+                        ))),
+                        _ => Type::Future(Box::new(Type::Unit)),
                     };
                     return Ok(Expr {
                         kind: ExprKind::Call(Call {

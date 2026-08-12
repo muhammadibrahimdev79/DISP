@@ -93,6 +93,11 @@ struct RuntimeFuture(Arc<StdMutex<Option<FutureWork>>>);
 enum FutureWork {
     Function(Box<Function>, Vec<Value>),
     Yield,
+    Sleep(StdDuration),
+    ReadText(PathBuf),
+    ReadBytes(PathBuf),
+    WriteText(PathBuf, RuntimeString),
+    WriteBytes(PathBuf, Vec<u8>),
 }
 
 impl RuntimeFuture {
@@ -105,6 +110,10 @@ impl RuntimeFuture {
 
     fn yielding() -> Self {
         Self(Arc::new(StdMutex::new(Some(FutureWork::Yield))))
+    }
+
+    fn operation(work: FutureWork) -> Self {
+        Self(Arc::new(StdMutex::new(Some(work))))
     }
 }
 
@@ -765,6 +774,29 @@ impl Interpreter {
             FutureWork::Yield => {
                 self.progress_tasks(program, span)?;
                 Ok(Value::Unit)
+            }
+            FutureWork::Sleep(duration) => {
+                thread::sleep(duration);
+                Ok(Value::Unit)
+            }
+            FutureWork::ReadText(path) => Ok(runtime_result(
+                fs::read_to_string(path).map(|text| Value::String(RuntimeString::literal(text))),
+            )),
+            FutureWork::ReadBytes(path) => Ok(runtime_result(fs::read(path).map(|bytes| {
+                let values = bytes
+                    .into_iter()
+                    .map(|value| Value::Unsigned(value as u128, 8))
+                    .collect::<Vec<_>>();
+                Value::List {
+                    capacity: values.len(),
+                    values,
+                }
+            }))),
+            FutureWork::WriteText(path, text) => Ok(runtime_result(
+                fs::write(path, text.text).map(|()| Value::Unit),
+            )),
+            FutureWork::WriteBytes(path, bytes) => {
+                Ok(runtime_result(fs::write(path, bytes).map(|()| Value::Unit)))
             }
         }
     }
@@ -1682,6 +1714,71 @@ impl Interpreter {
                             let task = RuntimeTask::new(future);
                             self.tasks.push(Arc::downgrade(&task.0));
                             Ok(Value::Task(task))
+                        }
+                        "sleep" => {
+                            let Value::Duration(duration) =
+                                self.evaluate(program, &arguments[0])?
+                            else {
+                                return Err(
+                                    self.error("Async.sleep expects Duration", arguments[0].span)
+                                );
+                            };
+                            Ok(Value::Future(RuntimeFuture::operation(FutureWork::Sleep(
+                                duration,
+                            ))))
+                        }
+                        "read_text" | "read_bytes" => {
+                            let value = self.consume(program, &arguments[0])?;
+                            let Value::Path(path) = value else {
+                                return Err(self.error(
+                                    "async file operation expects Path",
+                                    arguments[0].span,
+                                ));
+                            };
+                            let work = if field == "read_text" {
+                                FutureWork::ReadText(path)
+                            } else {
+                                FutureWork::ReadBytes(path)
+                            };
+                            Ok(Value::Future(RuntimeFuture::operation(work)))
+                        }
+                        "write_text" | "write_bytes" => {
+                            let path = self.consume(program, &arguments[0])?;
+                            let Value::Path(path) = path else {
+                                return Err(self.error(
+                                    "async file operation expects Path",
+                                    arguments[0].span,
+                                ));
+                            };
+                            let value = self.consume(program, &arguments[1])?;
+                            let work = if field == "write_text" {
+                                let Value::String(text) = value else {
+                                    return Err(self.error(
+                                        "Async.write_text expects owned String",
+                                        arguments[1].span,
+                                    ));
+                                };
+                                FutureWork::WriteText(path, text)
+                            } else {
+                                let Value::List { values, .. } = value else {
+                                    return Err(self.error(
+                                        "Async.write_bytes expects owned List<u8>",
+                                        arguments[1].span,
+                                    ));
+                                };
+                                let mut bytes = Vec::with_capacity(values.len());
+                                for value in values {
+                                    let Value::Unsigned(value, 8) = value else {
+                                        return Err(self.error(
+                                            "Async.write_bytes expects owned List<u8>",
+                                            arguments[1].span,
+                                        ));
+                                    };
+                                    bytes.push(value as u8);
+                                }
+                                FutureWork::WriteBytes(path, bytes)
+                            };
+                            Ok(Value::Future(RuntimeFuture::operation(work)))
                         }
                         _ => Err(self.error("unknown Async operation", callee.span)),
                     };

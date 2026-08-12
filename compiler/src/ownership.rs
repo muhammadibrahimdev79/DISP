@@ -1241,6 +1241,30 @@ impl<'a> Analyzer<'a> {
                         Ty::Future(output) => Ok(Ty::Task(output)),
                         _ => Ok(Ty::Task(Box::new(Ty::Owned("task-output".into())))),
                     },
+                    "sleep" => {
+                        self.check_expr(&arguments[0], UseMode::Read)?;
+                        Ok(Ty::Future(Box::new(Ty::Unit)))
+                    }
+                    "read_text" | "read_bytes" => {
+                        self.check_expr(&arguments[0], UseMode::Consume)?;
+                        let value = if field == "read_text" {
+                            Ty::Owned("String".into())
+                        } else {
+                            Ty::List(Box::new(Ty::Copy))
+                        };
+                        Ok(Ty::Future(Box::new(Ty::Result(
+                            Box::new(value),
+                            Box::new(Ty::Owned("IoError".into())),
+                        ))))
+                    }
+                    "write_text" | "write_bytes" => {
+                        self.check_expr(&arguments[0], UseMode::Consume)?;
+                        self.check_expr(&arguments[1], UseMode::Consume)?;
+                        Ok(Ty::Future(Box::new(Ty::Result(
+                            Box::new(Ty::Unit),
+                            Box::new(Ty::Owned("IoError".into())),
+                        ))))
+                    }
                     _ => Ok(Ty::Unit),
                 };
             }

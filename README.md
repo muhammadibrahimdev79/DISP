@@ -20,7 +20,11 @@ and lazy owned `Future<T>` values compiled to resumable native `async fn` state 
 and `Async.spawn(future)` creates a structured, cooperatively scheduled `Task<T>` that must be
 awaited or is cancelled with deterministic cleanup before its async scope exits. The separate
 `spawn function()` syntax creates an operating-system thread. An `async fn main()` is driven
-automatically. The implementation
+automatically. `Async.sleep`, `Async.read_text`, `Async.read_bytes`, `Async.write_text`, and
+`Async.write_bytes` are lazy owned futures; synchronous `Time.*` and `File.*` operations remain
+available. Cancelling an unpolled I/O future has no side effects. Once native I/O has started,
+cancellation discards its result but lets the operating-system operation finish, and shutdown
+drains that work so owned resources are released deterministically. The implementation
 remains under active development and should not
 yet be treated as a stable production language.
 

@@ -21,6 +21,18 @@ pub const C_RUNTIME: &str = r#"
 #endif
 
 static void dv_panic(const char *message,int line,int column);
+static void disp_time_sleep(uint64_t nanos);
+static void disp_async_file_drain(void);
+static _Thread_local uint64_t disp_reactor_wait_nanos=UINT64_MAX;
+static void disp_reactor_begin(void){disp_reactor_wait_nanos=UINT64_MAX;}
+static void disp_reactor_offer(uint64_t nanos){if(nanos<disp_reactor_wait_nanos)disp_reactor_wait_nanos=nanos;}
+static void disp_reactor_wait(void){if(disp_reactor_wait_nanos!=UINT64_MAX){disp_time_sleep(disp_reactor_wait_nanos);return;}
+#ifdef _WIN32
+SwitchToThread();
+#else
+sched_yield();
+#endif
+}
 struct disp_task_state {
     struct disp_task_state *next;
     disp_native_future future;
@@ -36,24 +48,12 @@ static _Thread_local disp_task_state *disp_task_head;
 static _Thread_local disp_task_state **disp_task_tail;
 static void disp_task_release(disp_task_state *state){if(!state)return;if(--state->refs)return;if(state->future.context&&state->future.drop)state->future.drop(state->future.context);if(state->result){if(state->complete&&!state->taken&&state->result_drop)state->result_drop(state->result);disp_dealloc(state->result);}disp_dealloc(state);}
 static void disp_task_unlink(disp_task_state **link,disp_task_state *state){*link=state->next;if(!state->next)disp_task_tail=link;state->next=NULL;disp_task_release(state);}
-static void disp_executor_tick(void){disp_task_state **link=&disp_task_head;while(*link){disp_task_state *state=*link;if(state->cancelled){if(state->future.context&&state->future.drop)state->future.drop(state->future.context);state->future=(disp_native_future){0};disp_task_unlink(link,state);continue;}if(!state->complete&&state->future.poll(state->future.context,state->result)){if(state->future.drop)state->future.drop(state->future.context);state->future=(disp_native_future){0};state->complete=true;disp_task_unlink(link,state);continue;}link=&state->next;}}
+static void disp_executor_tick(void){disp_task_state **link=&disp_task_head;while(*link){disp_task_state *state=*link;if(state->cancelled){if(state->future.context&&state->future.drop)state->future.drop(state->future.context);state->future=(disp_native_future){0};disp_task_unlink(link,state);disp_reactor_offer(0);continue;}if(!state->complete&&state->future.poll(state->future.context,state->result)){if(state->future.drop)state->future.drop(state->future.context);state->future=(disp_native_future){0};state->complete=true;disp_task_unlink(link,state);disp_reactor_offer(0);continue;}link=&state->next;}}
 static disp_native_task disp_task_spawn(disp_native_future future,size_t result_size,size_t result_align,void (*result_drop)(void *)){if(!future.context||!future.poll)dv_panic("cannot spawn an empty Future",0,0);disp_task_state *state=(disp_task_state*)disp_alloc_zeroed(1,sizeof(disp_task_state),_Alignof(disp_task_state));state->future=future;state->refs=2;state->result_size=result_size;state->result_drop=result_drop;state->result=disp_alloc_zeroed(1,result_size?result_size:1,result_align);if(!disp_task_tail)disp_task_tail=&disp_task_head;*disp_task_tail=state;disp_task_tail=&state->next;return (disp_native_task){.state=state};}
 static bool disp_task_poll(disp_native_task *task,void *output,int line,int column){disp_task_state *state=task->state;if(!state||state->taken)dv_panic("task has already been awaited",line,column);if(state->cancelled)dv_panic("cancelled task cannot be awaited",line,column);if(!state->complete)return false;if(state->result_size)memcpy(output,state->result,state->result_size);state->taken=true;disp_dealloc(state->result);state->result=NULL;task->state=NULL;disp_task_release(state);return true;}
 static void disp_task_drop(disp_native_task *task){disp_task_state *state=task->state;if(!state)return;if(!state->complete)state->cancelled=true;task->state=NULL;disp_task_release(state);}
-static void disp_task_wait(disp_native_task *task,void *output,int line,int column){while(!disp_task_poll(task,output,line,column)){
-#ifdef _WIN32
-SwitchToThread();
-#else
-sched_yield();
-#endif
-disp_executor_tick();}}
-static void disp_future_wait(disp_native_future *future,void *output,int line,int column){if(!future->context||!future->poll)dv_panic("future has already been awaited",line,column);while(!future->poll(future->context,output)){disp_executor_tick();
-#ifdef _WIN32
-SwitchToThread();
-#else
-sched_yield();
-#endif
-}if(future->drop)future->drop(future->context);*future=(disp_native_future){0};disp_executor_tick();}
+static void disp_task_wait(disp_native_task *task,void *output,int line,int column){for(;;){disp_reactor_begin();if(disp_task_poll(task,output,line,column))break;disp_executor_tick();disp_reactor_wait();}}
+static void disp_future_wait(disp_native_future *future,void *output,int line,int column){if(!future->context||!future->poll)dv_panic("future has already been awaited",line,column);for(;;){disp_reactor_begin();if(future->poll(future->context,output))break;disp_executor_tick();disp_reactor_wait();}if(future->drop)future->drop(future->context);*future=(disp_native_future){0};disp_executor_tick();disp_async_file_drain();}
 typedef struct { bool yielded; } disp_yield_future;
 static bool disp_yield_poll(void *raw,void *output){disp_yield_future *state=(disp_yield_future*)raw;if(!state->yielded){state->yielded=true;return false;}*(disp_native_unit*)output=(disp_native_unit){0};return true;}
 static void disp_yield_drop(void *raw){disp_dealloc(raw);}
@@ -110,10 +110,12 @@ typedef struct { disp_thread_entry entry; void *context; } disp_thread_boot;
 static DWORD WINAPI disp_thread_bootstrap(LPVOID raw){disp_thread_boot boot=*(disp_thread_boot*)raw;disp_dealloc(raw);boot.entry(boot.context);return 0;}
 static uintptr_t disp_thread_start(disp_thread_entry entry,void *context,int line,int column){disp_thread_boot *boot=(disp_thread_boot*)disp_alloc(sizeof(disp_thread_boot),_Alignof(disp_thread_boot));boot->entry=entry;boot->context=context;HANDLE handle=CreateThread(NULL,0,disp_thread_bootstrap,boot,0,NULL);if(!handle){disp_dealloc(boot);dv_panic("could not create native thread",line,column);}return (uintptr_t)handle;}
 static void disp_thread_wait(disp_native_thread *thread){if(!thread->handle)return;HANDLE handle=(HANDLE)thread->handle;DWORD status=WaitForSingleObject(handle,INFINITE);CloseHandle(handle);thread->handle=0;if(status!=WAIT_OBJECT_0)dv_panic("could not join native thread",0,0);}
+static void disp_thread_detach(uintptr_t handle){if(handle)CloseHandle((HANDLE)handle);}
 #else
 static void *disp_thread_bootstrap(void *raw){disp_thread_boot boot=*(disp_thread_boot*)raw;disp_dealloc(raw);boot.entry(boot.context);return NULL;}
 static uintptr_t disp_thread_start(disp_thread_entry entry,void *context,int line,int column){_Static_assert(sizeof(pthread_t)<=sizeof(uintptr_t),"pthread_t cannot fit DISP thread handle");disp_thread_boot *boot=(disp_thread_boot*)disp_alloc(sizeof(disp_thread_boot),_Alignof(disp_thread_boot));boot->entry=entry;boot->context=context;pthread_t native;if(pthread_create(&native,NULL,disp_thread_bootstrap,boot)!=0){disp_dealloc(boot);dv_panic("could not create native thread",line,column);}uintptr_t handle=0;memcpy(&handle,&native,sizeof(native));return handle;}
 static void disp_thread_wait(disp_native_thread *thread){if(!thread->handle)return;pthread_t native;memcpy(&native,&thread->handle,sizeof(native));thread->handle=0;if(pthread_join(native,NULL)!=0)dv_panic("could not join native thread",0,0);}
+static void disp_thread_detach(uintptr_t handle){pthread_t native;memcpy(&native,&handle,sizeof(native));if(pthread_detach(native)!=0)dv_panic("could not detach native thread",0,0);}
 #endif
 
 static void disp_string_drop(disp_native_string *value){if(value->cap)disp_dealloc(value->data);value->data=NULL;value->len=0;value->cap=0;}
@@ -122,6 +124,7 @@ static void disp_string_reserve(disp_native_string *value,size_t additional){siz
 static void disp_string_push_bytes(disp_native_string *value,const char *bytes,size_t length){disp_string_reserve(value,length);if(length)memcpy(value->data+value->len,bytes,length);value->len+=length;}
 static void disp_string_push_char(disp_native_string *value,uint32_t c){char out[4];size_t n;if(c<=0x7F){out[0]=(char)c;n=1;}else if(c<=0x7FF){out[0]=(char)(0xC0|(c>>6));out[1]=(char)(0x80|(c&0x3F));n=2;}else if(c<=0xFFFF && !(c>=0xD800&&c<=0xDFFF)){out[0]=(char)(0xE0|(c>>12));out[1]=(char)(0x80|((c>>6)&0x3F));out[2]=(char)(0x80|(c&0x3F));n=3;}else if(c<=0x10FFFF){out[0]=(char)(0xF0|(c>>18));out[1]=(char)(0x80|((c>>12)&0x3F));out[2]=(char)(0x80|((c>>6)&0x3F));out[3]=(char)(0x80|(c&0x3F));n=4;}else{dv_panic("invalid Unicode scalar",0,0);return;}disp_string_push_bytes(value,out,n);}
 static bool disp_utf8_boundary(const char *value,size_t length,size_t index){return index<=length&&(index==0||index==length||(((unsigned char)value[index]&0xC0)!=0x80));}
+static bool disp_utf8_valid(const char *value,size_t length){size_t i=0;while(i<length){unsigned char a=(unsigned char)value[i++];if(a<=0x7f)continue;if(a>=0xc2&&a<=0xdf){if(i>=length||((unsigned char)value[i++]&0xc0)!=0x80)return false;continue;}if(a>=0xe0&&a<=0xef){if(i+1>=length)return false;unsigned char b=(unsigned char)value[i++],c=(unsigned char)value[i++];if((c&0xc0)!=0x80)return false;if(a==0xe0){if(b<0xa0||b>0xbf)return false;}else if(a==0xed){if(b<0x80||b>0x9f)return false;}else if((b&0xc0)!=0x80)return false;continue;}if(a>=0xf0&&a<=0xf4){if(i+2>=length)return false;unsigned char b=(unsigned char)value[i++],c=(unsigned char)value[i++],d=(unsigned char)value[i++];if((c&0xc0)!=0x80||(d&0xc0)!=0x80)return false;if(a==0xf0){if(b<0x90||b>0xbf)return false;}else if(a==0xf4){if(b<0x80||b>0x8f)return false;}else if((b&0xc0)!=0x80)return false;continue;}return false;}return true;}
 
 static bool disp_string_starts_with(const char *value,size_t value_len,const char *prefix,size_t prefix_len){return prefix_len<=value_len&&(prefix_len==0||memcmp(value,prefix,prefix_len)==0);}
 static bool disp_string_ends_with(const char *value,size_t value_len,const char *suffix,size_t suffix_len){return suffix_len<=value_len&&(suffix_len==0||memcmp(value+value_len-suffix_len,suffix,suffix_len)==0);}
@@ -141,14 +144,39 @@ static disp_native_path disp_path_join(const disp_native_path *base,const char *
 '/';
 #endif
 if(child_len)memcpy(out.data+at,child,child_len);out.data[len]=0;out.len=len;out.cap=len+1;return out;}
-static bool disp_file_read_text(const disp_native_path *path,disp_native_string *out,disp_native_string *error){FILE *file=fopen(path->data,"rb");if(!file){*error=disp_io_error();return false;}if(fseek(file,0,SEEK_END)!=0){*error=disp_io_error();fclose(file);return false;}long end=ftell(file);if(end<0){*error=disp_io_error();fclose(file);return false;}rewind(file);size_t len=(size_t)end;char *data=len?(char*)disp_alloc(len,1):NULL;size_t read=len?fread(data,1,len,file):0;if(read!=len){*error=disp_io_error();disp_dealloc(data);fclose(file);return false;}if(fclose(file)!=0){*error=disp_io_error();disp_dealloc(data);return false;}out->data=data;out->len=len;out->cap=len;return true;}
+static bool disp_file_read_bytes(const disp_native_path *path,disp_native_string *out,disp_native_string *error){FILE *file=fopen(path->data,"rb");if(!file){*error=disp_io_error();return false;}if(fseek(file,0,SEEK_END)!=0){*error=disp_io_error();fclose(file);return false;}long end=ftell(file);if(end<0){*error=disp_io_error();fclose(file);return false;}rewind(file);size_t len=(size_t)end;char *data=len?(char*)disp_alloc(len,1):NULL;size_t read=len?fread(data,1,len,file):0;if(read!=len){*error=disp_io_error();disp_dealloc(data);fclose(file);return false;}if(fclose(file)!=0){*error=disp_io_error();disp_dealloc(data);return false;}out->data=data;out->len=len;out->cap=len;return true;}
+static bool disp_file_read_text(const disp_native_path *path,disp_native_string *out,disp_native_string *error){if(!disp_file_read_bytes(path,out,error))return false;if(disp_utf8_valid(out->data,out->len))return true;disp_string_drop(out);errno=EILSEQ;*error=disp_io_error();return false;}
 static bool disp_file_write_text(const disp_native_path *path,const char *data,size_t len,bool append,disp_native_string *error){FILE *file=fopen(path->data,append?"ab":"wb");if(!file){*error=disp_io_error();return false;}bool ok=!len||fwrite(data,1,len,file)==len;if(!ok)*error=disp_io_error();if(fclose(file)!=0&&ok){*error=disp_io_error();ok=false;}return ok;}
 static bool disp_file_exists(const disp_native_path *path){struct stat info;return stat(path->data,&info)==0&&(info.st_mode&S_IFREG)!=0;}
 static bool disp_file_metadata(const disp_native_path *path,uint64_t *size,uint64_t *modified,disp_native_string *error){struct stat info;if(stat(path->data,&info)!=0){*error=disp_io_error();return false;}*size=(uint64_t)info.st_size;*modified=(uint64_t)info.st_mtime;return true;}
 static bool disp_directory_exists(const disp_native_path *path){struct stat info;return stat(path->data,&info)==0&&(info.st_mode&S_IFDIR)!=0;}
 static bool disp_file_remove(const disp_native_path *path,disp_native_string *error){if(remove(path->data)==0)return true;*error=disp_io_error();return false;}
-static bool disp_file_copy(const disp_native_path *from,const disp_native_path *to,disp_native_string *error){disp_native_string data={0};if(!disp_file_read_text(from,&data,error))return false;bool ok=disp_file_write_text(to,data.data,data.len,false,error);disp_string_drop(&data);return ok;}
+static bool disp_file_copy(const disp_native_path *from,const disp_native_path *to,disp_native_string *error){disp_native_string data={0};if(!disp_file_read_bytes(from,&data,error))return false;bool ok=disp_file_write_text(to,data.data,data.len,false,error);disp_string_drop(&data);return ok;}
 static bool disp_file_move(const disp_native_path *from,const disp_native_path *to,disp_native_string *error){if(rename(from->data,to->data)==0)return true;*error=disp_io_error();return false;}
+typedef enum { DISP_ASYNC_READ_TEXT, DISP_ASYNC_READ_BYTES, DISP_ASYNC_WRITE_TEXT, DISP_ASYNC_WRITE_BYTES } disp_async_file_operation;
+typedef struct disp_async_file_state {
+    atomic_size_t refs;
+    atomic_bool done;
+    atomic_bool cancelled;
+    bool started;
+    bool taken;
+    bool ok;
+    int line;
+    int column;
+    disp_async_file_operation operation;
+    disp_native_path path;
+    disp_native_string input;
+    disp_native_string value;
+    disp_native_string error;
+} disp_async_file_state;
+static atomic_size_t disp_async_file_jobs=ATOMIC_VAR_INIT(0);
+static void disp_async_file_release(disp_async_file_state *state){if(atomic_fetch_sub_explicit(&state->refs,1,memory_order_acq_rel)!=1)return;atomic_thread_fence(memory_order_acquire);disp_path_drop(&state->path);disp_string_drop(&state->input);disp_string_drop(&state->value);disp_string_drop(&state->error);disp_dealloc(state);}
+static void disp_async_file_worker(void *raw){disp_async_file_state *state=(disp_async_file_state*)raw;if(state->operation==DISP_ASYNC_READ_TEXT)state->ok=disp_file_read_text(&state->path,&state->value,&state->error);else if(state->operation==DISP_ASYNC_READ_BYTES)state->ok=disp_file_read_bytes(&state->path,&state->value,&state->error);else state->ok=disp_file_write_text(&state->path,state->input.data,state->input.len,false,&state->error);disp_path_drop(&state->path);disp_string_drop(&state->input);atomic_store_explicit(&state->done,true,memory_order_release);disp_async_file_release(state);atomic_fetch_sub_explicit(&disp_async_file_jobs,1,memory_order_acq_rel);}
+static disp_async_file_state *disp_async_file_create(disp_async_file_operation operation,disp_native_path path,disp_native_string input,int line,int column){disp_async_file_state *state=(disp_async_file_state*)disp_alloc_zeroed(1,sizeof(disp_async_file_state),_Alignof(disp_async_file_state));atomic_init(&state->refs,1);atomic_init(&state->done,false);atomic_init(&state->cancelled,false);state->operation=operation;state->path=path;state->input=input;state->line=line;state->column=column;return state;}
+static bool disp_async_file_poll(disp_async_file_state *state){if(!state||state->taken)dv_panic("async file operation has already completed",0,0);if(!state->started){state->started=true;atomic_fetch_add_explicit(&state->refs,1,memory_order_relaxed);atomic_fetch_add_explicit(&disp_async_file_jobs,1,memory_order_relaxed);uintptr_t handle=disp_thread_start(disp_async_file_worker,state,state->line,state->column);disp_thread_detach(handle);}if(!atomic_load_explicit(&state->done,memory_order_acquire)){disp_reactor_offer(1000000ULL);return false;}return true;}
+static void disp_async_file_take(disp_async_file_state *state,bool *ok,disp_native_string *value,disp_native_string *error){if(!atomic_load_explicit(&state->done,memory_order_acquire)||state->taken)dv_panic("async file result is not ready",0,0);state->taken=true;*ok=state->ok;*value=state->value;*error=state->error;state->value=(disp_native_string){0};state->error=(disp_native_string){0};}
+static void disp_async_file_drop(void *raw){disp_async_file_state *state=(disp_async_file_state*)raw;if(!state)return;atomic_store_explicit(&state->cancelled,true,memory_order_release);disp_async_file_release(state);}
+static void disp_async_file_drain(void){while(atomic_load_explicit(&disp_async_file_jobs,memory_order_acquire))disp_time_sleep(1000000ULL);}
 static bool disp_directory_create(const disp_native_path *path,disp_native_string *error){
 #ifdef _WIN32
 int result=_mkdir(path->data);
@@ -200,6 +228,10 @@ while(nanos){uint64_t millis=nanos/1000000ULL+(nanos%1000000ULL!=0);DWORD chunk=
 struct timespec value={(time_t)(nanos/1000000000ULL),(long)(nanos%1000000000ULL)};while(nanosleep(&value,&value)!=0&&errno==EINTR){}
 #endif
 }
+typedef struct { uint64_t duration;uint64_t deadline;bool started; } disp_sleep_future;
+static bool disp_sleep_poll(void *raw,void *output){disp_sleep_future *state=(disp_sleep_future*)raw;uint64_t now=disp_time_now_nanos();if(!state->started){state->started=true;state->deadline=UINT64_MAX-now<state->duration?UINT64_MAX:now+state->duration;}if(now>=state->deadline){*(disp_native_unit*)output=(disp_native_unit){0};return true;}disp_reactor_offer(state->deadline-now);return false;}
+static void disp_sleep_drop(void *raw){disp_dealloc(raw);}
+static disp_native_future disp_future_sleep(disp_native_duration duration){disp_sleep_future *state=(disp_sleep_future*)disp_alloc_zeroed(1,sizeof(disp_sleep_future),_Alignof(disp_sleep_future));state->duration=duration.nanos;return (disp_native_future){.context=state,.poll=disp_sleep_poll,.drop=disp_sleep_drop};}
 
 typedef enum { DV_UNIT, DV_SIGNED, DV_UNSIGNED, DV_FLOAT, DV_BOOL, DV_CHAR, DV_STRING, DV_AGG, DV_REF, DV_RAW } DVTag;
 typedef struct DV DV;
