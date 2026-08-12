@@ -52,7 +52,7 @@ pub fn build(
                 mir::Terminator::Call {
                     target: hir::CallTarget::Intrinsic(name),
                     ..
-                } if name == "Async.connect" || name.starts_with("TcpListener.") || name.starts_with("TcpStream.")
+                } if name.starts_with("Async.connect") || name.starts_with("TcpListener.") || name.starts_with("TcpStream.")
             )
         })
     });

@@ -23,8 +23,10 @@ awaited or is cancelled with deterministic cleanup before its async scope exits.
 automatically. `Async.sleep`, `Async.read_text`, `Async.read_bytes`, `Async.write_text`, and
 `Async.write_bytes` are lazy owned futures; synchronous `Time.*` and `File.*` operations remain
 available. `SocketAddress` validates owned host/port pairs and `Async.connect` produces an owned
-`TcpStream` with typed `NetworkError` failures, byte reads/writes, explicit close, and automatic
-drop cleanup. `TcpListener.bind` provides owned server sockets with lazy readiness-polled
+`TcpStream` with typed `NetworkError` failures, synchronous or lazy nonblocking byte
+reads/writes, operation deadlines, explicit read/write half-close, explicit close, and automatic
+drop cleanup. Asynchronous writes copy their byte input into the future, so later caller mutation
+cannot change pending network output. `TcpListener.bind` provides owned server sockets with lazy readiness-polled
 `accept` futures, optional deadlines, local-port discovery, and cancellation-safe listener
 cleanup. Cancelling an unpolled I/O future has no side effects. Once native I/O has started,
 cancellation discards its result but lets the operating-system operation finish, and shutdown

@@ -8,7 +8,7 @@ use std::{
     collections::HashMap,
     fs,
     io::{Read, Write},
-    net::{Shutdown, TcpListener as StdTcpListener, TcpStream as StdTcpStream},
+    net::{Shutdown, TcpListener as StdTcpListener, TcpStream as StdTcpStream, ToSocketAddrs},
     path::PathBuf,
     sync::{
         Arc, Mutex as StdMutex, Weak,
@@ -100,8 +100,10 @@ enum FutureWork {
     ReadBytes(PathBuf),
     WriteText(PathBuf, RuntimeString),
     WriteBytes(PathBuf, Vec<u8>),
-    Connect(RuntimeSocketAddress),
+    Connect(RuntimeSocketAddress, Option<StdDuration>),
     Accept(RuntimeTcpListener, Option<StdDuration>),
+    SocketRead(RuntimeTcpStream, usize, Option<StdDuration>),
+    SocketWrite(RuntimeTcpStream, Vec<u8>, Option<StdDuration>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,7 +113,23 @@ struct RuntimeSocketAddress {
 }
 
 #[derive(Clone)]
-struct RuntimeTcpStream(Arc<StdMutex<Option<StdTcpStream>>>);
+struct RuntimeTcpStream(Arc<StdMutex<RuntimeTcpStreamState>>);
+
+struct RuntimeTcpStreamState {
+    socket: Option<StdTcpStream>,
+    read_shutdown: bool,
+    write_shutdown: bool,
+}
+
+impl RuntimeTcpStream {
+    fn new(socket: StdTcpStream) -> Self {
+        Self(Arc::new(StdMutex::new(RuntimeTcpStreamState {
+            socket: Some(socket),
+            read_shutdown: false,
+            write_shutdown: false,
+        })))
+    }
+}
 
 #[derive(Clone)]
 struct RuntimeTcpListener(Arc<StdMutex<Option<StdTcpListener>>>);
@@ -847,11 +865,39 @@ impl Interpreter {
             FutureWork::WriteBytes(path, bytes) => {
                 Ok(runtime_result(fs::write(path, bytes).map(|()| Value::Unit)))
             }
-            FutureWork::Connect(address) => Ok(runtime_result(
-                StdTcpStream::connect((address.host.as_str(), address.port)).map(|stream| {
-                    Value::TcpStream(RuntimeTcpStream(Arc::new(StdMutex::new(Some(stream)))))
-                }),
-            )),
+            FutureWork::Connect(address, timeout) => {
+                let connected = if let Some(timeout) = timeout {
+                    match (address.host.as_str(), address.port).to_socket_addrs() {
+                        Ok(addresses) => {
+                            let mut last = None;
+                            let mut connected = None;
+                            for address in addresses {
+                                match StdTcpStream::connect_timeout(&address, timeout) {
+                                    Ok(stream) => {
+                                        connected = Some(stream);
+                                        break;
+                                    }
+                                    Err(error) => last = Some(error),
+                                }
+                            }
+                            connected.ok_or_else(|| {
+                                last.unwrap_or_else(|| {
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::AddrNotAvailable,
+                                        "address resolution returned no addresses",
+                                    )
+                                })
+                            })
+                        }
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    StdTcpStream::connect((address.host.as_str(), address.port))
+                };
+                Ok(runtime_result(connected.map(|stream| {
+                    Value::TcpStream(RuntimeTcpStream::new(stream))
+                })))
+            }
             FutureWork::Accept(listener, timeout) => {
                 let deadline = timeout.and_then(|duration| StdInstant::now().checked_add(duration));
                 loop {
@@ -870,8 +916,8 @@ impl Interpreter {
                     };
                     match accepted {
                         Ok((stream, _)) => {
-                            break Ok(runtime_result(Ok(Value::TcpStream(RuntimeTcpStream(
-                                Arc::new(StdMutex::new(Some(stream))),
+                            break Ok(runtime_result(Ok(Value::TcpStream(RuntimeTcpStream::new(
+                                stream,
                             )))));
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -886,6 +932,66 @@ impl Interpreter {
                         Err(error) => break Ok(runtime_result(Err(error))),
                     }
                 }
+            }
+            FutureWork::SocketRead(stream, limit, timeout) => {
+                let mut guard = stream
+                    .0
+                    .lock()
+                    .map_err(|_| self.error("TCP stream state is poisoned", span))?;
+                let result = if guard.read_shutdown {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "TCP read side is shut down",
+                    ))
+                } else if let Some(socket) = guard.socket.as_mut() {
+                    socket.set_read_timeout(timeout).and_then(|()| {
+                        let mut bytes = vec![0; limit];
+                        let result = socket.read(&mut bytes).map(|count| {
+                            bytes.truncate(count);
+                            Value::List {
+                                capacity: bytes.len(),
+                                values: bytes
+                                    .into_iter()
+                                    .map(|byte| Value::Unsigned(byte as u128, 8))
+                                    .collect(),
+                            }
+                        });
+                        let _ = socket.set_read_timeout(None);
+                        result
+                    })
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "TCP stream is closed",
+                    ))
+                };
+                Ok(runtime_result(result))
+            }
+            FutureWork::SocketWrite(stream, bytes, timeout) => {
+                let mut guard = stream
+                    .0
+                    .lock()
+                    .map_err(|_| self.error("TCP stream state is poisoned", span))?;
+                let result = if guard.write_shutdown {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "TCP write side is shut down",
+                    ))
+                } else if let Some(socket) = guard.socket.as_mut() {
+                    socket.set_write_timeout(timeout).and_then(|()| {
+                        let result = socket
+                            .write_all(&bytes)
+                            .map(|()| Value::UInt(bytes.len() as u64));
+                        let _ = socket.set_write_timeout(None);
+                        result
+                    })
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "TCP stream is closed",
+                    ))
+                };
+                Ok(runtime_result(result))
             }
         }
     }
@@ -1860,16 +1966,26 @@ impl Interpreter {
                                 duration,
                             ))))
                         }
-                        "connect" => {
+                        "connect" | "connect_timeout" => {
                             let value = self.consume(program, &arguments[0])?;
                             let Value::SocketAddress(address) = value else {
                                 return Err(self.error(
-                                    "Async.connect expects SocketAddress",
+                                    "TCP connect expects SocketAddress",
                                     arguments[0].span,
                                 ));
                             };
+                            let timeout = if field == "connect_timeout" {
+                                let Value::Duration(duration) =
+                                    self.evaluate(program, &arguments[1])?
+                                else {
+                                    unreachable!("type checking validates connect timeout")
+                                };
+                                Some(duration)
+                            } else {
+                                None
+                            };
                             Ok(Value::Future(RuntimeFuture::operation(
-                                FutureWork::Connect(address),
+                                FutureWork::Connect(address, timeout),
                             )))
                         }
                         "read_text" | "read_bytes" => {
@@ -2498,7 +2614,7 @@ impl Interpreter {
                     }
                     if let Value::TcpStream(stream) = self.evaluate(program, object)? {
                         return match field.as_str() {
-                            "read" => {
+                            "read" | "read_async" | "read_async_timeout" => {
                                 let limit = self.index_value(program, &arguments[0])?;
                                 if limit > 16 * 1024 * 1024 {
                                     return Err(self.error(
@@ -2506,10 +2622,30 @@ impl Interpreter {
                                         arguments[0].span,
                                     ));
                                 }
+                                if field != "read" {
+                                    let timeout = if field == "read_async_timeout" {
+                                        let Value::Duration(duration) =
+                                            self.evaluate(program, &arguments[1])?
+                                        else {
+                                            unreachable!("type checking validates read timeout")
+                                        };
+                                        Some(duration)
+                                    } else {
+                                        None
+                                    };
+                                    return Ok(Value::Future(RuntimeFuture::operation(
+                                        FutureWork::SocketRead(stream, limit, timeout),
+                                    )));
+                                }
                                 let mut guard = stream.0.lock().map_err(|_| {
                                     self.error("TCP stream state is poisoned", object.span)
                                 })?;
-                                let result = if let Some(socket) = guard.as_mut() {
+                                let result = if guard.read_shutdown {
+                                    Err(std::io::Error::new(
+                                        std::io::ErrorKind::NotConnected,
+                                        "TCP read side is shut down",
+                                    ))
+                                } else if let Some(socket) = guard.socket.as_mut() {
                                     let mut bytes = vec![0; limit];
                                     socket.read(&mut bytes).map(|count| {
                                         bytes.truncate(count);
@@ -2529,7 +2665,7 @@ impl Interpreter {
                                 };
                                 Ok(runtime_result(result))
                             }
-                            "write" => {
+                            "write" | "write_async" | "write_async_timeout" => {
                                 let value = self.evaluate(program, &arguments[0])?;
                                 let values = match value {
                                     Value::List { values, .. } | Value::Slice(values) => values,
@@ -2542,10 +2678,30 @@ impl Interpreter {
                                         _ => unreachable!("type checking validates u8 elements"),
                                     })
                                     .collect::<Vec<_>>();
+                                if field != "write" {
+                                    let timeout = if field == "write_async_timeout" {
+                                        let Value::Duration(duration) =
+                                            self.evaluate(program, &arguments[1])?
+                                        else {
+                                            unreachable!("type checking validates write timeout")
+                                        };
+                                        Some(duration)
+                                    } else {
+                                        None
+                                    };
+                                    return Ok(Value::Future(RuntimeFuture::operation(
+                                        FutureWork::SocketWrite(stream, bytes, timeout),
+                                    )));
+                                }
                                 let mut guard = stream.0.lock().map_err(|_| {
                                     self.error("TCP stream state is poisoned", object.span)
                                 })?;
-                                let result = if let Some(socket) = guard.as_mut() {
+                                let result = if guard.write_shutdown {
+                                    Err(std::io::Error::new(
+                                        std::io::ErrorKind::NotConnected,
+                                        "TCP write side is shut down",
+                                    ))
+                                } else if let Some(socket) = guard.socket.as_mut() {
                                     socket
                                         .write_all(&bytes)
                                         .map(|()| Value::UInt(bytes.len() as u64))
@@ -2561,10 +2717,46 @@ impl Interpreter {
                                 let mut guard = stream.0.lock().map_err(|_| {
                                     self.error("TCP stream state is poisoned", object.span)
                                 })?;
-                                if let Some(socket) = guard.take() {
+                                if let Some(socket) = guard.socket.take() {
                                     let _ = socket.shutdown(Shutdown::Both);
                                 }
                                 Ok(Value::Unit)
+                            }
+                            "shutdown_read" | "shutdown_write" => {
+                                let mut guard = stream.0.lock().map_err(|_| {
+                                    self.error("TCP stream state is poisoned", object.span)
+                                })?;
+                                let reading = field == "shutdown_read";
+                                let already = if reading {
+                                    guard.read_shutdown
+                                } else {
+                                    guard.write_shutdown
+                                };
+                                let result = if already {
+                                    Ok(Value::Unit)
+                                } else if let Some(socket) = guard.socket.as_mut() {
+                                    let result = socket
+                                        .shutdown(if reading {
+                                            Shutdown::Read
+                                        } else {
+                                            Shutdown::Write
+                                        })
+                                        .map(|()| Value::Unit);
+                                    if result.is_ok() {
+                                        if reading {
+                                            guard.read_shutdown = true;
+                                        } else {
+                                            guard.write_shutdown = true;
+                                        }
+                                    }
+                                    result
+                                } else {
+                                    Err(std::io::Error::new(
+                                        std::io::ErrorKind::NotConnected,
+                                        "TCP stream is closed",
+                                    ))
+                                };
+                                Ok(runtime_result(result))
                             }
                             _ => Err(self.error("unknown TcpStream operation", expression.span)),
                         };

@@ -1589,6 +1589,26 @@ impl TypeChecker {
                             Box::new(Type::NetworkError),
                         ))));
                     }
+                    if field == "connect_timeout" && arguments.len() == 2 {
+                        let address = self.check_expression(&arguments[0])?;
+                        self.require_same(
+                            &Type::SocketAddress,
+                            &address,
+                            arguments[0].span,
+                            "TCP connect address",
+                        )?;
+                        let timeout = self.check_expression(&arguments[1])?;
+                        self.require_same(
+                            &Type::Duration,
+                            &timeout,
+                            arguments[1].span,
+                            "TCP connect timeout",
+                        )?;
+                        return Ok(Type::Future(Box::new(Type::Result(
+                            Box::new(Type::TcpStream),
+                            Box::new(Type::NetworkError),
+                        ))));
+                    }
                     if matches!(field.as_str(), "read_text" | "read_bytes") && arguments.len() == 1
                     {
                         self.require_path(&arguments[0])?;
@@ -2612,7 +2632,7 @@ impl TypeChecker {
                     }
                     if matches!(receiver, Type::TcpStream) {
                         match field.as_str() {
-                            "read" if arguments.len() == 1 => {
+                            "read" | "read_async" if arguments.len() == 1 => {
                                 let limit = self.check_expression(&arguments[0])?;
                                 if !is_integer(&limit) {
                                     return Err(Diagnostic::new(
@@ -2621,12 +2641,38 @@ impl TypeChecker {
                                         arguments[0].span,
                                     ));
                                 }
-                                return Ok(Type::Result(
+                                let result = Type::Result(
                                     Box::new(Type::List(Box::new(Type::Unsigned(8)))),
                                     Box::new(Type::NetworkError),
-                                ));
+                                );
+                                return Ok(if field == "read_async" {
+                                    Type::Future(Box::new(result))
+                                } else {
+                                    result
+                                });
                             }
-                            "write" if arguments.len() == 1 => {
+                            "read_async_timeout" if arguments.len() == 2 => {
+                                let limit = self.check_expression(&arguments[0])?;
+                                if !is_integer(&limit) {
+                                    return Err(Diagnostic::new(
+                                        DiagnosticKind::Type,
+                                        "TCP read limit must be an integer",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                let timeout = self.check_expression(&arguments[1])?;
+                                self.require_same(
+                                    &Type::Duration,
+                                    &timeout,
+                                    arguments[1].span,
+                                    "TCP read timeout",
+                                )?;
+                                return Ok(Type::Future(Box::new(Type::Result(
+                                    Box::new(Type::List(Box::new(Type::Unsigned(8)))),
+                                    Box::new(Type::NetworkError),
+                                ))));
+                            }
+                            "write" | "write_async" if arguments.len() == 1 => {
                                 let bytes = self.check_expression(&arguments[0])?;
                                 if !matches!(bytes, Type::List(ref element) | Type::Slice(ref element) if matches!(**element, Type::Unsigned(8)))
                                 {
@@ -2636,12 +2682,45 @@ impl TypeChecker {
                                         arguments[0].span,
                                     ));
                                 }
-                                return Ok(Type::Result(
+                                let result = Type::Result(
                                     Box::new(Type::UInt),
+                                    Box::new(Type::NetworkError),
+                                );
+                                return Ok(if field == "write_async" {
+                                    Type::Future(Box::new(result))
+                                } else {
+                                    result
+                                });
+                            }
+                            "write_async_timeout" if arguments.len() == 2 => {
+                                let bytes = self.check_expression(&arguments[0])?;
+                                if !matches!(bytes, Type::List(ref element) | Type::Slice(ref element) if matches!(**element, Type::Unsigned(8)))
+                                {
+                                    return Err(Diagnostic::new(
+                                        DiagnosticKind::Type,
+                                        "TCP write expects List<u8> or a u8 slice",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                let timeout = self.check_expression(&arguments[1])?;
+                                self.require_same(
+                                    &Type::Duration,
+                                    &timeout,
+                                    arguments[1].span,
+                                    "TCP write timeout",
+                                )?;
+                                return Ok(Type::Future(Box::new(Type::Result(
+                                    Box::new(Type::UInt),
+                                    Box::new(Type::NetworkError),
+                                ))));
+                            }
+                            "close" if arguments.is_empty() => return Ok(Type::Unit),
+                            "shutdown_read" | "shutdown_write" if arguments.is_empty() => {
+                                return Ok(Type::Result(
+                                    Box::new(Type::Unit),
                                     Box::new(Type::NetworkError),
                                 ));
                             }
-                            "close" if arguments.is_empty() => return Ok(Type::Unit),
                             _ => {}
                         }
                     }

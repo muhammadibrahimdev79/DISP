@@ -1725,7 +1725,7 @@ impl FunctionLowering<'_, '_> {
                             Box::new(Type::Unit),
                             Box::new(Type::Generic("IoError".into())),
                         ))),
-                        "connect" => Type::Future(Box::new(Type::Result(
+                        "connect" | "connect_timeout" => Type::Future(Box::new(Type::Result(
                             Box::new(Type::TcpStream),
                             Box::new(Type::Generic("NetworkError".into())),
                         ))),
@@ -2283,11 +2283,29 @@ impl FunctionLowering<'_, '_> {
                         }))),
                         Box::new(Type::Generic("NetworkError".into())),
                     ),
+                    "read_async" | "read_async_timeout" => Type::Future(Box::new(Type::Result(
+                        Box::new(Type::List(Box::new(Type::Int {
+                            signed: false,
+                            width: Some(8),
+                        }))),
+                        Box::new(Type::Generic("NetworkError".into())),
+                    ))),
                     "write" => Type::Result(
                         Box::new(Type::Int {
                             signed: false,
                             width: None,
                         }),
+                        Box::new(Type::Generic("NetworkError".into())),
+                    ),
+                    "write_async" | "write_async_timeout" => Type::Future(Box::new(Type::Result(
+                        Box::new(Type::Int {
+                            signed: false,
+                            width: None,
+                        }),
+                        Box::new(Type::Generic("NetworkError".into())),
+                    ))),
+                    "shutdown_read" | "shutdown_write" => Type::Result(
+                        Box::new(Type::Unit),
                         Box::new(Type::Generic("NetworkError".into())),
                     ),
                     _ => Type::Unit,

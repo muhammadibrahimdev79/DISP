@@ -1261,6 +1261,14 @@ impl<'a> Analyzer<'a> {
                             Box::new(Ty::Owned("NetworkError".into())),
                         ))))
                     }
+                    "connect_timeout" => {
+                        self.check_expr(&arguments[0], UseMode::Consume)?;
+                        self.check_expr(&arguments[1], UseMode::Read)?;
+                        Ok(Ty::Future(Box::new(Ty::Result(
+                            Box::new(Ty::TcpStream),
+                            Box::new(Ty::Owned("NetworkError".into())),
+                        ))))
+                    }
                     "read_text" | "read_bytes" => {
                         self.check_expr(&arguments[0], UseMode::Consume)?;
                         let value = if field == "read_text" {
@@ -1445,8 +1453,20 @@ impl<'a> Analyzer<'a> {
                         Box::new(Ty::List(Box::new(Ty::Copy))),
                         Box::new(Ty::Owned("NetworkError".into())),
                     ),
+                    "read_async" | "read_async_timeout" => Ty::Future(Box::new(Ty::Result(
+                        Box::new(Ty::List(Box::new(Ty::Copy))),
+                        Box::new(Ty::Owned("NetworkError".into())),
+                    ))),
                     "write" => Ty::Result(
                         Box::new(Ty::Copy),
+                        Box::new(Ty::Owned("NetworkError".into())),
+                    ),
+                    "write_async" | "write_async_timeout" => Ty::Future(Box::new(Ty::Result(
+                        Box::new(Ty::Copy),
+                        Box::new(Ty::Owned("NetworkError".into())),
+                    ))),
+                    "shutdown_read" | "shutdown_write" => Ty::Result(
+                        Box::new(Ty::Unit),
                         Box::new(Ty::Owned("NetworkError".into())),
                     ),
                     _ => Ty::Unit,

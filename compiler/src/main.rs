@@ -15,7 +15,21 @@ enum Command {
 }
 
 fn main() {
-    if let Err(error) = execute(env::args().skip(1).collect()) {
+    let arguments = env::args().skip(1).collect();
+    let result = std::thread::Builder::new()
+        .name("disp-driver".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || execute(arguments))
+        .and_then(|driver| {
+            driver.join().map_err(|_| {
+                std::io::Error::other("the DISP compiler driver terminated unexpectedly")
+            })
+        });
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => Err(format!("error: could not run the compiler driver: {error}")),
+    };
+    if let Err(error) = result {
         eprintln!("{error}");
         process::exit(1);
     }

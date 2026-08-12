@@ -1,0 +1,21 @@
+async fn try_local_service() -> Result<uint, NetworkError> {
+    connected = await Async.connect_timeout(
+        SocketAddress("127.0.0.1", 9),
+        Duration.from_millis(50)
+    )
+    var stream = connected?
+    written = await stream.write_async_timeout(
+        List.of(u8(68), u8(73), u8(83), u8(80)),
+        Duration.from_millis(50)
+    )
+    stream.shutdown_write()?
+    stream.close()
+    return written
+}
+
+async fn main() {
+    print(match await try_local_service() {
+        Ok(written) => written,
+        Err(error) => uint(0),
+    })
+}

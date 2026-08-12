@@ -648,6 +648,23 @@ stream.close()
 `read` and `write` return `Result<_, NetworkError>`. Reads are bounded to 16 MiB per call,
 and text protocols must explicitly validate or decode the returned `List<u8>`.
 
+Streams also provide lazy readiness-polled operations. Their deadlines begin on first poll,
+not when the future is constructed:
+
+```disp
+connected = await Async.connect_timeout(address, Duration.from_seconds(5))
+var stream = connected?
+written = await stream.write_async_timeout(bytes, Duration.from_seconds(2))
+response = await stream.read_async_timeout(4096, Duration.from_seconds(2))
+```
+
+`read_async` and `write_async` are the variants without deadlines. A zero-length successful
+read is EOF. `shutdown_read()` and `shutdown_write()` explicitly half-close one direction;
+operations on that direction then return `Err(NetworkError)`. One read and one write may progress
+concurrently, while multiple operations in the same direction are serialized. Async writes own a
+copy of their input bytes, and stream futures retain reference-counted native state, so closing or
+dropping the owner cannot produce dangling access.
+
 Owned TCP servers bind through the same validated address type. Accept futures retain the
 underlying listener state without exposing lifetimes or permitting use-after-close:
 
@@ -660,8 +677,8 @@ var stream = connection?
 
 `local_port()` returns `Result<uint, NetworkError>`, which supports safe operating-system
 port assignment with port zero. `accept()` and `accept_timeout()` are lazy nonblocking futures;
-closing or dropping the listener safely terminates pending accepts. UDP, readiness-driven stream
-reads/writes, and high-level protocol clients remain design work.
+closing or dropping the listener safely terminates pending accepts. UDP and high-level protocol
+clients remain design work.
 
 ---
 

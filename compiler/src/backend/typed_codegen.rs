@@ -174,8 +174,13 @@ fn async_operations(
                         | "Async.write_text"
                         | "Async.write_bytes"
                         | "Async.connect"
+                        | "Async.connect_timeout"
                         | "TcpListener.accept"
                         | "TcpListener.accept_timeout"
+                        | "TcpStream.read_async"
+                        | "TcpStream.read_async_timeout"
+                        | "TcpStream.write_async"
+                        | "TcpStream.write_async_timeout"
                 )
             {
                 let hir::Type::Future(result) =
@@ -201,10 +206,30 @@ fn async_poll_name(operation: &str, result: &hir::Type) -> String {
 fn async_poll_wrapper(operation: &str, result: &hir::Type, output: &mut String) {
     let result_c = native_types::c_type(result);
     let poll = async_poll_name(operation, result);
-    if operation == "Async.connect" {
+    if matches!(operation, "Async.connect" | "Async.connect_timeout") {
         writeln!(
             output,
             "static bool {poll}(void *raw,void *output){{disp_connect_state *state=(disp_connect_state*)raw;if(!disp_connect_poll(state))return false;bool ok=false;disp_native_tcp_stream stream={{0}};disp_native_string error={{0}};disp_connect_take(state,&ok,&stream,&error);{result_c} *result=({result_c}*)output;*result=({result_c}){{0}};if(ok){{result->tag=0;result->payload.v0.f0=stream;}}else{{result->tag=1;result->payload.v1.f0=error;}}return true;}}"
+        )
+        .unwrap();
+        return;
+    }
+    if operation.starts_with("TcpStream.read_async") {
+        writeln!(
+            output,
+            "static bool {poll}(void *raw,void *output){{disp_socket_io_state *state=(disp_socket_io_state*)raw;if(!disp_socket_io_poll(state))return false;bool ok=false;size_t written=0;disp_native_string bytes={{0}},error={{0}};disp_socket_io_take(state,&ok,&bytes,&written,&error);{result_c} *result=({result_c}*)output;*result=({result_c}){{0}};if(ok){{result->tag=0;result->payload.v0.f0=({}){{.data=(uint8_t*)bytes.data,.len=bytes.len,.cap=bytes.cap}};}}else{{result->tag=1;result->payload.v1.f0=error;}}return true;}}",
+            match result {
+                hir::Type::Result(value, _) => native_types::c_type(value),
+                _ => unreachable!("TCP read future must contain Result"),
+            }
+        )
+        .unwrap();
+        return;
+    }
+    if operation.starts_with("TcpStream.write_async") {
+        writeln!(
+            output,
+            "static bool {poll}(void *raw,void *output){{disp_socket_io_state *state=(disp_socket_io_state*)raw;if(!disp_socket_io_poll(state))return false;bool ok=false;size_t written=0;disp_native_string bytes={{0}},error={{0}};disp_socket_io_take(state,&ok,&bytes,&written,&error);disp_string_drop(&bytes);{result_c} *result=({result_c}*)output;*result=({result_c}){{0}};if(ok){{result->tag=0;result->payload.v0.f0=(uint64_t)written;}}else{{result->tag=1;result->payload.v1.f0=error;}}return true;}}"
         )
         .unwrap();
         return;
@@ -945,16 +970,27 @@ fn terminator(
                     );
                     format!("disp_future_sleep({duration})")
                 }
-                hir::CallTarget::Intrinsic(name) if name == "Async.connect" => {
+                hir::CallTarget::Intrinsic(name)
+                    if matches!(name.as_str(), "Async.connect" | "Async.connect_timeout") =>
+                {
                     let hir::Type::Future(result) = &destination_ty else {
                         unreachable!("Async.connect destination must be Future<T>")
                     };
                     let address_ty = operand_ty(program, function, &arguments[0], substitutions);
                     let address =
                         operand(program, function, &arguments[0], &address_ty, substitutions);
+                    let (has_timeout, timeout) = if arguments.len() == 2 {
+                        let timeout_ty =
+                            operand_ty(program, function, &arguments[1], substitutions);
+                        let timeout =
+                            operand(program, function, &arguments[1], &timeout_ty, substitutions);
+                        ("true", format!("({timeout}).nanos"))
+                    } else {
+                        ("false", "0".into())
+                    };
                     let poll = async_poll_name(name, result);
                     format!(
-                        "({{disp_connect_state *_state=disp_connect_create({address},{},{});(disp_native_future){{.context=_state,.poll={poll},.drop=disp_connect_drop}};}})",
+                        "({{disp_connect_state *_state=disp_connect_create({address},{has_timeout},{timeout},{},{});(disp_native_future){{.context=_state,.poll={poll},.drop=disp_connect_drop}};}})",
                         span.start.line, span.start.column
                     )
                 }
@@ -1306,6 +1342,83 @@ fn terminator(
                             let result_c = native_types::c_type(&destination_ty);
                             format!(
                                 "({{{result_c} _r={{0}};size_t _written=0;disp_native_string _error={{0}};if(disp_tcp_stream_write({stream},(const char*)({bytes}).data,({bytes}).len,&_written,&_error)){{_r.tag=0;_r.payload.v0.f0=(uint64_t)_written;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                            )
+                        }
+                        "TcpStream.read_async" | "TcpStream.read_async_timeout" => {
+                            let hir::Type::Future(result) = &destination_ty else {
+                                unreachable!("TCP async read must return Future")
+                            };
+                            let limit_ty =
+                                operand_ty(program, function, &arguments[1], substitutions);
+                            let limit =
+                                operand(program, function, &arguments[1], &limit_ty, substitutions);
+                            let (limit_c, invalid) =
+                                if matches!(limit_ty, hir::Type::Int { signed: true, .. }) {
+                                    ("__int128", "_limit<0||_limit>16777216")
+                                } else {
+                                    ("unsigned __int128", "_limit>16777216")
+                                };
+                            let (has_timeout, timeout) = if arguments.len() == 3 {
+                                let timeout_ty =
+                                    operand_ty(program, function, &arguments[2], substitutions);
+                                let timeout = operand(
+                                    program,
+                                    function,
+                                    &arguments[2],
+                                    &timeout_ty,
+                                    substitutions,
+                                );
+                                ("true", format!("({timeout}).nanos"))
+                            } else {
+                                ("false", "0".into())
+                            };
+                            let poll = async_poll_name(name, result);
+                            format!(
+                                "({{{limit_c} _limit=({limit_c})({limit});if({invalid})dv_panic(\"TCP read limit exceeds the 16 MiB safety limit\",{},{});disp_socket_io_state *_state=disp_socket_io_create(({stream})->state,DISP_SOCKET_READ,NULL,(size_t)_limit,{has_timeout},{timeout},{},{});(disp_native_future){{.context=_state,.poll={poll},.drop=disp_socket_io_drop}};}})",
+                                span.start.line,
+                                span.start.column,
+                                span.start.line,
+                                span.start.column
+                            )
+                        }
+                        "TcpStream.write_async" | "TcpStream.write_async_timeout" => {
+                            let hir::Type::Future(result) = &destination_ty else {
+                                unreachable!("TCP async write must return Future")
+                            };
+                            let bytes_ty =
+                                operand_ty(program, function, &arguments[1], substitutions);
+                            let bytes =
+                                operand(program, function, &arguments[1], &bytes_ty, substitutions);
+                            let bytes_c = native_types::c_type(&bytes_ty);
+                            let (has_timeout, timeout) = if arguments.len() == 3 {
+                                let timeout_ty =
+                                    operand_ty(program, function, &arguments[2], substitutions);
+                                let timeout = operand(
+                                    program,
+                                    function,
+                                    &arguments[2],
+                                    &timeout_ty,
+                                    substitutions,
+                                );
+                                ("true", format!("({timeout}).nanos"))
+                            } else {
+                                ("false", "0".into())
+                            };
+                            let poll = async_poll_name(name, result);
+                            format!(
+                                "({{{bytes_c} _bytes={bytes};disp_socket_io_state *_state=disp_socket_io_create(({stream})->state,DISP_SOCKET_WRITE,(const char*)_bytes.data,_bytes.len,{has_timeout},{timeout},{},{});(disp_native_future){{.context=_state,.poll={poll},.drop=disp_socket_io_drop}};}})",
+                                span.start.line, span.start.column
+                            )
+                        }
+                        "TcpStream.shutdown_read" | "TcpStream.shutdown_write" => {
+                            let result_c = native_types::c_type(&destination_ty);
+                            let reading = if name == "TcpStream.shutdown_read" {
+                                "true"
+                            } else {
+                                "false"
+                            };
+                            format!(
+                                "({{{result_c} _r={{0}};disp_native_string _error={{0}};if(disp_tcp_stream_shutdown({stream},{reading},&_error)){{_r.tag=0;_r.payload.v0.f0=(disp_native_unit){{0}};}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
                             )
                         }
                         _ => unreachable!(),
