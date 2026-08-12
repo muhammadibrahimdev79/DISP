@@ -841,6 +841,7 @@ pub fn type_code(ty: &hir::Type) -> String {
         hir::Type::SocketAddress => "na".into(),
         hir::Type::TcpStream => "nt".into(),
         hir::Type::TlsStream => "nx".into(),
+        hir::Type::HttpResponse => "nh".into(),
         hir::Type::TcpListener => "nl".into(),
         hir::Type::UdpSocket => "nu".into(),
         hir::Type::UdpDatagram => "nd".into(),

@@ -7,6 +7,7 @@ pub fn compile_and_link(
     executable: &Path,
     optimized: bool,
     networking: bool,
+    http: bool,
     libraries: &[String],
 ) -> Result<(), Diagnostic> {
     let mut compile = vec![
@@ -21,6 +22,9 @@ pub fn compile_and_link(
     }
     if networking {
         compile.push("-DDISP_NETWORKING".into());
+    }
+    if http {
+        compile.push("-DDISP_HTTP".into());
     }
     compile.extend([
         "-c".into(),
@@ -42,6 +46,9 @@ pub fn compile_and_link(
         link.push("-lws2_32".into());
         link.push("-lsecur32".into());
         link.push("-lcrypt32".into());
+        if http {
+            link.push("-lwinhttp".into());
+        }
     }
     for library in libraries {
         link.push(format!("-l{library}"));

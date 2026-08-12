@@ -36,6 +36,7 @@ pub enum Type {
     SocketAddress,
     TcpStream,
     TlsStream,
+    HttpResponse,
     TcpListener,
     UdpSocket,
     UdpDatagram,
@@ -93,6 +94,7 @@ impl Type {
             | Self::SocketAddress
             | Self::TcpStream
             | Self::TlsStream
+            | Self::HttpResponse
             | Self::TcpListener
             | Self::UdpSocket
             | Self::UdpDatagram
@@ -773,6 +775,7 @@ impl<'a> Lowering<'a> {
             "SocketAddress" => Type::SocketAddress,
             "TcpStream" => Type::TcpStream,
             "TlsStream" => Type::TlsStream,
+            "HttpResponse" => Type::HttpResponse,
             "TcpListener" => Type::TcpListener,
             "UdpSocket" => Type::UdpSocket,
             "UdpDatagram" => Type::UdpDatagram,
@@ -780,6 +783,7 @@ impl<'a> Lowering<'a> {
             "Duration" => Type::Duration,
             "IoError" => Type::Generic("IoError".into()),
             "NetworkError" => Type::Generic("NetworkError".into()),
+            "HttpError" => Type::Generic("HttpError".into()),
             "[]" => Type::Slice(Box::new(
                 ty.arguments
                     .first()
@@ -1853,6 +1857,25 @@ impl FunctionLowering<'_, '_> {
                         span,
                     });
                 }
+                if owner == "Http" && matches!(field.as_str(), "get" | "get_timeout") {
+                    let args = arguments
+                        .iter()
+                        .map(|x| self.lower_expr(x))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    return Ok(Expr {
+                        kind: ExprKind::Call(Call {
+                            target: CallTarget::Intrinsic(format!("Http.{field}")),
+                            arguments: args,
+                            receiver: None,
+                            substitutions: vec![],
+                        }),
+                        ty: Type::Future(Box::new(Type::Result(
+                            Box::new(Type::HttpResponse),
+                            Box::new(Type::Generic("HttpError".into())),
+                        ))),
+                        span,
+                    });
+                }
                 if owner == "String" {
                     let args = arguments
                         .iter()
@@ -2451,6 +2474,43 @@ impl FunctionLowering<'_, '_> {
                         target: CallTarget::Intrinsic(format!("TlsStream.{field}")),
                         arguments: args,
                         receiver: Some(ReceiverMode::Mutable),
+                        substitutions: vec![],
+                    }),
+                    ty,
+                    span,
+                });
+            }
+            if matches!(receiver.ty, Type::HttpResponse) {
+                let mut args = vec![receiver];
+                args.extend(
+                    arguments
+                        .iter()
+                        .map(|x| self.lower_expr(x))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+                let ty = match field.as_str() {
+                    "status" | "len" => Type::Int {
+                        signed: false,
+                        width: None,
+                    },
+                    "is_success" | "is_empty" => Type::Bool,
+                    "body" => Type::List(Box::new(Type::Int {
+                        signed: false,
+                        width: Some(8),
+                    })),
+                    "text" => Type::Result(
+                        Box::new(Type::String),
+                        Box::new(Type::Generic("HttpError".into())),
+                    ),
+                    "url" => Type::String,
+                    "header" => Type::Option(Box::new(Type::String)),
+                    _ => Type::Unknown,
+                };
+                return Ok(Expr {
+                    kind: ExprKind::Call(Call {
+                        target: CallTarget::Intrinsic(format!("HttpResponse.{field}")),
+                        arguments: args,
+                        receiver: Some(ReceiverMode::Shared),
                         substitutions: vec![],
                     }),
                     ty,
@@ -3593,6 +3653,7 @@ fn surface_type_is_copy(ty: &Type) -> bool {
         | Type::SocketAddress
         | Type::TcpStream
         | Type::TlsStream
+        | Type::HttpResponse
         | Type::TcpListener
         | Type::UdpSocket
         | Type::UdpDatagram

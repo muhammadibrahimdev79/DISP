@@ -26,6 +26,7 @@ pub enum Type {
     SocketAddress,
     TcpStream,
     TlsStream,
+    HttpResponse,
     TcpListener,
     UdpSocket,
     UdpDatagram,
@@ -47,6 +48,7 @@ pub enum Type {
     ConversionError,
     IoError,
     NetworkError,
+    HttpError,
     Unit,
     Struct(TypeId, Vec<Type>),
     Enum(TypeId, Vec<Type>),
@@ -1861,6 +1863,40 @@ impl TypeChecker {
                     ))));
                 }
                 if let Expression::FieldAccess { object, field, .. } = &callee.node
+                    && matches!(&object.node, Expression::Identifier(name) if name == "Http")
+                    && matches!(field.as_str(), "get" | "get_timeout")
+                {
+                    let expected = if field == "get" { 1 } else { 2 };
+                    if arguments.len() != expected {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            format!("`Http.{field}` expects {expected} arguments"),
+                            expression.span,
+                        ));
+                    }
+                    let url = self.check_expression(&arguments[0])?;
+                    if !matches!(url, Type::String | Type::Str) {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            "HTTP URL must be String or str",
+                            arguments[0].span,
+                        ));
+                    }
+                    if field == "get_timeout" {
+                        let timeout = self.check_expression(&arguments[1])?;
+                        self.require_same(
+                            &Type::Duration,
+                            &timeout,
+                            arguments[1].span,
+                            "HTTP request timeout",
+                        )?;
+                    }
+                    return Ok(Type::Future(Box::new(Type::Result(
+                        Box::new(Type::HttpResponse),
+                        Box::new(Type::HttpError),
+                    ))));
+                }
+                if let Expression::FieldAccess { object, field, .. } = &callee.node
                     && matches!(&object.node, Expression::Identifier(name) if name == "UdpSocket")
                     && field == "bind"
                     && arguments.len() == 1
@@ -2931,6 +2967,45 @@ impl TypeChecker {
                             _ => {}
                         }
                     }
+                    if matches!(receiver, Type::HttpResponse) {
+                        match field.as_str() {
+                            "status" | "len" if arguments.is_empty() => return Ok(Type::UInt),
+                            "is_success" | "is_empty" if arguments.is_empty() => {
+                                return Ok(Type::Bool);
+                            }
+                            "body" if arguments.is_empty() => {
+                                return Ok(Type::List(Box::new(Type::Unsigned(8))));
+                            }
+                            "text" if arguments.is_empty() => {
+                                return Ok(Type::Result(
+                                    Box::new(Type::String),
+                                    Box::new(Type::HttpError),
+                                ));
+                            }
+                            "url" if arguments.is_empty() => return Ok(Type::String),
+                            "header" if arguments.len() == 1 => {
+                                let name = self.check_expression(&arguments[0])?;
+                                if !matches!(name, Type::String | Type::Str) {
+                                    return Err(Diagnostic::new(
+                                        DiagnosticKind::Type,
+                                        "HTTP header name must be String or str",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                if let Expression::String(name) = &arguments[0].node
+                                    && !http_header_token(name)
+                                {
+                                    return Err(Diagnostic::new(
+                                        DiagnosticKind::Type,
+                                        "HTTP header name contains invalid characters",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                return Ok(Type::Option(Box::new(Type::String)));
+                            }
+                            _ => {}
+                        }
+                    }
                     if matches!(receiver, Type::TcpListener) {
                         let accepted = || {
                             Type::Future(Box::new(Type::Result(
@@ -3805,6 +3880,7 @@ impl TypeChecker {
             "SocketAddress" if ty.arguments.is_empty() => Type::SocketAddress,
             "TcpStream" if ty.arguments.is_empty() => Type::TcpStream,
             "TlsStream" if ty.arguments.is_empty() => Type::TlsStream,
+            "HttpResponse" if ty.arguments.is_empty() => Type::HttpResponse,
             "TcpListener" if ty.arguments.is_empty() => Type::TcpListener,
             "UdpSocket" if ty.arguments.is_empty() => Type::UdpSocket,
             "UdpDatagram" if ty.arguments.is_empty() => Type::UdpDatagram,
@@ -3812,6 +3888,7 @@ impl TypeChecker {
             "Duration" if ty.arguments.is_empty() => Type::Duration,
             "IoError" if ty.arguments.is_empty() => Type::IoError,
             "NetworkError" if ty.arguments.is_empty() => Type::NetworkError,
+            "HttpError" if ty.arguments.is_empty() => Type::HttpError,
             "AtomicInt" if ty.arguments.is_empty() => Type::AtomicInt,
             "[]" if ty.arguments.len() == 1 => {
                 Type::Slice(Box::new(self.resolve_type(&ty.arguments[0])?))
@@ -4148,6 +4225,7 @@ impl TypeChecker {
             Type::SocketAddress => "SocketAddress".into(),
             Type::TcpStream => "TcpStream".into(),
             Type::TlsStream => "TlsStream".into(),
+            Type::HttpResponse => "HttpResponse".into(),
             Type::TcpListener => "TcpListener".into(),
             Type::UdpSocket => "UdpSocket".into(),
             Type::UdpDatagram => "UdpDatagram".into(),
@@ -4174,6 +4252,7 @@ impl TypeChecker {
             Type::ConversionError => "ConversionError".into(),
             Type::IoError => "IoError".into(),
             Type::NetworkError => "NetworkError".into(),
+            Type::HttpError => "HttpError".into(),
             Type::Unit => "Unit".into(),
             Type::Struct(id, arguments) => self.format_nominal(&self.structs[id].name, arguments),
             Type::Enum(id, arguments) => self.format_nominal(&self.enums[id].name, arguments),
@@ -4885,6 +4964,30 @@ fn is_storage_expression(expression: &Expr) -> bool {
         expression.node,
         Expression::Identifier(_) | Expression::FieldAccess { .. } | Expression::Index { .. }
     )
+}
+
+fn http_header_token(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
 }
 
 #[cfg(test)]

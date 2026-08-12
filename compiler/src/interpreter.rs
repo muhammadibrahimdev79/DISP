@@ -8,7 +8,7 @@ use std::{
     any::Any,
     collections::HashMap,
     fs,
-    io::{Read, Write},
+    io::{self, Read, Write},
     net::{
         IpAddr, Shutdown, TcpListener as StdTcpListener, TcpStream as StdTcpStream, ToSocketAddrs,
         UdpSocket as StdUdpSocket,
@@ -21,6 +21,7 @@ use std::{
     thread,
     time::{Duration as StdDuration, Instant as StdInstant, SystemTime, UNIX_EPOCH},
 };
+use url::{Host, Position, Url};
 
 #[derive(Clone)]
 struct RuntimeThread(Arc<ThreadState>);
@@ -119,6 +120,7 @@ enum FutureWork {
     TlsConnect(RuntimeTcpStream, String, Option<StdDuration>),
     TlsRead(RuntimeTlsStream, usize, Option<StdDuration>),
     TlsWrite(RuntimeTlsStream, Vec<u8>, Option<StdDuration>),
+    HttpGet(String, StdDuration),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +137,17 @@ struct RuntimeTcpStream(Arc<StdMutex<RuntimeTcpStreamState>>);
 
 #[derive(Clone)]
 struct RuntimeTlsStream(Arc<StdMutex<Option<NativeTlsStream<StdTcpStream>>>>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeHttpResponse(Arc<RuntimeHttpResponseData>);
+
+#[derive(Debug, PartialEq, Eq)]
+struct RuntimeHttpResponseData {
+    status: u16,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
 
 struct RuntimeTcpStreamState {
     socket: Option<StdTcpStream>,
@@ -624,6 +637,507 @@ fn runtime_bytes(bytes: Vec<u8>) -> Value {
     }
 }
 
+const HTTP_HEADER_LIMIT: usize = 64 * 1024;
+const HTTP_BODY_LIMIT: usize = 16 * 1024 * 1024;
+const HTTP_CHUNKED_WIRE_LIMIT: usize = HTTP_BODY_LIMIT + 1024 * 1024;
+const HTTP_REDIRECT_LIMIT: usize = 10;
+
+enum InterpreterHttpStream {
+    Plain(StdTcpStream),
+    Tls(Box<NativeTlsStream<StdTcpStream>>),
+}
+
+type HttpHeaders = Vec<(String, String)>;
+type ParsedHttpHeaders = (u16, HttpHeaders, usize);
+type ParsedHttpResponse = (u16, HttpHeaders, Vec<u8>);
+
+impl Read for InterpreterHttpStream {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.read(buffer),
+            Self::Tls(stream) => stream.read(buffer),
+        }
+    }
+}
+
+impl Write for InterpreterHttpStream {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.write(buffer),
+            Self::Tls(stream) => stream.write(buffer),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Plain(stream) => stream.flush(),
+            Self::Tls(stream) => stream.flush(),
+        }
+    }
+}
+
+fn http_error(kind: io::ErrorKind, message: impl Into<String>) -> io::Error {
+    io::Error::new(kind, message.into())
+}
+
+fn http_remaining(deadline: StdInstant) -> io::Result<StdDuration> {
+    deadline
+        .checked_duration_since(StdInstant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| http_error(io::ErrorKind::TimedOut, "HTTP request timed out"))
+}
+
+fn parse_http_url(source: &str) -> io::Result<Url> {
+    if source.is_empty()
+        || source.len() > 8192
+        || source
+            .bytes()
+            .any(|byte| byte == 0 || byte <= 0x20 || byte == 0x7f)
+    {
+        return Err(http_error(
+            io::ErrorKind::InvalidInput,
+            "HTTP URL must be non-empty, at most 8192 bytes, and contain no control characters or spaces",
+        ));
+    }
+    let url = Url::parse(source).map_err(|error| {
+        http_error(
+            io::ErrorKind::InvalidInput,
+            format!("invalid HTTP URL: {error}"),
+        )
+    })?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(http_error(
+            io::ErrorKind::InvalidInput,
+            "HTTP URL scheme must be http or https",
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(http_error(
+            io::ErrorKind::InvalidInput,
+            "credentials are not allowed in HTTP URLs",
+        ));
+    }
+    if url.fragment().is_some() || url.host_str().is_none() {
+        return Err(http_error(
+            io::ErrorKind::InvalidInput,
+            "HTTP URL must contain a host and must not contain a fragment",
+        ));
+    }
+    Ok(url)
+}
+
+fn connect_http_stream(url: &Url, deadline: StdInstant) -> io::Result<InterpreterHttpStream> {
+    let host = url.host_str().ok_or_else(|| {
+        http_error(
+            io::ErrorKind::InvalidInput,
+            "HTTP URL does not contain a host",
+        )
+    })?;
+    let port = url.port_or_known_default().ok_or_else(|| {
+        http_error(
+            io::ErrorKind::InvalidInput,
+            "HTTP URL does not contain a valid port",
+        )
+    })?;
+    let addresses = (host, port).to_socket_addrs()?;
+    let mut last_error = None;
+    let mut socket = None;
+    for address in addresses {
+        match StdTcpStream::connect_timeout(&address, http_remaining(deadline)?) {
+            Ok(connected) => {
+                socket = Some(connected);
+                break;
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    let socket = socket.ok_or_else(|| {
+        last_error.unwrap_or_else(|| {
+            http_error(
+                io::ErrorKind::AddrNotAvailable,
+                "HTTP host resolved to no reachable address",
+            )
+        })
+    })?;
+    socket.set_read_timeout(Some(http_remaining(deadline)?))?;
+    socket.set_write_timeout(Some(http_remaining(deadline)?))?;
+    if url.scheme() == "http" {
+        return Ok(InterpreterHttpStream::Plain(socket));
+    }
+    let mut builder = TlsConnector::builder();
+    builder.min_protocol_version(Some(Protocol::Tlsv12));
+    let connector = builder.build().map_err(tls_error)?;
+    connector
+        .connect(host, socket)
+        .map(|stream| InterpreterHttpStream::Tls(Box::new(stream)))
+        .map_err(tls_error)
+}
+
+fn http_request_target(url: &Url) -> &str {
+    let target = &url[Position::BeforePath..Position::AfterQuery];
+    if target.is_empty() { "/" } else { target }
+}
+
+fn http_host_header(url: &Url) -> io::Result<String> {
+    let host = match url.host().ok_or_else(|| {
+        http_error(
+            io::ErrorKind::InvalidInput,
+            "HTTP URL does not contain a host",
+        )
+    })? {
+        Host::Ipv6(address) => format!("[{address}]"),
+        other => other.to_string(),
+    };
+    let default = match url.scheme() {
+        "http" => 80,
+        "https" => 443,
+        _ => unreachable!(),
+    };
+    Ok(match url.port() {
+        Some(port) if port != default => format!("{host}:{port}"),
+        _ => host,
+    })
+}
+
+fn find_crlf(bytes: &[u8], start: usize) -> Option<usize> {
+    bytes
+        .get(start..)?
+        .windows(2)
+        .position(|window| window == b"\r\n")
+        .map(|offset| start + offset)
+}
+
+fn decode_chunked_body(bytes: &[u8]) -> io::Result<Option<Vec<u8>>> {
+    let mut position = 0;
+    let mut decoded = Vec::new();
+    loop {
+        let Some(line_end) = find_crlf(bytes, position) else {
+            if bytes.len().saturating_sub(position) > 8192 {
+                return Err(http_error(
+                    io::ErrorKind::InvalidData,
+                    "HTTP chunk line exceeds 8192 bytes",
+                ));
+            }
+            return Ok(None);
+        };
+        if line_end - position > 8192 {
+            return Err(http_error(
+                io::ErrorKind::InvalidData,
+                "HTTP chunk line exceeds 8192 bytes",
+            ));
+        }
+        let line = std::str::from_utf8(&bytes[position..line_end])
+            .map_err(|_| http_error(io::ErrorKind::InvalidData, "HTTP chunk size is not ASCII"))?;
+        let digits = line.split(';').next().unwrap_or_default();
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(http_error(
+                io::ErrorKind::InvalidData,
+                "invalid HTTP chunk size",
+            ));
+        }
+        let size = usize::from_str_radix(digits, 16)
+            .map_err(|_| http_error(io::ErrorKind::InvalidData, "HTTP chunk size overflow"))?;
+        position = line_end + 2;
+        if size == 0 {
+            loop {
+                let Some(trailer_end) = find_crlf(bytes, position) else {
+                    return Ok(None);
+                };
+                if trailer_end == position {
+                    return Ok(Some(decoded));
+                }
+                if trailer_end - position > 8192 {
+                    return Err(http_error(
+                        io::ErrorKind::InvalidData,
+                        "HTTP trailer line exceeds 8192 bytes",
+                    ));
+                }
+                position = trailer_end + 2;
+            }
+        }
+        let end = position
+            .checked_add(size)
+            .ok_or_else(|| http_error(io::ErrorKind::InvalidData, "HTTP chunk size overflow"))?;
+        let framed_end = end
+            .checked_add(2)
+            .ok_or_else(|| http_error(io::ErrorKind::InvalidData, "HTTP chunk size overflow"))?;
+        if framed_end > bytes.len() {
+            return Ok(None);
+        }
+        if &bytes[end..framed_end] != b"\r\n" {
+            return Err(http_error(
+                io::ErrorKind::InvalidData,
+                "HTTP chunk is missing its terminator",
+            ));
+        }
+        if decoded.len().saturating_add(size) > HTTP_BODY_LIMIT {
+            return Err(http_error(
+                io::ErrorKind::InvalidData,
+                "HTTP response body exceeds the 16 MiB limit",
+            ));
+        }
+        decoded.extend_from_slice(&bytes[position..end]);
+        position = framed_end;
+    }
+}
+
+fn parse_http_headers(bytes: &[u8]) -> io::Result<ParsedHttpHeaders> {
+    let mut storage = [httparse::EMPTY_HEADER; 100];
+    let mut response = httparse::Response::new(&mut storage);
+    let consumed = match response.parse(bytes).map_err(|error| {
+        http_error(
+            io::ErrorKind::InvalidData,
+            format!("invalid HTTP response: {error}"),
+        )
+    })? {
+        httparse::Status::Complete(consumed) => consumed,
+        httparse::Status::Partial => {
+            return Err(http_error(
+                io::ErrorKind::UnexpectedEof,
+                "incomplete HTTP response headers",
+            ));
+        }
+    };
+    let status = response.code.ok_or_else(|| {
+        http_error(
+            io::ErrorKind::InvalidData,
+            "HTTP response has no status code",
+        )
+    })?;
+    let mut headers = Vec::with_capacity(response.headers.len());
+    for header in response.headers {
+        let value = std::str::from_utf8(header.value).map_err(|_| {
+            http_error(
+                io::ErrorKind::InvalidData,
+                "HTTP response header is not valid UTF-8",
+            )
+        })?;
+        headers.push((header.name.to_ascii_lowercase(), value.trim().to_owned()));
+    }
+    Ok((status, headers, consumed))
+}
+
+fn read_http_response(
+    stream: &mut InterpreterHttpStream,
+    deadline: StdInstant,
+) -> io::Result<ParsedHttpResponse> {
+    let mut wire = Vec::new();
+    let mut chunk = [0u8; 16 * 1024];
+    let (status, headers, body_start) = loop {
+        if let Some(end) = wire.windows(4).position(|window| window == b"\r\n\r\n") {
+            let header_end = end + 4;
+            if header_end > HTTP_HEADER_LIMIT {
+                return Err(http_error(
+                    io::ErrorKind::InvalidData,
+                    "HTTP response headers exceed the 64 KiB limit",
+                ));
+            }
+            let (status, headers, consumed) = parse_http_headers(&wire[..header_end])?;
+            if consumed != header_end {
+                return Err(http_error(
+                    io::ErrorKind::InvalidData,
+                    "ambiguous HTTP response headers",
+                ));
+            }
+            if (100..200).contains(&status) && status != 101 {
+                wire.drain(..header_end);
+                continue;
+            }
+            break (status, headers, header_end);
+        }
+        if wire.len() >= HTTP_HEADER_LIMIT {
+            return Err(http_error(
+                io::ErrorKind::InvalidData,
+                "HTTP response headers exceed the 64 KiB limit",
+            ));
+        }
+        let count = stream.read(&mut chunk)?;
+        if count == 0 {
+            return Err(http_error(
+                io::ErrorKind::UnexpectedEof,
+                "connection ended before HTTP response headers",
+            ));
+        }
+        wire.extend_from_slice(&chunk[..count]);
+    };
+    let content_lengths = headers
+        .iter()
+        .filter(|(name, _)| name == "content-length")
+        .map(|(_, value)| value.parse::<usize>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| http_error(io::ErrorKind::InvalidData, "invalid HTTP Content-Length"))?;
+    if content_lengths.windows(2).any(|pair| pair[0] != pair[1]) {
+        return Err(http_error(
+            io::ErrorKind::InvalidData,
+            "conflicting HTTP Content-Length headers",
+        ));
+    }
+    let content_length = content_lengths.first().copied();
+    let transfer_codings = headers
+        .iter()
+        .filter(|(name, _)| name == "transfer-encoding")
+        .flat_map(|(_, value)| value.split(','))
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    if !transfer_codings.is_empty() && content_length.is_some() {
+        return Err(http_error(
+            io::ErrorKind::InvalidData,
+            "ambiguous HTTP body framing",
+        ));
+    }
+    let chunked =
+        transfer_codings.len() == 1 && transfer_codings[0].eq_ignore_ascii_case("chunked");
+    if !transfer_codings.is_empty() && !chunked {
+        return Err(http_error(
+            io::ErrorKind::InvalidData,
+            "unsupported HTTP Transfer-Encoding",
+        ));
+    }
+    let no_body = matches!(status, 204 | 304) || (100..200).contains(&status);
+    if no_body {
+        return Ok((status, headers, Vec::new()));
+    }
+    if let Some(length) = content_length {
+        if length > HTTP_BODY_LIMIT {
+            return Err(http_error(
+                io::ErrorKind::InvalidData,
+                "HTTP response body exceeds the 16 MiB limit",
+            ));
+        }
+        while wire.len().saturating_sub(body_start) < length {
+            let remaining = http_remaining(deadline)?;
+            match stream {
+                InterpreterHttpStream::Plain(socket) => socket.set_read_timeout(Some(remaining))?,
+                InterpreterHttpStream::Tls(socket) => {
+                    socket.get_ref().set_read_timeout(Some(remaining))?
+                }
+            }
+            let count = stream.read(&mut chunk)?;
+            if count == 0 {
+                return Err(http_error(
+                    io::ErrorKind::UnexpectedEof,
+                    "HTTP response body ended early",
+                ));
+            }
+            wire.extend_from_slice(&chunk[..count]);
+        }
+        return Ok((
+            status,
+            headers,
+            wire[body_start..body_start + length].to_vec(),
+        ));
+    }
+    if chunked {
+        loop {
+            let encoded = &wire[body_start..];
+            if encoded.len() > HTTP_CHUNKED_WIRE_LIMIT {
+                return Err(http_error(
+                    io::ErrorKind::InvalidData,
+                    "HTTP chunk framing exceeds its safety limit",
+                ));
+            }
+            if let Some(body) = decode_chunked_body(encoded)? {
+                return Ok((status, headers, body));
+            }
+            let remaining = http_remaining(deadline)?;
+            match stream {
+                InterpreterHttpStream::Plain(socket) => socket.set_read_timeout(Some(remaining))?,
+                InterpreterHttpStream::Tls(socket) => {
+                    socket.get_ref().set_read_timeout(Some(remaining))?
+                }
+            }
+            let count = stream.read(&mut chunk)?;
+            if count == 0 {
+                return Err(http_error(
+                    io::ErrorKind::UnexpectedEof,
+                    "chunked HTTP response ended early",
+                ));
+            }
+            wire.extend_from_slice(&chunk[..count]);
+        }
+    }
+    loop {
+        if wire.len().saturating_sub(body_start) > HTTP_BODY_LIMIT {
+            return Err(http_error(
+                io::ErrorKind::InvalidData,
+                "HTTP response body exceeds the 16 MiB limit",
+            ));
+        }
+        let remaining = http_remaining(deadline)?;
+        match stream {
+            InterpreterHttpStream::Plain(socket) => socket.set_read_timeout(Some(remaining))?,
+            InterpreterHttpStream::Tls(socket) => {
+                socket.get_ref().set_read_timeout(Some(remaining))?
+            }
+        }
+        let count = stream.read(&mut chunk)?;
+        if count == 0 {
+            return Ok((status, headers, wire[body_start..].to_vec()));
+        }
+        wire.extend_from_slice(&chunk[..count]);
+    }
+}
+
+fn interpreter_http_get(source: &str, timeout: StdDuration) -> io::Result<Value> {
+    if timeout.is_zero() {
+        return Err(http_error(
+            io::ErrorKind::TimedOut,
+            "HTTP request timed out",
+        ));
+    }
+    let deadline = StdInstant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| http_error(io::ErrorKind::InvalidInput, "HTTP timeout is too large"))?;
+    let mut url = parse_http_url(source)?;
+    for redirects in 0..=HTTP_REDIRECT_LIMIT {
+        let mut stream = connect_http_stream(&url, deadline)?;
+        let request = format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: DISP/0.1\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+            http_request_target(&url),
+            http_host_header(&url)?
+        );
+        stream.write_all(request.as_bytes())?;
+        stream.flush()?;
+        let (status, headers, body) = read_http_response(&mut stream, deadline)?;
+        let location = headers
+            .iter()
+            .find(|(name, _)| name == "location")
+            .map(|(_, value)| value.as_str());
+        if let (true, Some(location)) = (matches!(status, 301 | 302 | 303 | 307 | 308), location) {
+            if redirects == HTTP_REDIRECT_LIMIT {
+                return Err(http_error(
+                    io::ErrorKind::InvalidData,
+                    "HTTP redirect limit exceeded",
+                ));
+            }
+            let next = url.join(location).map_err(|error| {
+                http_error(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid HTTP redirect URL: {error}"),
+                )
+            })?;
+            let next = parse_http_url(next.as_str())?;
+            if url.scheme() == "https" && next.scheme() != "https" {
+                return Err(http_error(
+                    io::ErrorKind::PermissionDenied,
+                    "HTTPS to HTTP redirect is rejected",
+                ));
+            }
+            url = next;
+            continue;
+        }
+        return Ok(Value::HttpResponse(RuntimeHttpResponse(Arc::new(
+            RuntimeHttpResponseData {
+                status,
+                url: url.to_string(),
+                headers,
+                body,
+            },
+        ))));
+    }
+    unreachable!()
+}
+
 fn tls_error(error: impl std::fmt::Display) -> std::io::Error {
     std::io::Error::other(format!("TLS: {error}"))
 }
@@ -672,6 +1186,7 @@ enum Value {
     SocketAddress(RuntimeSocketAddress),
     TcpStream(RuntimeTcpStream),
     TlsStream(RuntimeTlsStream),
+    HttpResponse(RuntimeHttpResponse),
     TcpListener(RuntimeTcpListener),
     UdpSocket(RuntimeUdpSocket),
     UdpDatagram(RuntimeUdpDatagram),
@@ -755,7 +1270,9 @@ enum RuntimeFault {
 }
 
 type RuntimeResult<T> = Result<T, RuntimeFault>;
-const INTERPRETER_STACK_BYTES: usize = 8 * 1024 * 1024;
+// The recursive semantic oracle retains rich source and ownership values in each
+// frame. Keep enough stack for the documented 32-call safety limit on Windows.
+const INTERPRETER_STACK_BYTES: usize = 32 * 1024 * 1024;
 
 enum Flow {
     Normal,
@@ -1260,6 +1777,9 @@ impl Interpreter {
                     ))
                 };
                 Ok(runtime_result(result))
+            }
+            FutureWork::HttpGet(url, timeout) => {
+                Ok(runtime_result(interpreter_http_get(&url, timeout)))
             }
         }
     }
@@ -2127,6 +2647,26 @@ impl Interpreter {
                     };
                     return Ok(Value::Future(RuntimeFuture::operation(
                         FutureWork::TlsConnect(stream, server_name.text, timeout),
+                    )));
+                }
+                if let Expression::FieldAccess { object, field, .. } = &callee.node
+                    && matches!(&object.node, Expression::Identifier(name) if name == "Http")
+                    && matches!(field.as_str(), "get" | "get_timeout")
+                {
+                    let Value::String(url) = self.evaluate(program, &arguments[0])? else {
+                        unreachable!("type checking validates HTTP URL")
+                    };
+                    let timeout = if field == "get_timeout" {
+                        let Value::Duration(duration) = self.evaluate(program, &arguments[1])?
+                        else {
+                            unreachable!("type checking validates HTTP request timeout")
+                        };
+                        duration
+                    } else {
+                        StdDuration::from_secs(30)
+                    };
+                    return Ok(Value::Future(RuntimeFuture::operation(
+                        FutureWork::HttpGet(url.text, timeout),
                     )));
                 }
                 if matches!(&callee.node, Expression::Identifier(name) if name == "Path") {
@@ -3220,6 +3760,71 @@ impl Interpreter {
                                 Ok(Value::Unit)
                             }
                             _ => Err(self.error("unknown TlsStream operation", expression.span)),
+                        };
+                    }
+                    if let Value::HttpResponse(response) = self.evaluate(program, object)? {
+                        let response = &response.0;
+                        return match field.as_str() {
+                            "status" => Ok(Value::UInt(response.status as u64)),
+                            "is_success" => Ok(Value::Bool((200..300).contains(&response.status))),
+                            "body" => Ok(runtime_bytes(response.body.clone())),
+                            "text" => Ok(match String::from_utf8(response.body.clone()) {
+                                Ok(text) => {
+                                    runtime_result(Ok(Value::String(RuntimeString::literal(text))))
+                                }
+                                Err(error) => runtime_result(Err(http_error(
+                                    io::ErrorKind::InvalidData,
+                                    format!("HTTP response body is not valid UTF-8: {error}"),
+                                ))),
+                            }),
+                            "header" => {
+                                let Value::String(name) = self.evaluate(program, &arguments[0])?
+                                else {
+                                    unreachable!("type checking validates HTTP header name")
+                                };
+                                if name.text.is_empty()
+                                    || !name.text.bytes().all(|byte| {
+                                        byte.is_ascii_alphanumeric()
+                                            || matches!(
+                                                byte,
+                                                b'!' | b'#'
+                                                    | b'$'
+                                                    | b'%'
+                                                    | b'&'
+                                                    | b'\''
+                                                    | b'*'
+                                                    | b'+'
+                                                    | b'-'
+                                                    | b'.'
+                                                    | b'^'
+                                                    | b'_'
+                                                    | b'`'
+                                                    | b'|'
+                                                    | b'~'
+                                            )
+                                    })
+                                {
+                                    return Err(self.error(
+                                        "HTTP header name contains invalid characters",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                let values = response
+                                    .headers
+                                    .iter()
+                                    .filter(|(header, _)| header.eq_ignore_ascii_case(&name.text))
+                                    .map(|(_, value)| value.as_str())
+                                    .collect::<Vec<_>>();
+                                Ok(option_value((!values.is_empty()).then(|| {
+                                    Value::String(RuntimeString::literal(values.join(", ")))
+                                })))
+                            }
+                            "url" => {
+                                Ok(Value::String(RuntimeString::literal(response.url.clone())))
+                            }
+                            "len" => Ok(Value::UInt(response.body.len() as u64)),
+                            "is_empty" => Ok(Value::Bool(response.body.is_empty())),
+                            _ => Err(self.error("unknown HttpResponse operation", expression.span)),
                         };
                     }
                     if let Value::UdpSocket(socket) = self.evaluate(program, object)? {
@@ -4703,6 +5308,7 @@ fn value_type_name(value: &Value) -> &str {
         Value::SocketAddress(_) => "SocketAddress",
         Value::TcpStream(_) => "TcpStream",
         Value::TlsStream(_) => "TlsStream",
+        Value::HttpResponse(_) => "HttpResponse",
         Value::TcpListener(_) => "TcpListener",
         Value::UdpSocket(_) => "UdpSocket",
         Value::UdpDatagram(_) => "UdpDatagram",
@@ -4776,6 +5382,7 @@ fn value_is_copy(program: &Program, value: &Value) -> bool {
         | Value::SocketAddress(_)
         | Value::TcpStream(_)
         | Value::TlsStream(_)
+        | Value::HttpResponse(_)
         | Value::TcpListener(_)
         | Value::UdpSocket(_)
         | Value::UdpDatagram(_)
@@ -5148,6 +5755,13 @@ fn display_value(value: Value) -> String {
         Value::SocketAddress(value) => format!("{}:{}", value.host, value.port),
         Value::TcpStream(_) => "<TcpStream>".into(),
         Value::TlsStream(_) => "<TlsStream>".into(),
+        Value::HttpResponse(value) => {
+            format!(
+                "<HttpResponse:{} {} bytes>",
+                value.0.status,
+                value.0.body.len()
+            )
+        }
         Value::TcpListener(_) => "<TcpListener>".into(),
         Value::UdpSocket(_) => "<UdpSocket>".into(),
         Value::UdpDatagram(value) => format!("<UdpDatagram:{} bytes>", value.bytes.len()),

@@ -817,6 +817,22 @@ the interpreter provides the same language-level contract through the host TLS i
 
 ---
 
+# 47.1 HTTP client
+
+`Http.get` and `Http.get_timeout` lower to lazy native futures. The native Windows implementation
+uses WinHTTP with the system proxy and trust configuration, certificate revocation checking,
+TLS 1.2 or newer, at most ten automatic redirects, and explicit 64 KiB header and 16 MiB body
+limits. HTTPS-to-HTTP redirects are rejected. Request state is reference-counted across the future
+and worker; timeout, cancellation, success, error, future drop, and response drop each have a
+single deterministic ownership path.
+
+The interpreter independently parses HTTP/1.1 with bounded headers, content-length and chunked
+framing checks, strict ambiguity rejection, the same redirect/downgrade policy, and the same body
+limit. Native/interpreter differential tests exercise successful responses, redirects, chunked
+bodies, invalid UTF-8, malformed framing, typed failures, laziness, and zero deadlines.
+
+---
+
 # 48. Cryptography Runtime Policy
 
 The runtime may expose cryptographic primitives through the standard library.

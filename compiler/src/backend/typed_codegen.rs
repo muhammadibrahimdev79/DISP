@@ -179,6 +179,8 @@ fn async_operations(
                         | "Async.resolve_timeout"
                         | "Tls.connect"
                         | "Tls.connect_timeout"
+                        | "Http.get"
+                        | "Http.get_timeout"
                         | "TcpListener.accept"
                         | "TcpListener.accept_timeout"
                         | "TcpStream.read_async"
@@ -242,6 +244,14 @@ fn async_poll_wrapper(operation: &str, result: &hir::Type, output: &mut String) 
         writeln!(
             output,
             "static bool {poll}(void *raw,void *output){{disp_tls_handshake_state *state=(disp_tls_handshake_state*)raw;if(!disp_tls_handshake_poll(state))return false;bool ok=false;disp_native_tls_stream stream={{0}};disp_native_string error={{0}};disp_tls_handshake_take(state,&ok,&stream,&error);{result_c} *result=({result_c}*)output;*result=({result_c}){{0}};if(ok){{result->tag=0;result->payload.v0.f0=stream;}}else{{result->tag=1;result->payload.v1.f0=error;}}return true;}}"
+        )
+        .unwrap();
+        return;
+    }
+    if matches!(operation, "Http.get" | "Http.get_timeout") {
+        writeln!(
+            output,
+            "static bool {poll}(void *raw,void *output){{disp_http_request_state *state=(disp_http_request_state*)raw;if(!disp_http_request_poll(state))return false;bool ok=false;disp_native_http_response response={{0}};disp_native_string error={{0}};disp_http_request_take(state,&ok,&response,&error);{result_c} *result=({result_c}*)output;*result=({result_c}){{0}};if(ok){{result->tag=0;result->payload.v0.f0=response;}}else{{result->tag=1;result->payload.v1.f0=error;}}return true;}}"
         )
         .unwrap();
         return;
@@ -553,6 +563,7 @@ pub fn supported(program: &mir::Program, ty: &hir::Type) -> bool {
         | hir::Type::SocketAddress
         | hir::Type::TcpStream
         | hir::Type::TlsStream
+        | hir::Type::HttpResponse
         | hir::Type::TcpListener
         | hir::Type::UdpSocket
         | hir::Type::UdpDatagram
@@ -610,7 +621,7 @@ pub fn supported(program: &mir::Program, ty: &hir::Type) -> bool {
         hir::Type::Generic(name) => {
             matches!(
                 name.as_str(),
-                "ConversionError" | "IoError" | "NetworkError"
+                "ConversionError" | "IoError" | "NetworkError" | "HttpError"
             )
         }
         _ => false,
@@ -1112,6 +1123,28 @@ fn terminator(
                     let poll = async_poll_name(name, result);
                     format!(
                         "({{disp_native_tcp_stream _tcp={stream};disp_tls_handshake_state *_state=disp_tls_handshake_create(_tcp.state,({server_name})->data,({server_name})->len,{has_timeout},{timeout},{},{});(disp_native_future){{.context=_state,.poll={poll},.drop=disp_tls_handshake_drop}};}})",
+                        span.start.line, span.start.column
+                    )
+                }
+                hir::CallTarget::Intrinsic(name)
+                    if matches!(name.as_str(), "Http.get" | "Http.get_timeout") =>
+                {
+                    let hir::Type::Future(result) = &destination_ty else {
+                        unreachable!("Http.get destination must be Future<T>")
+                    };
+                    let (url, _) = system_argument(program, function, &arguments[0], substitutions);
+                    let timeout = if arguments.len() == 2 {
+                        let timeout_ty =
+                            operand_ty(program, function, &arguments[1], substitutions);
+                        let timeout =
+                            operand(program, function, &arguments[1], &timeout_ty, substitutions);
+                        format!("({timeout}).nanos")
+                    } else {
+                        "30000000000ULL".into()
+                    };
+                    let poll = async_poll_name(name, result);
+                    format!(
+                        "({{disp_http_request_state *_state=disp_http_request_create(({url})->data,({url})->len,{timeout},{},{});(disp_native_future){{.context=_state,.poll={poll},.drop=disp_http_request_drop}};}})",
                         span.start.line, span.start.column
                     )
                 }
@@ -1856,6 +1889,45 @@ fn terminator(
                         }
                         "UdpDatagram.len" => format!("({datagram})->len"),
                         "UdpDatagram.is_empty" => format!("({datagram})->len==0"),
+                        _ => unreachable!(),
+                    }
+                }
+                hir::CallTarget::Intrinsic(name) if name.starts_with("HttpResponse.") => {
+                    let (response, _) =
+                        system_argument(program, function, &arguments[0], substitutions);
+                    match name.as_str() {
+                        "HttpResponse.status" => {
+                            format!("disp_http_response_status({response})")
+                        }
+                        "HttpResponse.is_success" => {
+                            format!("disp_http_response_is_success({response})")
+                        }
+                        "HttpResponse.body" => {
+                            let list_c = native_types::c_type(&destination_ty);
+                            format!(
+                                "({{{list_c} _body={{0}};disp_native_string _bytes=disp_http_response_body({response});_body.data=(uint8_t*)_bytes.data;_body.len=_bytes.len;_body.cap=_bytes.cap;_body;}})"
+                            )
+                        }
+                        "HttpResponse.text" => {
+                            let result_c = native_types::c_type(&destination_ty);
+                            format!(
+                                "({{{result_c} _r={{0}};disp_native_string _text={{0}},_error={{0}};if(disp_http_response_text({response},&_text,&_error)){{_r.tag=0;_r.payload.v0.f0=_text;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                            )
+                        }
+                        "HttpResponse.header" => {
+                            let option_c = native_types::c_type(&destination_ty);
+                            let (header, _) =
+                                system_argument(program, function, &arguments[1], substitutions);
+                            format!(
+                                "({{{option_c} _r={{0}};disp_native_string _value={{0}};if(disp_http_response_header({response},({header})->data,({header})->len,&_value,{},{})){{_r.tag=1;_r.payload.v1.f0=_value;}}_r;}})",
+                                span.start.line, span.start.column
+                            )
+                        }
+                        "HttpResponse.url" => format!("disp_http_response_url({response})"),
+                        "HttpResponse.len" => format!("disp_http_response_len({response})"),
+                        "HttpResponse.is_empty" => {
+                            format!("disp_http_response_len({response})==0")
+                        }
                         _ => unreachable!(),
                     }
                 }
@@ -3287,6 +3359,7 @@ fn to_dv(value: &str, ty: &hir::Type) -> String {
         hir::Type::SocketAddress => "dv_string(\"<SocketAddress>\",15)".into(),
         hir::Type::TcpStream => "dv_string(\"<TcpStream>\",11)".into(),
         hir::Type::TlsStream => "dv_string(\"<TlsStream>\",11)".into(),
+        hir::Type::HttpResponse => "dv_string(\"<HttpResponse>\",14)".into(),
         hir::Type::TcpListener => "dv_string(\"<TcpListener>\",13)".into(),
         hir::Type::UdpSocket => "dv_string(\"<UdpSocket>\",11)".into(),
         hir::Type::UdpDatagram => "dv_string(\"<UdpDatagram>\",13)".into(),
@@ -3526,6 +3599,7 @@ fn drop_value_depth(program: &mir::Program, value: &str, ty: &hir::Type, depth: 
         hir::Type::SocketAddress => format!("disp_socket_address_drop(&({value}));"),
         hir::Type::TcpStream => format!("disp_tcp_stream_drop(&({value}));"),
         hir::Type::TlsStream => format!("disp_tls_stream_drop(&({value}));"),
+        hir::Type::HttpResponse => format!("disp_http_response_drop(&({value}));"),
         hir::Type::TcpListener => format!("disp_tcp_listener_drop(&({value}));"),
         hir::Type::UdpSocket => format!("disp_udp_socket_drop(&({value}));"),
         hir::Type::UdpDatagram => format!("disp_udp_datagram_drop(&({value}));"),

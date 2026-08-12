@@ -45,7 +45,22 @@ pub fn build(
     let abi = abi::lower(hir, mir, &mono, target)?;
     let native_types = native_types::generate(hir, &mono, target)?;
     let generated = codegen::generate(mir, &mono, &abi, &native_types)?;
-    let networking = mir.functions.iter().any(|function| {
+    let http = mir.functions.iter().any(|function| {
+        function
+            .locals
+            .iter()
+            .any(|local| type_uses_http(&local.ty))
+            || function.blocks.iter().any(|block| {
+                matches!(
+                    &block.terminator,
+                    mir::Terminator::Call {
+                        target: hir::CallTarget::Intrinsic(name),
+                        ..
+                    } if name.starts_with("Http.") || name.starts_with("HttpResponse.")
+                )
+            })
+    });
+    let networking = http || mir.functions.iter().any(|function| {
         function
             .locals
             .iter()
@@ -56,7 +71,7 @@ pub fn build(
                     mir::Terminator::Call {
                         target: hir::CallTarget::Intrinsic(name),
                         ..
-                    } if name.starts_with("Async.connect") || name.starts_with("TcpListener.") || name.starts_with("TcpStream.") || name.starts_with("UdpSocket.") || name.starts_with("UdpDatagram.")
+                    } if name.starts_with("Async.connect") || name.starts_with("Http.") || name.starts_with("HttpResponse.") || name.starts_with("TcpListener.") || name.starts_with("TcpStream.") || name.starts_with("UdpSocket.") || name.starts_with("UdpDatagram.")
                 )
             })
     });
@@ -117,6 +132,7 @@ pub fn build(
         &executable_path,
         options.optimized,
         networking,
+        http,
         &libraries,
     )?;
     if !options.emit_c {
@@ -132,12 +148,41 @@ pub fn build(
     })
 }
 
+fn type_uses_http(ty: &hir::Type) -> bool {
+    match ty {
+        hir::Type::HttpResponse => true,
+        hir::Type::Array(inner, _)
+        | hir::Type::Slice(inner)
+        | hir::Type::List(inner)
+        | hir::Type::Set(inner)
+        | hir::Type::Thread(inner)
+        | hir::Type::Future(inner)
+        | hir::Type::Task(inner)
+        | hir::Type::Mutex(inner)
+        | hir::Type::MutexGuard(inner)
+        | hir::Type::Option(inner)
+        | hir::Type::Reference { inner, .. }
+        | hir::Type::RawPointer { inner, .. } => type_uses_http(inner),
+        hir::Type::Map(key, value) | hir::Type::Result(key, value) => {
+            type_uses_http(key) || type_uses_http(value)
+        }
+        hir::Type::Struct(_, arguments) | hir::Type::Enum(_, arguments) => {
+            arguments.iter().any(type_uses_http)
+        }
+        hir::Type::Function(arguments, result) => {
+            arguments.iter().any(type_uses_http) || type_uses_http(result)
+        }
+        _ => false,
+    }
+}
+
 fn type_uses_networking(ty: &hir::Type) -> bool {
     match ty {
         hir::Type::IpAddress
         | hir::Type::SocketAddress
         | hir::Type::TcpStream
         | hir::Type::TlsStream
+        | hir::Type::HttpResponse
         | hir::Type::TcpListener
         | hir::Type::UdpSocket
         | hir::Type::UdpDatagram => true,

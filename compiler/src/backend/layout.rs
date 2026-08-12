@@ -75,6 +75,7 @@ impl<'a> LayoutEngine<'a> {
             ]),
             hir::Type::TcpStream
             | hir::Type::TlsStream
+            | hir::Type::HttpResponse
             | hir::Type::TcpListener
             | hir::Type::UdpSocket => scalar(
                 u64::from(self.target.pointer_width) / 8,

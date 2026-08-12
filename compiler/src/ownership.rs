@@ -34,6 +34,7 @@ enum Ty {
     SocketAddress,
     TcpStream,
     TlsStream,
+    HttpResponse,
     TcpListener,
     UdpSocket,
     UdpDatagram,
@@ -1355,6 +1356,18 @@ impl<'a> Analyzer<'a> {
                     Box::new(Ty::Owned("NetworkError".into())),
                 ))));
             }
+            if matches!(&object.node, Expression::Identifier(name) if name == "Http")
+                && matches!(field.as_str(), "get" | "get_timeout")
+            {
+                self.check_expr(&arguments[0], UseMode::Read)?;
+                if field == "get_timeout" {
+                    self.check_expr(&arguments[1], UseMode::Read)?;
+                }
+                return Ok(Ty::Future(Box::new(Ty::Result(
+                    Box::new(Ty::HttpResponse),
+                    Box::new(Ty::Owned("HttpError".into())),
+                ))));
+            }
             if let Expression::Identifier(owner) = &object.node
                 && matches!(
                     owner.as_str(),
@@ -1551,6 +1564,22 @@ impl<'a> Analyzer<'a> {
                         Box::new(Ty::Owned("NetworkError".into())),
                     ))),
                     _ => Ty::Unit,
+                });
+            }
+            if matches!(self.expr_ty(object), Ok(Ty::HttpResponse)) {
+                self.check_expr(object, UseMode::Read)?;
+                for argument in arguments {
+                    self.check_expr(argument, UseMode::Read)?;
+                }
+                return Ok(match field.as_str() {
+                    "body" => Ty::List(Box::new(Ty::Copy)),
+                    "text" => Ty::Result(
+                        Box::new(Ty::Owned("String".into())),
+                        Box::new(Ty::Owned("HttpError".into())),
+                    ),
+                    "url" => Ty::Owned("String".into()),
+                    "header" => Ty::Option(Box::new(Ty::Owned("String".into()))),
+                    _ => Ty::Copy,
                 });
             }
             if matches!(self.expr_ty(object), Ok(Ty::TcpListener)) {
@@ -2725,6 +2754,7 @@ impl<'a> Analyzer<'a> {
             "SocketAddress" => Ty::SocketAddress,
             "TcpStream" => Ty::TcpStream,
             "TlsStream" => Ty::TlsStream,
+            "HttpResponse" => Ty::HttpResponse,
             "TcpListener" => Ty::TcpListener,
             "UdpSocket" => Ty::UdpSocket,
             "UdpDatagram" => Ty::UdpDatagram,
@@ -2773,6 +2803,7 @@ impl<'a> Analyzer<'a> {
             | Ty::SocketAddress
             | Ty::TcpStream
             | Ty::TlsStream
+            | Ty::HttpResponse
             | Ty::TcpListener
             | Ty::UdpSocket
             | Ty::UdpDatagram

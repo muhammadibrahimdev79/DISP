@@ -37,7 +37,9 @@ datagrams, and cancellation-safe reference-counted native state. `Tls.connect` a
 `TlsStream` using the operating-system trust store, verified host names, SNI, certificate
 revocation checks, strong cryptography, and TLS 1.2 or newer. TLS streams provide synchronous and
 lazy deadline-aware encrypted reads and writes, explicit close, and deterministic authenticated
-shutdown/drop cleanup. Cancelling an unpolled I/O future has no side effects. Once native I/O has started,
+shutdown/drop cleanup. `Http.get` adds lazy high-level HTTP/HTTPS GET requests with owned typed
+responses, safe TLS defaults, strict URL and UTF-8 validation, bounded redirects, headers and
+bodies, typed failures, and deterministic cleanup. Cancelling an unpolled I/O future has no side effects. Once native I/O has started,
 cancellation discards its result but lets the operating-system operation finish, and shutdown
 drains that work so owned resources are released deterministically. The implementation
 remains under active development and should not

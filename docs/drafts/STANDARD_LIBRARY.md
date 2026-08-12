@@ -757,13 +757,30 @@ bounded, same-direction operations are serialized, and close/drop perform determ
 
 # 36. HTTP
 
-HTTP should be an official high-level module.
+The first high-level HTTP client API is available without requiring an explicit client object:
 
 Example:
 
 ```disp
-let response = await http.get("https://example.com")?
+response = await Http.get("https://example.com")?
+print(response.status())
+print(response.header("content-type"))
+text = response.text()?
 ```
+
+`get_timeout(url, duration)` adds an explicit total deadline. Both operations are lazy and return
+`Future<Result<HttpResponse, HttpError>>`. The URL is borrowed logically and copied into the lazy
+operation, so creating a future neither consumes the caller's string nor performs network work.
+
+`HttpResponse` is an owned non-Copy value. It exposes `status`, `is_success`, `body`, `text`,
+`header`, `url`, `len`, and `is_empty`. Body and text access return owned copies so no hidden
+response lifetime reaches ordinary code. Text conversion strictly validates UTF-8, and header
+lookup is case-insensitive.
+
+The safe client limits URLs to 8192 bytes, response headers to 64 KiB, bodies to 16 MiB, and
+redirects to 10. It rejects URL credentials and fragments, HTTPS-to-HTTP redirects, invalid body
+framing, and invalid header-name tokens. HTTPS uses system trust and host-name validation, TLS 1.2
+or newer, and revocation checking. No safe option disables certificate verification.
 
 ---
 

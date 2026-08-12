@@ -1,0 +1,14 @@
+async fn fetch() -> Result<bool, HttpError> {
+    response = (await Http.get_timeout(
+        "https://example.com",
+        Duration.from_seconds(10)
+    ))?
+    print(response.status())
+    print(response.header("content-type"))
+    text = response.text()?
+    return Ok(response.is_success() && text.contains("Example Domain"))
+}
+
+async fn main() {
+    print(await fetch())
+}
