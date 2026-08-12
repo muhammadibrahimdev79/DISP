@@ -137,6 +137,7 @@ fn type_uses_networking(ty: &hir::Type) -> bool {
         hir::Type::IpAddress
         | hir::Type::SocketAddress
         | hir::Type::TcpStream
+        | hir::Type::TlsStream
         | hir::Type::TcpListener
         | hir::Type::UdpSocket
         | hir::Type::UdpDatagram => true,

@@ -796,7 +796,24 @@ Secure transport should use mature cryptographic implementations.
 
 DISP should not invent custom cryptographic protocols.
 
-TLS APIs should use secure defaults.
+The implemented client transport exposes `Tls.connect(tcp, server_name)` and
+`Tls.connect_timeout(tcp, server_name, duration)`. Both consume the owned `TcpStream` and return
+a lazy `Future<Result<TlsStream, NetworkError>>`; dropping an unpolled future therefore performs
+no network work. A successful `TlsStream` owns the secure session and cannot be copied.
+
+The ordinary API always uses the operating-system trust store, verifies the certificate chain and
+requested host name, sends SNI, checks revocation except at the trust root, requests strong
+cryptography, and accepts TLS 1.2 or newer. It does not expose switches that disable certificate or
+host-name verification. Invalid UTF-8, empty, or NUL-containing server names fail before the
+handshake starts.
+
+`read`, `write`, and their lazy deadline-aware variants operate on encrypted transport. Reads are
+bounded to 16 MiB per operation. Async writes own a copy of their input so later mutation cannot
+alter pending output. Per-direction operations are serialized, bounds and timeout failures are
+typed, and zero-duration operations fail without emitting network data. `close` sends authenticated
+TLS shutdown where possible; explicit close, cancellation, failure, and drop release both TLS and
+socket resources deterministically. The current native implementation uses Windows Schannel, while
+the interpreter provides the same language-level contract through the host TLS implementation.
 
 ---
 

@@ -3,6 +3,7 @@ use crate::ast::{
     Pattern, Program, Statement, UnaryOperator, VariantDeclaration,
 };
 use crate::diagnostics::{Diagnostic, DiagnosticKind, Span};
+use native_tls::{Protocol, TlsConnector, TlsStream as NativeTlsStream};
 use std::{
     any::Any,
     collections::HashMap,
@@ -115,6 +116,9 @@ enum FutureWork {
         Option<StdDuration>,
     ),
     Resolve(String, Option<StdDuration>),
+    TlsConnect(RuntimeTcpStream, String, Option<StdDuration>),
+    TlsRead(RuntimeTlsStream, usize, Option<StdDuration>),
+    TlsWrite(RuntimeTlsStream, Vec<u8>, Option<StdDuration>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +132,9 @@ struct RuntimeIpAddress(IpAddr);
 
 #[derive(Clone)]
 struct RuntimeTcpStream(Arc<StdMutex<RuntimeTcpStreamState>>);
+
+#[derive(Clone)]
+struct RuntimeTlsStream(Arc<StdMutex<Option<NativeTlsStream<StdTcpStream>>>>);
 
 struct RuntimeTcpStreamState {
     socket: Option<StdTcpStream>,
@@ -167,6 +174,21 @@ impl std::fmt::Debug for RuntimeTcpStream {
 }
 
 impl PartialEq for RuntimeTcpStream {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl std::fmt::Debug for RuntimeTlsStream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("TlsStream")
+            .field(&Arc::as_ptr(&self.0))
+            .finish()
+    }
+}
+
+impl PartialEq for RuntimeTlsStream {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
@@ -592,6 +614,20 @@ fn runtime_result(value: Result<Value, std::io::Error>) -> Value {
     }
 }
 
+fn runtime_bytes(bytes: Vec<u8>) -> Value {
+    Value::List {
+        capacity: bytes.len(),
+        values: bytes
+            .into_iter()
+            .map(|byte| Value::Unsigned(byte as u128, 8))
+            .collect(),
+    }
+}
+
+fn tls_error(error: impl std::fmt::Display) -> std::io::Error {
+    std::io::Error::other(format!("TLS: {error}"))
+}
+
 fn runtime_path(value: Value) -> Option<PathBuf> {
     match value {
         Value::Path(path) => Some(path),
@@ -635,6 +671,7 @@ enum Value {
     IpAddress(RuntimeIpAddress),
     SocketAddress(RuntimeSocketAddress),
     TcpStream(RuntimeTcpStream),
+    TlsStream(RuntimeTlsStream),
     TcpListener(RuntimeTcpListener),
     UdpSocket(RuntimeUdpSocket),
     UdpDatagram(RuntimeUdpDatagram),
@@ -1137,6 +1174,92 @@ impl Interpreter {
                     })
                 });
                 Ok(runtime_result(resolved))
+            }
+            FutureWork::TlsConnect(stream, server_name, timeout) => {
+                if server_name.is_empty() || server_name.contains('\0') {
+                    return Ok(runtime_result(Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "TLS server name must not be empty or contain NUL",
+                    ))));
+                }
+                if timeout.is_some_and(|duration| duration.is_zero()) {
+                    return Ok(runtime_result(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "TLS handshake timed out",
+                    ))));
+                }
+                let socket = {
+                    let mut state = stream
+                        .0
+                        .lock()
+                        .map_err(|_| self.error("TCP stream state is poisoned", span))?;
+                    state.socket.take()
+                };
+                let Some(socket) = socket else {
+                    return Ok(runtime_result(Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "TCP stream is closed",
+                    ))));
+                };
+                let result = (|| {
+                    socket.set_nonblocking(false)?;
+                    socket.set_read_timeout(timeout)?;
+                    socket.set_write_timeout(timeout)?;
+                    let mut builder = TlsConnector::builder();
+                    builder.min_protocol_version(Some(Protocol::Tlsv12));
+                    let connector = builder.build().map_err(tls_error)?;
+                    let secure = connector.connect(&server_name, socket).map_err(tls_error)?;
+                    secure.get_ref().set_read_timeout(None)?;
+                    secure.get_ref().set_write_timeout(None)?;
+                    Ok(Value::TlsStream(RuntimeTlsStream(Arc::new(StdMutex::new(
+                        Some(secure),
+                    )))))
+                })();
+                Ok(runtime_result(result))
+            }
+            FutureWork::TlsRead(stream, limit, timeout) => {
+                let mut guard = stream
+                    .0
+                    .lock()
+                    .map_err(|_| self.error("TLS stream state is poisoned", span))?;
+                let result = if let Some(stream) = guard.as_mut() {
+                    stream.get_ref().set_read_timeout(timeout).and_then(|()| {
+                        let mut bytes = vec![0; limit];
+                        let result = stream.read(&mut bytes).map(|count| {
+                            bytes.truncate(count);
+                            runtime_bytes(bytes)
+                        });
+                        let _ = stream.get_ref().set_read_timeout(None);
+                        result
+                    })
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "TLS stream is closed",
+                    ))
+                };
+                Ok(runtime_result(result))
+            }
+            FutureWork::TlsWrite(stream, bytes, timeout) => {
+                let mut guard = stream
+                    .0
+                    .lock()
+                    .map_err(|_| self.error("TLS stream state is poisoned", span))?;
+                let result = if let Some(stream) = guard.as_mut() {
+                    stream.get_ref().set_write_timeout(timeout).and_then(|()| {
+                        let result = stream
+                            .write_all(&bytes)
+                            .map(|()| Value::UInt(bytes.len() as u64));
+                        let _ = stream.get_ref().set_write_timeout(None);
+                        result
+                    })
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "TLS stream is closed",
+                    ))
+                };
+                Ok(runtime_result(result))
             }
         }
     }
@@ -1982,6 +2105,29 @@ impl Interpreter {
                         }
                     });
                     return Ok(runtime_result(result));
+                }
+                if let Expression::FieldAccess { object, field, .. } = &callee.node
+                    && matches!(&object.node, Expression::Identifier(name) if name == "Tls")
+                    && matches!(field.as_str(), "connect" | "connect_timeout")
+                {
+                    let Value::TcpStream(stream) = self.consume(program, &arguments[0])? else {
+                        unreachable!("type checking validates TLS source stream")
+                    };
+                    let Value::String(server_name) = self.evaluate(program, &arguments[1])? else {
+                        unreachable!("type checking validates TLS server name")
+                    };
+                    let timeout = if field == "connect_timeout" {
+                        let Value::Duration(duration) = self.evaluate(program, &arguments[2])?
+                        else {
+                            unreachable!("type checking validates TLS handshake timeout")
+                        };
+                        Some(duration)
+                    } else {
+                        None
+                    };
+                    return Ok(Value::Future(RuntimeFuture::operation(
+                        FutureWork::TlsConnect(stream, server_name.text, timeout),
+                    )));
                 }
                 if matches!(&callee.node, Expression::Identifier(name) if name == "Path") {
                     let value = self.evaluate(program, &arguments[0])?;
@@ -2976,6 +3122,104 @@ impl Interpreter {
                                 Ok(runtime_result(result))
                             }
                             _ => Err(self.error("unknown TcpStream operation", expression.span)),
+                        };
+                    }
+                    if let Value::TlsStream(stream) = self.evaluate(program, object)? {
+                        return match field.as_str() {
+                            "read" | "read_async" | "read_async_timeout" => {
+                                let limit = self.index_value(program, &arguments[0])?;
+                                if limit > 16 * 1024 * 1024 {
+                                    return Err(self.error(
+                                        "TLS read limit exceeds the 16 MiB safety limit",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                if field != "read" {
+                                    let timeout = if field == "read_async_timeout" {
+                                        let Value::Duration(duration) =
+                                            self.evaluate(program, &arguments[1])?
+                                        else {
+                                            unreachable!("type checking validates TLS timeout")
+                                        };
+                                        Some(duration)
+                                    } else {
+                                        None
+                                    };
+                                    return Ok(Value::Future(RuntimeFuture::operation(
+                                        FutureWork::TlsRead(stream, limit, timeout),
+                                    )));
+                                }
+                                let mut guard = stream.0.lock().map_err(|_| {
+                                    self.error("TLS stream state is poisoned", object.span)
+                                })?;
+                                let result = if let Some(stream) = guard.as_mut() {
+                                    let mut bytes = vec![0; limit];
+                                    stream.read(&mut bytes).map(|count| {
+                                        bytes.truncate(count);
+                                        runtime_bytes(bytes)
+                                    })
+                                } else {
+                                    Err(std::io::Error::new(
+                                        std::io::ErrorKind::NotConnected,
+                                        "TLS stream is closed",
+                                    ))
+                                };
+                                Ok(runtime_result(result))
+                            }
+                            "write" | "write_async" | "write_async_timeout" => {
+                                let value = self.evaluate(program, &arguments[0])?;
+                                let values = match value {
+                                    Value::List { values, .. } | Value::Slice(values) => values,
+                                    _ => unreachable!("type checking validates TLS bytes"),
+                                };
+                                let bytes = values
+                                    .into_iter()
+                                    .map(|value| match value {
+                                        Value::Unsigned(byte, 8) => byte as u8,
+                                        _ => unreachable!("type checking validates u8 elements"),
+                                    })
+                                    .collect::<Vec<_>>();
+                                if field != "write" {
+                                    let timeout = if field == "write_async_timeout" {
+                                        let Value::Duration(duration) =
+                                            self.evaluate(program, &arguments[1])?
+                                        else {
+                                            unreachable!("type checking validates TLS timeout")
+                                        };
+                                        Some(duration)
+                                    } else {
+                                        None
+                                    };
+                                    return Ok(Value::Future(RuntimeFuture::operation(
+                                        FutureWork::TlsWrite(stream, bytes, timeout),
+                                    )));
+                                }
+                                let mut guard = stream.0.lock().map_err(|_| {
+                                    self.error("TLS stream state is poisoned", object.span)
+                                })?;
+                                let result = if let Some(stream) = guard.as_mut() {
+                                    stream
+                                        .write_all(&bytes)
+                                        .map(|()| Value::UInt(bytes.len() as u64))
+                                } else {
+                                    Err(std::io::Error::new(
+                                        std::io::ErrorKind::NotConnected,
+                                        "TLS stream is closed",
+                                    ))
+                                };
+                                Ok(runtime_result(result))
+                            }
+                            "close" => {
+                                let mut guard = stream.0.lock().map_err(|_| {
+                                    self.error("TLS stream state is poisoned", object.span)
+                                })?;
+                                if let Some(mut secure) = guard.take() {
+                                    let _ = secure.shutdown();
+                                    let _ = secure.get_ref().shutdown(Shutdown::Both);
+                                }
+                                Ok(Value::Unit)
+                            }
+                            _ => Err(self.error("unknown TlsStream operation", expression.span)),
                         };
                     }
                     if let Value::UdpSocket(socket) = self.evaluate(program, object)? {
@@ -4458,6 +4702,7 @@ fn value_type_name(value: &Value) -> &str {
         Value::IpAddress(_) => "IpAddress",
         Value::SocketAddress(_) => "SocketAddress",
         Value::TcpStream(_) => "TcpStream",
+        Value::TlsStream(_) => "TlsStream",
         Value::TcpListener(_) => "TcpListener",
         Value::UdpSocket(_) => "UdpSocket",
         Value::UdpDatagram(_) => "UdpDatagram",
@@ -4530,6 +4775,7 @@ fn value_is_copy(program: &Program, value: &Value) -> bool {
         | Value::Path(_)
         | Value::SocketAddress(_)
         | Value::TcpStream(_)
+        | Value::TlsStream(_)
         | Value::TcpListener(_)
         | Value::UdpSocket(_)
         | Value::UdpDatagram(_)
@@ -4901,6 +5147,7 @@ fn display_value(value: Value) -> String {
         Value::IpAddress(value) => value.0.to_string(),
         Value::SocketAddress(value) => format!("{}:{}", value.host, value.port),
         Value::TcpStream(_) => "<TcpStream>".into(),
+        Value::TlsStream(_) => "<TlsStream>".into(),
         Value::TcpListener(_) => "<TcpListener>".into(),
         Value::UdpSocket(_) => "<UdpSocket>".into(),
         Value::UdpDatagram(value) => format!("<UdpDatagram:{} bytes>", value.bytes.len()),

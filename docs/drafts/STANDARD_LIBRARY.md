@@ -734,6 +734,27 @@ invalidates pending operations through retained reference-counted state without 
 
 ---
 
+## Secure TLS transport
+
+TLS upgrades an owned TCP stream without exposing certificate-management complexity in ordinary
+code:
+
+```disp
+tcp = await Async.connect(SocketAddress("example.com", 443))?
+tls = await Tls.connect(tcp, "example.com")?
+tls.write("GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n".bytes())?
+reply = tls.read(16384)?
+tls.close()?
+```
+
+`connect_timeout` adds an explicit deadline. Connections verify the system trust chain and host
+name, send SNI, check revocation, and require TLS 1.2 or newer. The safe API has no option to accept
+an invalid certificate. `TlsStream` is an owned non-Copy resource with synchronous and lazy
+deadline-aware reads and writes; asynchronous writes snapshot their input. Plaintext reads are
+bounded, same-direction operations are serialized, and close/drop perform deterministic cleanup.
+
+---
+
 # 36. HTTP
 
 HTTP should be an official high-level module.

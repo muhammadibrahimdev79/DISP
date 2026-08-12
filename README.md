@@ -32,7 +32,12 @@ cannot change pending network output. `TcpListener.bind` provides owned server s
 `accept` futures, optional deadlines, local-port discovery, and cancellation-safe listener
 cleanup. `UdpSocket` adds owned datagram sockets with synchronous or lazy deadline-aware
 send/receive operations, sender-address metadata, explicit truncation errors, zero-length
-datagrams, and cancellation-safe reference-counted native state. Cancelling an unpolled I/O future has no side effects. Once native I/O has started,
+datagrams, and cancellation-safe reference-counted native state. `Tls.connect` and
+`Tls.connect_timeout` consume a `TcpStream` into a lazy handshake future and produce an owned
+`TlsStream` using the operating-system trust store, verified host names, SNI, certificate
+revocation checks, strong cryptography, and TLS 1.2 or newer. TLS streams provide synchronous and
+lazy deadline-aware encrypted reads and writes, explicit close, and deterministic authenticated
+shutdown/drop cleanup. Cancelling an unpolled I/O future has no side effects. Once native I/O has started,
 cancellation discards its result but lets the operating-system operation finish, and shutdown
 drains that work so owned resources are released deterministically. The implementation
 remains under active development and should not

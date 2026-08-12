@@ -40,6 +40,8 @@ pub fn compile_and_link(
         link.push("-pthread".into());
     } else if networking {
         link.push("-lws2_32".into());
+        link.push("-lsecur32".into());
+        link.push("-lcrypt32".into());
     }
     for library in libraries {
         link.push(format!("-l{library}"));

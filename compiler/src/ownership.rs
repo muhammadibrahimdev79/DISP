@@ -33,6 +33,7 @@ enum Ty {
     IpAddress,
     SocketAddress,
     TcpStream,
+    TlsStream,
     TcpListener,
     UdpSocket,
     UdpDatagram,
@@ -1341,6 +1342,19 @@ impl<'a> Analyzer<'a> {
                     Box::new(Ty::Owned("NetworkError".into())),
                 ));
             }
+            if matches!(&object.node, Expression::Identifier(name) if name == "Tls")
+                && matches!(field.as_str(), "connect" | "connect_timeout")
+            {
+                self.check_expr(&arguments[0], UseMode::Consume)?;
+                self.check_expr(&arguments[1], UseMode::Read)?;
+                if field == "connect_timeout" {
+                    self.check_expr(&arguments[2], UseMode::Read)?;
+                }
+                return Ok(Ty::Future(Box::new(Ty::Result(
+                    Box::new(Ty::TlsStream),
+                    Box::new(Ty::Owned("NetworkError".into())),
+                ))));
+            }
             if let Expression::Identifier(owner) = &object.node
                 && matches!(
                     owner.as_str(),
@@ -1509,6 +1523,33 @@ impl<'a> Analyzer<'a> {
                         Box::new(Ty::Unit),
                         Box::new(Ty::Owned("NetworkError".into())),
                     ),
+                    _ => Ty::Unit,
+                });
+            }
+            if matches!(self.expr_ty(object), Ok(Ty::TlsStream)) {
+                let place = self.place(object)?;
+                self.check_borrow(&place, true, object.span)?;
+                self.use_place(&place, UseMode::Read, object.span)?;
+                for argument in arguments {
+                    self.check_expr(argument, UseMode::Read)?;
+                }
+                return Ok(match field.as_str() {
+                    "read" => Ty::Result(
+                        Box::new(Ty::List(Box::new(Ty::Copy))),
+                        Box::new(Ty::Owned("NetworkError".into())),
+                    ),
+                    "read_async" | "read_async_timeout" => Ty::Future(Box::new(Ty::Result(
+                        Box::new(Ty::List(Box::new(Ty::Copy))),
+                        Box::new(Ty::Owned("NetworkError".into())),
+                    ))),
+                    "write" => Ty::Result(
+                        Box::new(Ty::Copy),
+                        Box::new(Ty::Owned("NetworkError".into())),
+                    ),
+                    "write_async" | "write_async_timeout" => Ty::Future(Box::new(Ty::Result(
+                        Box::new(Ty::Copy),
+                        Box::new(Ty::Owned("NetworkError".into())),
+                    ))),
                     _ => Ty::Unit,
                 });
             }
@@ -2683,6 +2724,7 @@ impl<'a> Analyzer<'a> {
             "IpAddress" => Ty::IpAddress,
             "SocketAddress" => Ty::SocketAddress,
             "TcpStream" => Ty::TcpStream,
+            "TlsStream" => Ty::TlsStream,
             "TcpListener" => Ty::TcpListener,
             "UdpSocket" => Ty::UdpSocket,
             "UdpDatagram" => Ty::UdpDatagram,
@@ -2730,6 +2772,7 @@ impl<'a> Analyzer<'a> {
             Ty::Path
             | Ty::SocketAddress
             | Ty::TcpStream
+            | Ty::TlsStream
             | Ty::TcpListener
             | Ty::UdpSocket
             | Ty::UdpDatagram

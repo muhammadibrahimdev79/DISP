@@ -20,6 +20,8 @@ pub fn generate(
          typedef struct { char *host; size_t len; uint16_t port; } disp_native_socket_address;\n\
          typedef struct disp_tcp_state disp_tcp_state;\n\
          typedef struct { disp_tcp_state *state; } disp_native_tcp_stream;\n\
+         typedef struct disp_tls_state disp_tls_state;\n\
+         typedef struct { disp_tls_state *state; } disp_native_tls_stream;\n\
          typedef struct disp_tcp_listener_state disp_tcp_listener_state;\n\
          typedef struct { disp_tcp_listener_state *state; } disp_native_tcp_listener;\n\
          typedef struct disp_udp_socket_state disp_udp_socket_state;\n\
@@ -290,6 +292,7 @@ fn dependencies(program: &hir::Program, ty: &hir::Type) -> Vec<hir::Type> {
         hir::Type::IpAddress
         | hir::Type::SocketAddress
         | hir::Type::TcpStream
+        | hir::Type::TlsStream
         | hir::Type::TcpListener
         | hir::Type::UdpSocket
         | hir::Type::UdpDatagram => vec![],
@@ -329,6 +332,7 @@ pub fn c_type(ty: &hir::Type) -> String {
         hir::Type::IpAddress => "disp_native_ip_address".into(),
         hir::Type::SocketAddress => "disp_native_socket_address".into(),
         hir::Type::TcpStream => "disp_native_tcp_stream".into(),
+        hir::Type::TlsStream => "disp_native_tls_stream".into(),
         hir::Type::TcpListener => "disp_native_tcp_listener".into(),
         hir::Type::UdpSocket => "disp_native_udp_socket".into(),
         hir::Type::UdpDatagram => "disp_native_udp_datagram".into(),

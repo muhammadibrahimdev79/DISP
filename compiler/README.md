@@ -22,6 +22,7 @@ Implemented executable subset:
 - lazy deadline-aware TCP connect/read/write futures, serialized per-direction stream operations, EOF and half-close semantics, typed `NetworkError`, explicit close, and reference-counted deterministic native socket cleanup
 - owned `TcpListener` bind/local-port operations and lazy nonblocking `accept`/`accept_timeout` futures with responsive cancellation and reference-counted native listener state
 - owned `UdpSocket` datagram I/O with local-port discovery, sender-address metadata, synchronous and lazy deadline-aware operations, explicit truncation errors, serialized directions, and cancellation-safe native cleanup
+- owned `TlsStream` transport with lazy consuming handshakes, system trust and host-name verification, SNI, TLS 1.2 minimum, certificate revocation checks, bounded plaintext reads, deadline-aware encrypted I/O, and deterministic close/drop cleanup
 - explicitly shared `Mutex<T>`, owning lock guards, and checked sequentially consistent `AtomicInt`
 - defined `extern C` declarations, fixed C ABI aliases, checked `CString`, borrowed `CStr`, and native library linking
 - owned aligned `Memory`, bounds-checked byte operations, raw pointer views, and explicit unsafe pointer arithmetic/read/write

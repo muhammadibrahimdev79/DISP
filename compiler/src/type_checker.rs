@@ -25,6 +25,7 @@ pub enum Type {
     IpAddress,
     SocketAddress,
     TcpStream,
+    TlsStream,
     TcpListener,
     UdpSocket,
     UdpDatagram,
@@ -1819,6 +1820,47 @@ impl TypeChecker {
                     ));
                 }
                 if let Expression::FieldAccess { object, field, .. } = &callee.node
+                    && matches!(&object.node, Expression::Identifier(name) if name == "Tls")
+                    && matches!(field.as_str(), "connect" | "connect_timeout")
+                {
+                    let expected = if field == "connect" { 2 } else { 3 };
+                    if arguments.len() != expected {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            format!("`Tls.{field}` expects {expected} arguments"),
+                            expression.span,
+                        ));
+                    }
+                    let stream = self.check_expression(&arguments[0])?;
+                    self.require_same(
+                        &Type::TcpStream,
+                        &stream,
+                        arguments[0].span,
+                        "TLS source stream",
+                    )?;
+                    let server_name = self.check_expression(&arguments[1])?;
+                    if !matches!(server_name, Type::String | Type::Str) {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            "TLS server name must be String or str",
+                            arguments[1].span,
+                        ));
+                    }
+                    if field == "connect_timeout" {
+                        let timeout = self.check_expression(&arguments[2])?;
+                        self.require_same(
+                            &Type::Duration,
+                            &timeout,
+                            arguments[2].span,
+                            "TLS handshake timeout",
+                        )?;
+                    }
+                    return Ok(Type::Future(Box::new(Type::Result(
+                        Box::new(Type::TlsStream),
+                        Box::new(Type::NetworkError),
+                    ))));
+                }
+                if let Expression::FieldAccess { object, field, .. } = &callee.node
                     && matches!(&object.node, Expression::Identifier(name) if name == "UdpSocket")
                     && field == "bind"
                     && arguments.len() == 1
@@ -2805,6 +2847,90 @@ impl TypeChecker {
                             _ => {}
                         }
                     }
+                    if matches!(receiver, Type::TlsStream) {
+                        let read_result = || {
+                            Type::Result(
+                                Box::new(Type::List(Box::new(Type::Unsigned(8)))),
+                                Box::new(Type::NetworkError),
+                            )
+                        };
+                        let write_result =
+                            || Type::Result(Box::new(Type::UInt), Box::new(Type::NetworkError));
+                        match field.as_str() {
+                            "read" | "read_async" if arguments.len() == 1 => {
+                                let limit = self.check_expression(&arguments[0])?;
+                                if !is_integer(&limit) {
+                                    return Err(Diagnostic::new(
+                                        DiagnosticKind::Type,
+                                        "TLS read limit must be an integer",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                let result = read_result();
+                                return Ok(if field == "read_async" {
+                                    Type::Future(Box::new(result))
+                                } else {
+                                    result
+                                });
+                            }
+                            "read_async_timeout" if arguments.len() == 2 => {
+                                let limit = self.check_expression(&arguments[0])?;
+                                if !is_integer(&limit) {
+                                    return Err(Diagnostic::new(
+                                        DiagnosticKind::Type,
+                                        "TLS read limit must be an integer",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                let timeout = self.check_expression(&arguments[1])?;
+                                self.require_same(
+                                    &Type::Duration,
+                                    &timeout,
+                                    arguments[1].span,
+                                    "TLS read timeout",
+                                )?;
+                                return Ok(Type::Future(Box::new(read_result())));
+                            }
+                            "write" | "write_async" if arguments.len() == 1 => {
+                                let bytes = self.check_expression(&arguments[0])?;
+                                if !matches!(bytes, Type::List(ref element) | Type::Slice(ref element) if matches!(**element, Type::Unsigned(8)))
+                                {
+                                    return Err(Diagnostic::new(
+                                        DiagnosticKind::Type,
+                                        "TLS write expects List<u8> or a u8 slice",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                let result = write_result();
+                                return Ok(if field == "write_async" {
+                                    Type::Future(Box::new(result))
+                                } else {
+                                    result
+                                });
+                            }
+                            "write_async_timeout" if arguments.len() == 2 => {
+                                let bytes = self.check_expression(&arguments[0])?;
+                                if !matches!(bytes, Type::List(ref element) | Type::Slice(ref element) if matches!(**element, Type::Unsigned(8)))
+                                {
+                                    return Err(Diagnostic::new(
+                                        DiagnosticKind::Type,
+                                        "TLS write expects List<u8> or a u8 slice",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                let timeout = self.check_expression(&arguments[1])?;
+                                self.require_same(
+                                    &Type::Duration,
+                                    &timeout,
+                                    arguments[1].span,
+                                    "TLS write timeout",
+                                )?;
+                                return Ok(Type::Future(Box::new(write_result())));
+                            }
+                            "close" if arguments.is_empty() => return Ok(Type::Unit),
+                            _ => {}
+                        }
+                    }
                     if matches!(receiver, Type::TcpListener) {
                         let accepted = || {
                             Type::Future(Box::new(Type::Result(
@@ -3678,6 +3804,7 @@ impl TypeChecker {
             "IpAddress" if ty.arguments.is_empty() => Type::IpAddress,
             "SocketAddress" if ty.arguments.is_empty() => Type::SocketAddress,
             "TcpStream" if ty.arguments.is_empty() => Type::TcpStream,
+            "TlsStream" if ty.arguments.is_empty() => Type::TlsStream,
             "TcpListener" if ty.arguments.is_empty() => Type::TcpListener,
             "UdpSocket" if ty.arguments.is_empty() => Type::UdpSocket,
             "UdpDatagram" if ty.arguments.is_empty() => Type::UdpDatagram,
@@ -4020,6 +4147,7 @@ impl TypeChecker {
             Type::IpAddress => "IpAddress".into(),
             Type::SocketAddress => "SocketAddress".into(),
             Type::TcpStream => "TcpStream".into(),
+            Type::TlsStream => "TlsStream".into(),
             Type::TcpListener => "TcpListener".into(),
             Type::UdpSocket => "UdpSocket".into(),
             Type::UdpDatagram => "UdpDatagram".into(),

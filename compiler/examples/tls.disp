@@ -1,0 +1,36 @@
+async fn secure_request() -> Result<bool, NetworkError> {
+    connected = await Async.connect_timeout(
+        SocketAddress("example.com", 443),
+        Duration.from_seconds(5)
+    )
+    tcp = connected?
+    upgraded = await Tls.connect_timeout(
+        tcp,
+        "example.com",
+        Duration.from_seconds(5)
+    )
+    var secure = upgraded?
+    request = List.of(
+        u8(71), u8(69), u8(84), u8(32), u8(47), u8(32),
+        u8(72), u8(84), u8(84), u8(80), u8(47), u8(49), u8(46), u8(48),
+        u8(13), u8(10),
+        u8(72), u8(111), u8(115), u8(116), u8(58), u8(32),
+        u8(101), u8(120), u8(97), u8(109), u8(112), u8(108), u8(101),
+        u8(46), u8(99), u8(111), u8(109),
+        u8(13), u8(10),
+        u8(67), u8(111), u8(110), u8(110), u8(101), u8(99), u8(116),
+        u8(105), u8(111), u8(110), u8(58), u8(32),
+        u8(99), u8(108), u8(111), u8(115), u8(101),
+        u8(13), u8(10), u8(13), u8(10)
+    )
+    written = await secure.write_async_timeout(request, Duration.from_seconds(5))
+    written?
+    response = await secure.read_async_timeout(4096, Duration.from_seconds(5))
+    bytes = response?
+    secure.close()
+    return Ok(bytes.is_empty() == false)
+}
+
+async fn main() {
+    print(await secure_request())
+}

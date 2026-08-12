@@ -489,6 +489,7 @@ fn collect_type(
         hir::Type::IpAddress
         | hir::Type::SocketAddress
         | hir::Type::TcpStream
+        | hir::Type::TlsStream
         | hir::Type::TcpListener
         | hir::Type::UdpSocket
         | hir::Type::UdpDatagram => {}
@@ -839,6 +840,7 @@ pub fn type_code(ty: &hir::Type) -> String {
         hir::Type::IpAddress => "ni".into(),
         hir::Type::SocketAddress => "na".into(),
         hir::Type::TcpStream => "nt".into(),
+        hir::Type::TlsStream => "nx".into(),
         hir::Type::TcpListener => "nl".into(),
         hir::Type::UdpSocket => "nu".into(),
         hir::Type::UdpDatagram => "nd".into(),
