@@ -1,0 +1,12 @@
+async fn submit() -> Result<bool, HttpError> {
+    quick = (await Http.post("https://example.com/", "short request"))?
+    request = Http.request("POST", "https://example.com/")?
+    request = request.header("X-DISP-Client", "safe")?
+    request = request.text("hello from DISP")?
+    response = (await request.send_timeout(Duration.from_seconds(10)))?
+    return Ok(quick.status() > 0 && response.status() > 0)
+}
+
+async fn main() {
+    print(await submit())
+}

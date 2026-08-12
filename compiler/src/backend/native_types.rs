@@ -22,6 +22,8 @@ pub fn generate(
          typedef struct { disp_tcp_state *state; } disp_native_tcp_stream;\n\
          typedef struct disp_tls_state disp_tls_state;\n\
          typedef struct { disp_tls_state *state; } disp_native_tls_stream;\n\
+         typedef struct disp_http_builder_state disp_http_builder_state;\n\
+         typedef struct { disp_http_builder_state *state; } disp_native_http_request;\n\
          typedef struct disp_http_response_state disp_http_response_state;\n\
          typedef struct { disp_http_response_state *state; } disp_native_http_response;\n\
          typedef struct disp_tcp_listener_state disp_tcp_listener_state;\n\
@@ -295,6 +297,7 @@ fn dependencies(program: &hir::Program, ty: &hir::Type) -> Vec<hir::Type> {
         | hir::Type::SocketAddress
         | hir::Type::TcpStream
         | hir::Type::TlsStream
+        | hir::Type::HttpRequest
         | hir::Type::HttpResponse
         | hir::Type::TcpListener
         | hir::Type::UdpSocket
@@ -336,6 +339,7 @@ pub fn c_type(ty: &hir::Type) -> String {
         hir::Type::SocketAddress => "disp_native_socket_address".into(),
         hir::Type::TcpStream => "disp_native_tcp_stream".into(),
         hir::Type::TlsStream => "disp_native_tls_stream".into(),
+        hir::Type::HttpRequest => "disp_native_http_request".into(),
         hir::Type::HttpResponse => "disp_native_http_response".into(),
         hir::Type::TcpListener => "disp_native_tcp_listener".into(),
         hir::Type::UdpSocket => "disp_native_udp_socket".into(),

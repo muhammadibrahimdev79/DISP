@@ -120,7 +120,7 @@ enum FutureWork {
     TlsConnect(RuntimeTcpStream, String, Option<StdDuration>),
     TlsRead(RuntimeTlsStream, usize, Option<StdDuration>),
     TlsWrite(RuntimeTlsStream, Vec<u8>, Option<StdDuration>),
-    HttpGet(String, StdDuration),
+    HttpRequest(RuntimeHttpRequest, StdDuration),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +140,14 @@ struct RuntimeTlsStream(Arc<StdMutex<Option<NativeTlsStream<StdTcpStream>>>>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeHttpResponse(Arc<RuntimeHttpResponseData>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeHttpRequest {
+    method: String,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct RuntimeHttpResponseData {
@@ -637,6 +645,20 @@ fn runtime_bytes(bytes: Vec<u8>) -> Value {
     }
 }
 
+fn runtime_http_body(value: Value) -> Option<Vec<u8>> {
+    match value {
+        Value::String(text) => Some(text.text.into_bytes()),
+        Value::List { values, .. } | Value::Slice(values) => values
+            .into_iter()
+            .map(|value| match value {
+                Value::Unsigned(byte, 8) => Some(byte as u8),
+                _ => None,
+            })
+            .collect(),
+        _ => None,
+    }
+}
+
 const HTTP_HEADER_LIMIT: usize = 64 * 1024;
 const HTTP_BODY_LIMIT: usize = 16 * 1024 * 1024;
 const HTTP_CHUNKED_WIRE_LIMIT: usize = HTTP_BODY_LIMIT + 1024 * 1024;
@@ -648,8 +670,9 @@ enum InterpreterHttpStream {
 }
 
 type HttpHeaders = Vec<(String, String)>;
-type ParsedHttpHeaders = (u16, HttpHeaders, usize);
-type ParsedHttpResponse = (u16, HttpHeaders, Vec<u8>);
+type ParsedHttpHeaders = (u16, HttpHeaders, usize, bool);
+type ParsedHttpResponse = (u16, HttpHeaders, Vec<u8>, bool);
+type InterpreterHttpPool = HashMap<String, Vec<InterpreterHttpStream>>;
 
 impl Read for InterpreterHttpStream {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
@@ -799,6 +822,39 @@ fn http_host_header(url: &Url) -> io::Result<String> {
     })
 }
 
+fn http_origin(url: &Url) -> io::Result<String> {
+    Ok(format!("{}://{}", url.scheme(), http_host_header(url)?))
+}
+
+fn http_stream_timeout(
+    stream: &InterpreterHttpStream,
+    timeout: StdDuration,
+) -> io::Result<()> {
+    match stream {
+        InterpreterHttpStream::Plain(socket) => {
+            socket.set_read_timeout(Some(timeout))?;
+            socket.set_write_timeout(Some(timeout))
+        }
+        InterpreterHttpStream::Tls(socket) => {
+            socket.get_ref().set_read_timeout(Some(timeout))?;
+            socket.get_ref().set_write_timeout(Some(timeout))
+        }
+    }
+}
+
+fn http_pool_return(
+    pool: &mut InterpreterHttpPool,
+    origin: String,
+    stream: InterpreterHttpStream,
+) {
+    if pool.len() < 32 || pool.contains_key(&origin) {
+        let streams = pool.entry(origin).or_default();
+        if streams.len() < 2 {
+            streams.push(stream);
+        }
+    }
+}
+
 fn find_crlf(bytes: &[u8], start: usize) -> Option<usize> {
     bytes
         .get(start..)?
@@ -807,7 +863,7 @@ fn find_crlf(bytes: &[u8], start: usize) -> Option<usize> {
         .map(|offset| start + offset)
 }
 
-fn decode_chunked_body(bytes: &[u8]) -> io::Result<Option<Vec<u8>>> {
+fn decode_chunked_body(bytes: &[u8]) -> io::Result<Option<(Vec<u8>, usize)>> {
     let mut position = 0;
     let mut decoded = Vec::new();
     loop {
@@ -844,7 +900,7 @@ fn decode_chunked_body(bytes: &[u8]) -> io::Result<Option<Vec<u8>>> {
                     return Ok(None);
                 };
                 if trailer_end == position {
-                    return Ok(Some(decoded));
+                    return Ok(Some((decoded, trailer_end + 2)));
                 }
                 if trailer_end - position > 8192 {
                     return Err(http_error(
@@ -914,16 +970,17 @@ fn parse_http_headers(bytes: &[u8]) -> io::Result<ParsedHttpHeaders> {
         })?;
         headers.push((header.name.to_ascii_lowercase(), value.trim().to_owned()));
     }
-    Ok((status, headers, consumed))
+    Ok((status, headers, consumed, response.version == Some(1)))
 }
 
 fn read_http_response(
     stream: &mut InterpreterHttpStream,
     deadline: StdInstant,
+    head_request: bool,
 ) -> io::Result<ParsedHttpResponse> {
     let mut wire = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
-    let (status, headers, body_start) = loop {
+    let (status, headers, body_start, http11) = loop {
         if let Some(end) = wire.windows(4).position(|window| window == b"\r\n\r\n") {
             let header_end = end + 4;
             if header_end > HTTP_HEADER_LIMIT {
@@ -932,7 +989,8 @@ fn read_http_response(
                     "HTTP response headers exceed the 64 KiB limit",
                 ));
             }
-            let (status, headers, consumed) = parse_http_headers(&wire[..header_end])?;
+            let (status, headers, consumed, http11) =
+                parse_http_headers(&wire[..header_end])?;
             if consumed != header_end {
                 return Err(http_error(
                     io::ErrorKind::InvalidData,
@@ -943,7 +1001,7 @@ fn read_http_response(
                 wire.drain(..header_end);
                 continue;
             }
-            break (status, headers, header_end);
+            break (status, headers, header_end, http11);
         }
         if wire.len() >= HTTP_HEADER_LIMIT {
             return Err(http_error(
@@ -993,9 +1051,16 @@ fn read_http_response(
             "unsupported HTTP Transfer-Encoding",
         ));
     }
-    let no_body = matches!(status, 204 | 304) || (100..200).contains(&status);
+    let reusable = http11
+        && !headers.iter().any(|(name, value)| {
+            name == "connection"
+                && value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("close"))
+        });
+    let no_body = head_request || matches!(status, 204 | 304) || (100..200).contains(&status);
     if no_body {
-        return Ok((status, headers, Vec::new()));
+        return Ok((status, headers, Vec::new(), reusable));
     }
     if let Some(length) = content_length {
         if length > HTTP_BODY_LIMIT {
@@ -1025,6 +1090,7 @@ fn read_http_response(
             status,
             headers,
             wire[body_start..body_start + length].to_vec(),
+            reusable && wire.len() == body_start + length,
         ));
     }
     if chunked {
@@ -1036,8 +1102,8 @@ fn read_http_response(
                     "HTTP chunk framing exceeds its safety limit",
                 ));
             }
-            if let Some(body) = decode_chunked_body(encoded)? {
-                return Ok((status, headers, body));
+            if let Some((body, consumed)) = decode_chunked_body(encoded)? {
+                return Ok((status, headers, body, reusable && encoded.len() == consumed));
             }
             let remaining = http_remaining(deadline)?;
             match stream {
@@ -1072,13 +1138,143 @@ fn read_http_response(
         }
         let count = stream.read(&mut chunk)?;
         if count == 0 {
-            return Ok((status, headers, wire[body_start..].to_vec()));
+            return Ok((status, headers, wire[body_start..].to_vec(), false));
         }
         wire.extend_from_slice(&chunk[..count]);
     }
 }
 
-fn interpreter_http_get(source: &str, timeout: StdDuration) -> io::Result<Value> {
+fn http_method(method: &str) -> io::Result<String> {
+    let upper = method.to_ascii_uppercase();
+    if method.is_empty()
+        || method.len() > 32
+        || !method.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+        || matches!(upper.as_str(), "CONNECT" | "TRACE")
+    {
+        return Err(http_error(
+            io::ErrorKind::InvalidInput,
+            "HTTP method is invalid or forbidden by the safe client",
+        ));
+    }
+    Ok(upper)
+}
+
+fn http_forbidden_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "host"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "proxy-connection"
+            | "proxy-authorization"
+            | "trailer"
+            | "te"
+            | "upgrade"
+    )
+}
+
+fn http_header(name: &str, value: &str) -> io::Result<()> {
+    if name.is_empty()
+        || !name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+        || http_forbidden_header(name)
+    {
+        return Err(http_error(
+            io::ErrorKind::InvalidInput,
+            "HTTP header name is invalid or controlled by the safe client",
+        ));
+    }
+    if value
+        .bytes()
+        .any(|byte| byte > 0x7e || (byte < 0x20 && byte != b'\t'))
+    {
+        return Err(http_error(
+            io::ErrorKind::InvalidInput,
+            "HTTP header value must contain only safe ASCII text",
+        ));
+    }
+    Ok(())
+}
+
+fn http_request_size(request: &RuntimeHttpRequest) -> io::Result<()> {
+    if request.headers.len() > 100 {
+        return Err(http_error(
+            io::ErrorKind::InvalidInput,
+            "HTTP request contains more than 100 headers",
+        ));
+    }
+    let header_bytes = request
+        .headers
+        .iter()
+        .try_fold(0usize, |total, (name, value)| {
+            total
+                .checked_add(name.len())
+                .and_then(|total| total.checked_add(value.len() + 4))
+                .ok_or_else(|| {
+                    http_error(
+                        io::ErrorKind::InvalidInput,
+                        "HTTP request header size overflow",
+                    )
+                })
+        })?;
+    if header_bytes > HTTP_HEADER_LIMIT {
+        return Err(http_error(
+            io::ErrorKind::InvalidInput,
+            "HTTP request headers exceed the 64 KiB limit",
+        ));
+    }
+    if request.body.len() > HTTP_BODY_LIMIT {
+        return Err(http_error(
+            io::ErrorKind::InvalidInput,
+            "HTTP request body exceeds the 16 MiB limit",
+        ));
+    }
+    Ok(())
+}
+
+fn interpreter_http_request(
+    request: RuntimeHttpRequest,
+    timeout: StdDuration,
+    pool: &mut InterpreterHttpPool,
+) -> io::Result<Value> {
     if timeout.is_zero() {
         return Err(http_error(
             io::ErrorKind::TimedOut,
@@ -1088,22 +1284,53 @@ fn interpreter_http_get(source: &str, timeout: StdDuration) -> io::Result<Value>
     let deadline = StdInstant::now()
         .checked_add(timeout)
         .ok_or_else(|| http_error(io::ErrorKind::InvalidInput, "HTTP timeout is too large"))?;
-    let mut url = parse_http_url(source)?;
+    http_request_size(&request)?;
+    let method = http_method(&request.method)?;
+    let mut url = parse_http_url(&request.url)?;
     for redirects in 0..=HTTP_REDIRECT_LIMIT {
-        let mut stream = connect_http_stream(&url, deadline)?;
-        let request = format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: DISP/0.1\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+        let origin = http_origin(&url)?;
+        let mut stream = if let Some(stream) = pool.get_mut(&origin).and_then(Vec::pop) {
+            http_stream_timeout(&stream, http_remaining(deadline)?)?;
+            stream
+        } else {
+            connect_http_stream(&url, deadline)?
+        };
+        let mut wire = format!(
+            "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: DISP/0.1\r\nAccept: */*\r\nConnection: keep-alive\r\n",
+            method,
             http_request_target(&url),
             http_host_header(&url)?
         );
-        stream.write_all(request.as_bytes())?;
+        for (name, value) in &request.headers {
+            http_header(name, value)?;
+            wire.push_str(name);
+            wire.push_str(": ");
+            wire.push_str(value);
+            wire.push_str("\r\n");
+        }
+        if !request.body.is_empty() || matches!(method.as_str(), "POST" | "PUT" | "PATCH") {
+            wire.push_str(&format!("Content-Length: {}\r\n", request.body.len()));
+        }
+        wire.push_str("\r\n");
+        stream.write_all(wire.as_bytes())?;
+        stream.write_all(&request.body)?;
         stream.flush()?;
-        let (status, headers, body) = read_http_response(&mut stream, deadline)?;
+        let (status, headers, body, reusable) =
+            read_http_response(&mut stream, deadline, method == "HEAD")?;
         let location = headers
             .iter()
             .find(|(name, _)| name == "location")
             .map(|(_, value)| value.as_str());
-        if let (true, Some(location)) = (matches!(status, 301 | 302 | 303 | 307 | 308), location) {
+        if let (true, Some(location)) = (
+            matches!(method.as_str(), "GET" | "HEAD")
+                && request.headers.is_empty()
+                && request.body.is_empty()
+                && matches!(status, 301 | 302 | 303 | 307 | 308),
+            location,
+        ) {
+            if reusable {
+                http_pool_return(pool, origin, stream);
+            }
             if redirects == HTTP_REDIRECT_LIMIT {
                 return Err(http_error(
                     io::ErrorKind::InvalidData,
@@ -1125,6 +1352,9 @@ fn interpreter_http_get(source: &str, timeout: StdDuration) -> io::Result<Value>
             }
             url = next;
             continue;
+        }
+        if reusable {
+            http_pool_return(pool, origin, stream);
         }
         return Ok(Value::HttpResponse(RuntimeHttpResponse(Arc::new(
             RuntimeHttpResponseData {
@@ -1186,6 +1416,7 @@ enum Value {
     SocketAddress(RuntimeSocketAddress),
     TcpStream(RuntimeTcpStream),
     TlsStream(RuntimeTlsStream),
+    HttpRequest(RuntimeHttpRequest),
     HttpResponse(RuntimeHttpResponse),
     TcpListener(RuntimeTcpListener),
     UdpSocket(RuntimeUdpSocket),
@@ -1778,8 +2009,8 @@ impl Interpreter {
                 };
                 Ok(runtime_result(result))
             }
-            FutureWork::HttpGet(url, timeout) => {
-                Ok(runtime_result(interpreter_http_get(&url, timeout)))
+            FutureWork::HttpRequest(request, timeout) => {
+                Ok(runtime_result(interpreter_http_request(request, timeout)))
             }
         }
     }
@@ -2651,13 +2882,75 @@ impl Interpreter {
                 }
                 if let Expression::FieldAccess { object, field, .. } = &callee.node
                     && matches!(&object.node, Expression::Identifier(name) if name == "Http")
-                    && matches!(field.as_str(), "get" | "get_timeout")
+                    && matches!(
+                        field.as_str(),
+                        "get"
+                            | "get_timeout"
+                            | "post"
+                            | "post_timeout"
+                            | "put"
+                            | "put_timeout"
+                            | "patch"
+                            | "patch_timeout"
+                            | "delete"
+                            | "delete_timeout"
+                            | "request"
+                    )
                 {
-                    let Value::String(url) = self.evaluate(program, &arguments[0])? else {
+                    let (method, url_index) = match field.as_str() {
+                        "request" => {
+                            let Value::String(method) = self.evaluate(program, &arguments[0])?
+                            else {
+                                unreachable!("type checking validates HTTP method")
+                            };
+                            (method.text, 1)
+                        }
+                        name if name.starts_with("post") => ("POST".into(), 0),
+                        name if name.starts_with("put") => ("PUT".into(), 0),
+                        name if name.starts_with("patch") => ("PATCH".into(), 0),
+                        name if name.starts_with("delete") => ("DELETE".into(), 0),
+                        _ => ("GET".into(), 0),
+                    };
+                    let Value::String(url) = self.evaluate(program, &arguments[url_index])? else {
                         unreachable!("type checking validates HTTP URL")
                     };
-                    let timeout = if field == "get_timeout" {
-                        let Value::Duration(duration) = self.evaluate(program, &arguments[1])?
+                    if field == "request" {
+                        let request = http_method(&method)
+                            .and_then(|method| {
+                                parse_http_url(&url.text).map(|url| RuntimeHttpRequest {
+                                    method,
+                                    url: url.to_string(),
+                                    headers: vec![],
+                                    body: vec![],
+                                })
+                            })
+                            .map(Value::HttpRequest);
+                        return Ok(runtime_result(request));
+                    }
+                    let (body, headers) = if matches!(method.as_str(), "POST" | "PUT" | "PATCH") {
+                        let value = self.evaluate(program, &arguments[1])?;
+                        let text = matches!(value, Value::String(_));
+                        let body = runtime_http_body(value)
+                            .unwrap_or_else(|| unreachable!("type checking validates HTTP body"));
+                        let headers = if text {
+                            vec![("Content-Type".into(), "text/plain; charset=utf-8".into())]
+                        } else {
+                            vec![]
+                        };
+                        (body, headers)
+                    } else {
+                        (vec![], vec![])
+                    };
+                    let timeout = if field.ends_with("_timeout") {
+                        let index = if body.is_empty()
+                            && !matches!(method.as_str(), "POST" | "PUT" | "PATCH")
+                        {
+                            1
+                        } else {
+                            2
+                        };
+                        let Value::Duration(duration) =
+                            self.evaluate(program, &arguments[index])?
                         else {
                             unreachable!("type checking validates HTTP request timeout")
                         };
@@ -2666,7 +2959,15 @@ impl Interpreter {
                         StdDuration::from_secs(30)
                     };
                     return Ok(Value::Future(RuntimeFuture::operation(
-                        FutureWork::HttpGet(url.text, timeout),
+                        FutureWork::HttpRequest(
+                            RuntimeHttpRequest {
+                                method,
+                                url: url.text,
+                                headers,
+                                body,
+                            },
+                            timeout,
+                        ),
                     )));
                 }
                 if matches!(&callee.node, Expression::Identifier(name) if name == "Path") {
@@ -3826,6 +4127,73 @@ impl Interpreter {
                             "is_empty" => Ok(Value::Bool(response.body.is_empty())),
                             _ => Err(self.error("unknown HttpResponse operation", expression.span)),
                         };
+                    }
+                    if matches!(
+                        field.as_str(),
+                        "header" | "text" | "bytes" | "send" | "send_timeout"
+                    ) {
+                        let value = self.consume(program, object)?;
+                        if let Value::HttpRequest(mut request) = value {
+                            return match field.as_str() {
+                                "header" => {
+                                    let Value::String(name) =
+                                        self.evaluate(program, &arguments[0])?
+                                    else {
+                                        unreachable!("type checking validates HTTP header name")
+                                    };
+                                    let Value::String(value) =
+                                        self.evaluate(program, &arguments[1])?
+                                    else {
+                                        unreachable!("type checking validates HTTP header value")
+                                    };
+                                    let result = http_header(&name.text, &value.text)
+                                        .and_then(|()| {
+                                            request.headers.push((name.text, value.text));
+                                            http_request_size(&request)
+                                        })
+                                        .map(|()| Value::HttpRequest(request));
+                                    Ok(runtime_result(result))
+                                }
+                                "text" | "bytes" => {
+                                    let body =
+                                        runtime_http_body(self.evaluate(program, &arguments[0])?)
+                                            .unwrap_or_else(|| {
+                                                unreachable!("type checking validates HTTP body")
+                                            });
+                                    request.body = body;
+                                    if field == "text"
+                                        && !request.headers.iter().any(|(name, _)| {
+                                            name.eq_ignore_ascii_case("content-type")
+                                        })
+                                    {
+                                        request.headers.push((
+                                            "Content-Type".into(),
+                                            "text/plain; charset=utf-8".into(),
+                                        ));
+                                    }
+                                    Ok(runtime_result(
+                                        http_request_size(&request)
+                                            .map(|()| Value::HttpRequest(request)),
+                                    ))
+                                }
+                                "send" | "send_timeout" => {
+                                    let timeout = if field == "send_timeout" {
+                                        let Value::Duration(duration) =
+                                            self.evaluate(program, &arguments[0])?
+                                        else {
+                                            unreachable!("type checking validates HTTP timeout")
+                                        };
+                                        duration
+                                    } else {
+                                        StdDuration::from_secs(30)
+                                    };
+                                    Ok(Value::Future(RuntimeFuture::operation(
+                                        FutureWork::HttpRequest(request, timeout),
+                                    )))
+                                }
+                                _ => unreachable!(),
+                            };
+                        }
                     }
                     if let Value::UdpSocket(socket) = self.evaluate(program, object)? {
                         return match field.as_str() {
@@ -5308,6 +5676,7 @@ fn value_type_name(value: &Value) -> &str {
         Value::SocketAddress(_) => "SocketAddress",
         Value::TcpStream(_) => "TcpStream",
         Value::TlsStream(_) => "TlsStream",
+        Value::HttpRequest(_) => "HttpRequest",
         Value::HttpResponse(_) => "HttpResponse",
         Value::TcpListener(_) => "TcpListener",
         Value::UdpSocket(_) => "UdpSocket",
@@ -5382,6 +5751,7 @@ fn value_is_copy(program: &Program, value: &Value) -> bool {
         | Value::SocketAddress(_)
         | Value::TcpStream(_)
         | Value::TlsStream(_)
+        | Value::HttpRequest(_)
         | Value::HttpResponse(_)
         | Value::TcpListener(_)
         | Value::UdpSocket(_)
@@ -5755,6 +6125,7 @@ fn display_value(value: Value) -> String {
         Value::SocketAddress(value) => format!("{}:{}", value.host, value.port),
         Value::TcpStream(_) => "<TcpStream>".into(),
         Value::TlsStream(_) => "<TlsStream>".into(),
+        Value::HttpRequest(value) => format!("<HttpRequest:{}>", value.method),
         Value::HttpResponse(value) => {
             format!(
                 "<HttpResponse:{} {} bytes>",

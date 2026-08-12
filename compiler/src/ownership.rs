@@ -34,6 +34,7 @@ enum Ty {
     SocketAddress,
     TcpStream,
     TlsStream,
+    HttpRequest,
     HttpResponse,
     TcpListener,
     UdpSocket,
@@ -1357,11 +1358,29 @@ impl<'a> Analyzer<'a> {
                 ))));
             }
             if matches!(&object.node, Expression::Identifier(name) if name == "Http")
-                && matches!(field.as_str(), "get" | "get_timeout")
+                && matches!(
+                    field.as_str(),
+                    "get"
+                        | "get_timeout"
+                        | "post"
+                        | "post_timeout"
+                        | "put"
+                        | "put_timeout"
+                        | "patch"
+                        | "patch_timeout"
+                        | "delete"
+                        | "delete_timeout"
+                        | "request"
+                )
             {
-                self.check_expr(&arguments[0], UseMode::Read)?;
-                if field == "get_timeout" {
-                    self.check_expr(&arguments[1], UseMode::Read)?;
+                for argument in arguments {
+                    self.check_expr(argument, UseMode::Read)?;
+                }
+                if field == "request" {
+                    return Ok(Ty::Result(
+                        Box::new(Ty::HttpRequest),
+                        Box::new(Ty::Owned("HttpError".into())),
+                    ));
                 }
                 return Ok(Ty::Future(Box::new(Ty::Result(
                     Box::new(Ty::HttpResponse),
@@ -1580,6 +1599,23 @@ impl<'a> Analyzer<'a> {
                     "url" => Ty::Owned("String".into()),
                     "header" => Ty::Option(Box::new(Ty::Owned("String".into()))),
                     _ => Ty::Copy,
+                });
+            }
+            if matches!(self.expr_ty(object), Ok(Ty::HttpRequest)) {
+                self.check_expr(object, UseMode::Consume)?;
+                for argument in arguments {
+                    self.check_expr(argument, UseMode::Read)?;
+                }
+                return Ok(match field.as_str() {
+                    "header" | "text" | "bytes" => Ty::Result(
+                        Box::new(Ty::HttpRequest),
+                        Box::new(Ty::Owned("HttpError".into())),
+                    ),
+                    "send" | "send_timeout" => Ty::Future(Box::new(Ty::Result(
+                        Box::new(Ty::HttpResponse),
+                        Box::new(Ty::Owned("HttpError".into())),
+                    ))),
+                    _ => Ty::Unit,
                 });
             }
             if matches!(self.expr_ty(object), Ok(Ty::TcpListener)) {
@@ -2754,6 +2790,7 @@ impl<'a> Analyzer<'a> {
             "SocketAddress" => Ty::SocketAddress,
             "TcpStream" => Ty::TcpStream,
             "TlsStream" => Ty::TlsStream,
+            "HttpRequest" => Ty::HttpRequest,
             "HttpResponse" => Ty::HttpResponse,
             "TcpListener" => Ty::TcpListener,
             "UdpSocket" => Ty::UdpSocket,
@@ -2803,6 +2840,7 @@ impl<'a> Analyzer<'a> {
             | Ty::SocketAddress
             | Ty::TcpStream
             | Ty::TlsStream
+            | Ty::HttpRequest
             | Ty::HttpResponse
             | Ty::TcpListener
             | Ty::UdpSocket

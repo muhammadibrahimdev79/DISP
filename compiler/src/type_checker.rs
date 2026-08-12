@@ -26,6 +26,7 @@ pub enum Type {
     SocketAddress,
     TcpStream,
     TlsStream,
+    HttpRequest,
     HttpResponse,
     TcpListener,
     UdpSocket,
@@ -1864,9 +1865,28 @@ impl TypeChecker {
                 }
                 if let Expression::FieldAccess { object, field, .. } = &callee.node
                     && matches!(&object.node, Expression::Identifier(name) if name == "Http")
-                    && matches!(field.as_str(), "get" | "get_timeout")
+                    && matches!(
+                        field.as_str(),
+                        "get"
+                            | "get_timeout"
+                            | "post"
+                            | "post_timeout"
+                            | "put"
+                            | "put_timeout"
+                            | "patch"
+                            | "patch_timeout"
+                            | "delete"
+                            | "delete_timeout"
+                            | "request"
+                    )
                 {
-                    let expected = if field == "get" { 1 } else { 2 };
+                    let expected = match field.as_str() {
+                        "get" | "delete" => 1,
+                        "get_timeout" | "delete_timeout" | "post" | "put" | "patch" | "request" => {
+                            2
+                        }
+                        _ => 3,
+                    };
                     if arguments.len() != expected {
                         return Err(Diagnostic::new(
                             DiagnosticKind::Type,
@@ -1874,20 +1894,61 @@ impl TypeChecker {
                             expression.span,
                         ));
                     }
-                    let url = self.check_expression(&arguments[0])?;
+                    let url_index = usize::from(field == "request");
+                    if field == "request" {
+                        let method = self.check_expression(&arguments[0])?;
+                        if !matches!(method, Type::String | Type::Str) {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Type,
+                                "HTTP method must be String or str",
+                                arguments[0].span,
+                            ));
+                        }
+                        if let Expression::String(method) = &arguments[0].node
+                            && !http_method_token(method)
+                        {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Type,
+                                "HTTP method is invalid or forbidden by the safe client",
+                                arguments[0].span,
+                            ));
+                        }
+                    }
+                    let url = self.check_expression(&arguments[url_index])?;
                     if !matches!(url, Type::String | Type::Str) {
                         return Err(Diagnostic::new(
                             DiagnosticKind::Type,
                             "HTTP URL must be String or str",
-                            arguments[0].span,
+                            arguments[url_index].span,
                         ));
                     }
-                    if field == "get_timeout" {
-                        let timeout = self.check_expression(&arguments[1])?;
+                    if field == "request" {
+                        return Ok(Type::Result(
+                            Box::new(Type::HttpRequest),
+                            Box::new(Type::HttpError),
+                        ));
+                    }
+                    let has_body = matches!(
+                        field.as_str(),
+                        "post" | "post_timeout" | "put" | "put_timeout" | "patch" | "patch_timeout"
+                    );
+                    if has_body {
+                        let body = self.check_expression(&arguments[1])?;
+                        if !http_body_type(&body) {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Type,
+                                "HTTP body must be String, str, List<u8>, or a u8 slice",
+                                arguments[1].span,
+                            ));
+                        }
+                    }
+                    if field.ends_with("_timeout") {
+                        let timeout_index = if has_body { 2 } else { 1 };
+                        let timeout = self.check_expression(&arguments[timeout_index])?;
                         self.require_same(
                             &Type::Duration,
                             &timeout,
-                            arguments[1].span,
+                            arguments[timeout_index].span,
                             "HTTP request timeout",
                         )?;
                     }
@@ -3006,6 +3067,87 @@ impl TypeChecker {
                             _ => {}
                         }
                     }
+                    if matches!(receiver, Type::HttpRequest) {
+                        match field.as_str() {
+                            "header" if arguments.len() == 2 => {
+                                for (argument, description) in arguments
+                                    .iter()
+                                    .zip(["HTTP header name", "HTTP header value"])
+                                {
+                                    let actual = self.check_expression(argument)?;
+                                    if !matches!(actual, Type::String | Type::Str) {
+                                        return Err(Diagnostic::new(
+                                            DiagnosticKind::Type,
+                                            format!("{description} must be String or str"),
+                                            argument.span,
+                                        ));
+                                    }
+                                }
+                                if let Expression::String(name) = &arguments[0].node
+                                    && (!http_header_token(name) || http_forbidden_header(name))
+                                {
+                                    return Err(Diagnostic::new(
+                                        DiagnosticKind::Type,
+                                        "HTTP header name is invalid or controlled by the safe client",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                return Ok(Type::Result(
+                                    Box::new(Type::HttpRequest),
+                                    Box::new(Type::HttpError),
+                                ));
+                            }
+                            "text" if arguments.len() == 1 => {
+                                let body = self.check_expression(&arguments[0])?;
+                                if !matches!(body, Type::String | Type::Str) {
+                                    return Err(Diagnostic::new(
+                                        DiagnosticKind::Type,
+                                        "HTTP text body must be String or str",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                return Ok(Type::Result(
+                                    Box::new(Type::HttpRequest),
+                                    Box::new(Type::HttpError),
+                                ));
+                            }
+                            "bytes" if arguments.len() == 1 => {
+                                let body = self.check_expression(&arguments[0])?;
+                                if !matches!(body,Type::List(ref element)|Type::Slice(ref element) if matches!(**element,Type::Unsigned(8)))
+                                {
+                                    return Err(Diagnostic::new(
+                                        DiagnosticKind::Type,
+                                        "HTTP byte body must be List<u8> or a u8 slice",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                return Ok(Type::Result(
+                                    Box::new(Type::HttpRequest),
+                                    Box::new(Type::HttpError),
+                                ));
+                            }
+                            "send" if arguments.is_empty() => {
+                                return Ok(Type::Future(Box::new(Type::Result(
+                                    Box::new(Type::HttpResponse),
+                                    Box::new(Type::HttpError),
+                                ))));
+                            }
+                            "send_timeout" if arguments.len() == 1 => {
+                                let timeout = self.check_expression(&arguments[0])?;
+                                self.require_same(
+                                    &Type::Duration,
+                                    &timeout,
+                                    arguments[0].span,
+                                    "HTTP request timeout",
+                                )?;
+                                return Ok(Type::Future(Box::new(Type::Result(
+                                    Box::new(Type::HttpResponse),
+                                    Box::new(Type::HttpError),
+                                ))));
+                            }
+                            _ => {}
+                        }
+                    }
                     if matches!(receiver, Type::TcpListener) {
                         let accepted = || {
                             Type::Future(Box::new(Type::Result(
@@ -3880,6 +4022,7 @@ impl TypeChecker {
             "SocketAddress" if ty.arguments.is_empty() => Type::SocketAddress,
             "TcpStream" if ty.arguments.is_empty() => Type::TcpStream,
             "TlsStream" if ty.arguments.is_empty() => Type::TlsStream,
+            "HttpRequest" if ty.arguments.is_empty() => Type::HttpRequest,
             "HttpResponse" if ty.arguments.is_empty() => Type::HttpResponse,
             "TcpListener" if ty.arguments.is_empty() => Type::TcpListener,
             "UdpSocket" if ty.arguments.is_empty() => Type::UdpSocket,
@@ -4225,6 +4368,7 @@ impl TypeChecker {
             Type::SocketAddress => "SocketAddress".into(),
             Type::TcpStream => "TcpStream".into(),
             Type::TlsStream => "TlsStream".into(),
+            Type::HttpRequest => "HttpRequest".into(),
             Type::HttpResponse => "HttpResponse".into(),
             Type::TcpListener => "TcpListener".into(),
             Type::UdpSocket => "UdpSocket".into(),
@@ -4988,6 +5132,33 @@ fn http_header_token(name: &str) -> bool {
                         | b'~'
                 )
         })
+}
+
+fn http_forbidden_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "host"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "proxy-connection"
+            | "proxy-authorization"
+            | "trailer"
+            | "te"
+            | "upgrade"
+    )
+}
+
+fn http_method_token(method: &str) -> bool {
+    !method.is_empty()
+        && method.len() <= 32
+        && http_header_token(method)
+        && !matches!(method.to_ascii_uppercase().as_str(), "CONNECT" | "TRACE")
+}
+
+fn http_body_type(ty: &Type) -> bool {
+    matches!(ty, Type::String | Type::Str)
+        || matches!(ty,Type::List(element)|Type::Slice(element) if matches!(**element,Type::Unsigned(8)))
 }
 
 #[cfg(test)]

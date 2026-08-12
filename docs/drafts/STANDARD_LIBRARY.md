@@ -772,6 +772,19 @@ text = response.text()?
 `Future<Result<HttpResponse, HttpError>>`. The URL is borrowed logically and copied into the lazy
 operation, so creating a future neither consumes the caller's string nor performs network work.
 
+Common writes remain equally direct:
+
+```disp
+created = await Http.post(url, text)?
+updated = await Http.put(url, bytes)?
+changed = await Http.patch(url, text)?
+removed = await Http.delete(url)?
+```
+
+Each has a `_timeout` form. Text bodies receive `text/plain; charset=utf-8`; byte-list and byte-slice
+bodies remain unlabelled unless the advanced request API supplies a content type. All body inputs
+are copied into the lazy future before it is returned.
+
 `HttpResponse` is an owned non-Copy value. It exposes `status`, `is_success`, `body`, `text`,
 `header`, `url`, `len`, and `is_empty`. Body and text access return owned copies so no hidden
 response lifetime reaches ordinary code. Text conversion strictly validates UTF-8, and header
@@ -786,27 +799,25 @@ or newer, and revocation checking. No safe option disables certificate verificat
 
 # 37. HTTP Client
 
-Conceptually:
+Custom methods, headers, and bodies use a linear owned request:
 
 ```disp
-let client = HttpClient()
-
-let response =
-    await client.get(url)?
+request = Http.request("OPTIONS", url)?
+request = request.header("Authorization", token)?
+request = request.text(payload)?
+response = await request.send_timeout(Duration.from_seconds(10))?
 ```
 
-Configurable behavior:
+`header`, `text`, and `bytes` consume the prior request and return a new
+`Result<HttpRequest, HttpError>`. This prevents aliases from observing partial configuration and
+makes failure cleanup deterministic. `send` consumes the final request into a lazy future.
 
-```text
-timeouts
-redirects
-headers
-TLS
-connection pooling
-body limits
-```
-
-Secure defaults are mandatory.
+Methods and header names use bounded HTTP tokens. `CONNECT`, `TRACE`, and transport-controlled
+headers (`Host`, `Content-Length`, `Transfer-Encoding`, connection/proxy framing headers, and
+upgrade headers) are rejected. User header values are restricted to safe ASCII text, requests have
+at most 100 user headers, request headers and bodies use the same 64 KiB and 16 MiB bounds, and
+non-empty or user-configured requests are never automatically replayed across redirects. Bare
+GET/HEAD requests retain the bounded safe redirect behavior.
 
 ---
 

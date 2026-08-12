@@ -181,6 +181,16 @@ fn async_operations(
                         | "Tls.connect_timeout"
                         | "Http.get"
                         | "Http.get_timeout"
+                        | "Http.post"
+                        | "Http.post_timeout"
+                        | "Http.put"
+                        | "Http.put_timeout"
+                        | "Http.patch"
+                        | "Http.patch_timeout"
+                        | "Http.delete"
+                        | "Http.delete_timeout"
+                        | "HttpRequest.send"
+                        | "HttpRequest.send_timeout"
                         | "TcpListener.accept"
                         | "TcpListener.accept_timeout"
                         | "TcpStream.read_async"
@@ -248,7 +258,7 @@ fn async_poll_wrapper(operation: &str, result: &hir::Type, output: &mut String) 
         .unwrap();
         return;
     }
-    if matches!(operation, "Http.get" | "Http.get_timeout") {
+    if operation.starts_with("Http.") || operation.starts_with("HttpRequest.send") {
         writeln!(
             output,
             "static bool {poll}(void *raw,void *output){{disp_http_request_state *state=(disp_http_request_state*)raw;if(!disp_http_request_poll(state))return false;bool ok=false;disp_native_http_response response={{0}};disp_native_string error={{0}};disp_http_request_take(state,&ok,&response,&error);{result_c} *result=({result_c}*)output;*result=({result_c}){{0}};if(ok){{result->tag=0;result->payload.v0.f0=response;}}else{{result->tag=1;result->payload.v1.f0=error;}}return true;}}"
@@ -563,6 +573,7 @@ pub fn supported(program: &mir::Program, ty: &hir::Type) -> bool {
         | hir::Type::SocketAddress
         | hir::Type::TcpStream
         | hir::Type::TlsStream
+        | hir::Type::HttpRequest
         | hir::Type::HttpResponse
         | hir::Type::TcpListener
         | hir::Type::UdpSocket
@@ -1126,26 +1137,86 @@ fn terminator(
                         span.start.line, span.start.column
                     )
                 }
+                hir::CallTarget::Intrinsic(name) if name == "Http.request" => {
+                    let result_c = native_types::c_type(&destination_ty);
+                    let (method, _) =
+                        system_argument(program, function, &arguments[0], substitutions);
+                    let (url, _) = system_argument(program, function, &arguments[1], substitutions);
+                    format!(
+                        "({{{result_c} _r={{0}};disp_native_http_request _request={{0}};disp_native_string _error={{0}};if(disp_http_builder_create(({method})->data,({method})->len,({url})->data,({url})->len,&_request,&_error)){{_r.tag=0;_r.payload.v0.f0=_request;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                    )
+                }
                 hir::CallTarget::Intrinsic(name)
-                    if matches!(name.as_str(), "Http.get" | "Http.get_timeout") =>
+                    if matches!(
+                        name.as_str(),
+                        "Http.get"
+                            | "Http.get_timeout"
+                            | "Http.post"
+                            | "Http.post_timeout"
+                            | "Http.put"
+                            | "Http.put_timeout"
+                            | "Http.patch"
+                            | "Http.patch_timeout"
+                            | "Http.delete"
+                            | "Http.delete_timeout"
+                    ) =>
                 {
                     let hir::Type::Future(result) = &destination_ty else {
-                        unreachable!("Http.get destination must be Future<T>")
+                        unreachable!("HTTP operation destination must be Future<T>")
                     };
                     let (url, _) = system_argument(program, function, &arguments[0], substitutions);
-                    let timeout = if arguments.len() == 2 {
+                    let method = if name.starts_with("Http.post") {
+                        "POST"
+                    } else if name.starts_with("Http.put") {
+                        "PUT"
+                    } else if name.starts_with("Http.patch") {
+                        "PATCH"
+                    } else if name.starts_with("Http.delete") {
+                        "DELETE"
+                    } else {
+                        "GET"
+                    };
+                    let has_body = matches!(method, "POST" | "PUT" | "PATCH");
+                    let (body_data, body_len, headers, headers_len) = if has_body {
+                        let body_ty = operand_ty(program, function, &arguments[1], substitutions);
+                        let (body, _) =
+                            system_argument(program, function, &arguments[1], substitutions);
+                        let text = matches!(body_ty, hir::Type::String | hir::Type::Str);
+                        (
+                            format!("(const char*)({body})->data"),
+                            format!("({body})->len"),
+                            if text {
+                                "\"Content-Type: text/plain; charset=utf-8\\r\\n\""
+                            } else {
+                                "NULL"
+                            },
+                            if text { "41" } else { "0" },
+                        )
+                    } else {
+                        ("NULL".into(), "0".into(), "NULL", "0")
+                    };
+                    let timeout_index = usize::from(!has_body);
+                    let timeout = if name.ends_with("_timeout") {
+                        let timeout_index = if has_body { 2 } else { timeout_index };
                         let timeout_ty =
-                            operand_ty(program, function, &arguments[1], substitutions);
-                        let timeout =
-                            operand(program, function, &arguments[1], &timeout_ty, substitutions);
+                            operand_ty(program, function, &arguments[timeout_index], substitutions);
+                        let timeout = operand(
+                            program,
+                            function,
+                            &arguments[timeout_index],
+                            &timeout_ty,
+                            substitutions,
+                        );
                         format!("({timeout}).nanos")
                     } else {
                         "30000000000ULL".into()
                     };
                     let poll = async_poll_name(name, result);
                     format!(
-                        "({{disp_http_request_state *_state=disp_http_request_create(({url})->data,({url})->len,{timeout},{},{});(disp_native_future){{.context=_state,.poll={poll},.drop=disp_http_request_drop}};}})",
-                        span.start.line, span.start.column
+                        "({{disp_http_request_state *_state=disp_http_request_create(\"{method}\",{},({url})->data,({url})->len,{headers},{headers_len},{body_data},{body_len},{timeout},{},{});(disp_native_future){{.context=_state,.poll={poll},.drop=disp_http_request_drop}};}})",
+                        method.len(),
+                        span.start.line,
+                        span.start.column
                     )
                 }
                 hir::CallTarget::Intrinsic(name)
@@ -1927,6 +1998,56 @@ fn terminator(
                         "HttpResponse.len" => format!("disp_http_response_len({response})"),
                         "HttpResponse.is_empty" => {
                             format!("disp_http_response_len({response})==0")
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                hir::CallTarget::Intrinsic(name) if name.starts_with("HttpRequest.") => {
+                    let (request, _) =
+                        system_argument(program, function, &arguments[0], substitutions);
+                    match name.as_str() {
+                        "HttpRequest.header" => {
+                            let result_c = native_types::c_type(&destination_ty);
+                            let (header, _) =
+                                system_argument(program, function, &arguments[1], substitutions);
+                            let (value, _) =
+                                system_argument(program, function, &arguments[2], substitutions);
+                            format!(
+                                "({{{result_c} _r={{0}};disp_native_http_request _next={{0}};disp_native_string _error={{0}};if(disp_http_builder_header({request},({header})->data,({header})->len,({value})->data,({value})->len,&_next,&_error)){{_r.tag=0;_r.payload.v0.f0=_next;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                            )
+                        }
+                        "HttpRequest.text" | "HttpRequest.bytes" => {
+                            let result_c = native_types::c_type(&destination_ty);
+                            let (body, _) =
+                                system_argument(program, function, &arguments[1], substitutions);
+                            let text = name == "HttpRequest.text";
+                            format!(
+                                "({{{result_c} _r={{0}};disp_native_http_request _next={{0}};disp_native_string _error={{0}};if(disp_http_builder_body({request},({body})->data,({body})->len,{text},&_next,&_error)){{_r.tag=0;_r.payload.v0.f0=_next;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                            )
+                        }
+                        "HttpRequest.send" | "HttpRequest.send_timeout" => {
+                            let hir::Type::Future(result) = &destination_ty else {
+                                unreachable!("HTTP send destination must be Future<T>")
+                            };
+                            let timeout = if arguments.len() == 2 {
+                                let timeout_ty =
+                                    operand_ty(program, function, &arguments[1], substitutions);
+                                let timeout = operand(
+                                    program,
+                                    function,
+                                    &arguments[1],
+                                    &timeout_ty,
+                                    substitutions,
+                                );
+                                format!("({timeout}).nanos")
+                            } else {
+                                "30000000000ULL".into()
+                            };
+                            let poll = async_poll_name(name, result);
+                            format!(
+                                "({{disp_http_request_state *_state=disp_http_request_from_builder({request},{timeout},{},{});(disp_native_future){{.context=_state,.poll={poll},.drop=disp_http_request_drop}};}})",
+                                span.start.line, span.start.column
+                            )
                         }
                         _ => unreachable!(),
                     }
@@ -3359,6 +3480,7 @@ fn to_dv(value: &str, ty: &hir::Type) -> String {
         hir::Type::SocketAddress => "dv_string(\"<SocketAddress>\",15)".into(),
         hir::Type::TcpStream => "dv_string(\"<TcpStream>\",11)".into(),
         hir::Type::TlsStream => "dv_string(\"<TlsStream>\",11)".into(),
+        hir::Type::HttpRequest => "dv_string(\"<HttpRequest>\",13)".into(),
         hir::Type::HttpResponse => "dv_string(\"<HttpResponse>\",14)".into(),
         hir::Type::TcpListener => "dv_string(\"<TcpListener>\",13)".into(),
         hir::Type::UdpSocket => "dv_string(\"<UdpSocket>\",11)".into(),
@@ -3599,6 +3721,7 @@ fn drop_value_depth(program: &mir::Program, value: &str, ty: &hir::Type, depth: 
         hir::Type::SocketAddress => format!("disp_socket_address_drop(&({value}));"),
         hir::Type::TcpStream => format!("disp_tcp_stream_drop(&({value}));"),
         hir::Type::TlsStream => format!("disp_tls_stream_drop(&({value}));"),
+        hir::Type::HttpRequest => format!("disp_http_builder_drop(&({value}));"),
         hir::Type::HttpResponse => format!("disp_http_response_drop(&({value}));"),
         hir::Type::TcpListener => format!("disp_tcp_listener_drop(&({value}));"),
         hir::Type::UdpSocket => format!("disp_udp_socket_drop(&({value}));"),

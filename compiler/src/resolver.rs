@@ -759,7 +759,7 @@ impl Resolver {
             name if name.starts_with("[;") && name.ends_with(']') => Some(1),
             "int" | "f64" | "str" | "String" | "Path" | "IpAddress" | "SocketAddress"
             | "TcpStream" | "TlsStream" | "TcpListener" | "UdpSocket" | "UdpDatagram"
-            | "Instant" | "Duration" | "IoError" | "NetworkError" | "HttpError"
+            | "Instant" | "Duration" | "IoError" | "NetworkError" | "HttpError" | "HttpRequest"
             | "HttpResponse" | "char" | "bool" | "Unit" | "ConversionError" => Some(0),
             name if self
                 .generic_types

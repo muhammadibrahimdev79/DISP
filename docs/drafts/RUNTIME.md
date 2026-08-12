@@ -826,6 +826,12 @@ limits. HTTPS-to-HTTP redirects are rejected. Request state is reference-counted
 and worker; timeout, cancellation, success, error, future drop, and response drop each have a
 single deterministic ownership path.
 
+`Http.post`, `put`, `patch`, and `delete` share that future machinery. `HttpRequest` is a concrete
+owned pointer type whose functional `header`, `text`, and `bytes` operations consume their input.
+The resulting `send` future owns method, URL, headers, and body snapshots. Native requests pass
+bounded owned input to WinHTTP; non-GET/HEAD methods and any request carrying custom headers or a
+body disable automatic redirects so credentials and non-idempotent bodies cannot be replayed.
+
 The interpreter independently parses HTTP/1.1 with bounded headers, content-length and chunked
 framing checks, strict ambiguity rejection, the same redirect/downgrade policy, and the same body
 limit. Native/interpreter differential tests exercise successful responses, redirects, chunked

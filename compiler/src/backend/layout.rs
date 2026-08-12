@@ -75,6 +75,7 @@ impl<'a> LayoutEngine<'a> {
             ]),
             hir::Type::TcpStream
             | hir::Type::TlsStream
+            | hir::Type::HttpRequest
             | hir::Type::HttpResponse
             | hir::Type::TcpListener
             | hir::Type::UdpSocket => scalar(

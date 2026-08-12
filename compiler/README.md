@@ -23,7 +23,7 @@ Implemented executable subset:
 - owned `TcpListener` bind/local-port operations and lazy nonblocking `accept`/`accept_timeout` futures with responsive cancellation and reference-counted native listener state
 - owned `UdpSocket` datagram I/O with local-port discovery, sender-address metadata, synchronous and lazy deadline-aware operations, explicit truncation errors, serialized directions, and cancellation-safe native cleanup
 - owned `TlsStream` transport with lazy consuming handshakes, system trust and host-name verification, SNI, TLS 1.2 minimum, certificate revocation checks, bounded plaintext reads, deadline-aware encrypted I/O, and deterministic close/drop cleanup
-- lazy `Http.get`/`Http.get_timeout` with owned non-Copy responses, typed `HttpError`, bounded headers and bodies, strict UTF-8 text conversion, bounded redirects, downgrade rejection, safe system TLS verification, and deterministic response/future cleanup
+- lazy safe HTTP GET/POST/PUT/PATCH/DELETE operations plus linear owned `HttpRequest` values for custom methods, headers and text/byte bodies, with non-Copy responses, typed errors, bounded input/output, non-replay redirects, verified system TLS, and deterministic cleanup
 - explicitly shared `Mutex<T>`, owning lock guards, and checked sequentially consistent `AtomicInt`
 - defined `extern C` declarations, fixed C ABI aliases, checked `CString`, borrowed `CStr`, and native library linking
 - owned aligned `Memory`, bounds-checked byte operations, raw pointer views, and explicit unsafe pointer arithmetic/read/write

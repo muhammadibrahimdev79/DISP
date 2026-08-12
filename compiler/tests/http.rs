@@ -94,8 +94,27 @@ fn server(
                         request.extend_from_slice(&chunk[..count]);
                         assert!(request.len() <= 32 * 1024);
                     }
+                    let header_end = request
+                        .windows(4)
+                        .position(|part| part == b"\r\n\r\n")
+                        .map(|position| position + 4)
+                        .unwrap();
+                    let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    while request.len() < header_end + content_length {
+                        let count = stream.read(&mut chunk).unwrap();
+                        assert!(count > 0, "request body ended early");
+                        request.extend_from_slice(&chunk[..count]);
+                        assert!(request.len() <= 17 * 1024 * 1024);
+                    }
                     let request = String::from_utf8(request).unwrap();
-                    assert!(request.starts_with("GET "), "{request}");
                     stream.write_all(&response(&request)).unwrap();
                     stream.flush().unwrap();
                     served += 1;
@@ -168,6 +187,206 @@ fn owned_responses_headers_text_and_bytes_are_native_interpreter_differential() 
     assert!(generated.contains("disp_http_response_drop"));
 }
 
+fn request_response(request: &str) -> Vec<u8> {
+    let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+    let first = headers.lines().next().unwrap();
+    match first {
+        "POST /direct HTTP/1.1" => {
+            assert!(headers.contains("Content-Type: text/plain; charset=utf-8"));
+            assert_eq!(body, "direct");
+        }
+        "PUT /bytes HTTP/1.1" => assert_eq!(body, "ABC"),
+        "PATCH /patch HTTP/1.1" => assert_eq!(body, "patch"),
+        "DELETE /remove HTTP/1.1" => assert!(body.is_empty()),
+        "OPTIONS /custom HTTP/1.1" => {
+            assert!(headers.contains("X-DISP: safe"));
+            assert!(headers.contains("Content-Type: text/plain; charset=utf-8"));
+            assert_eq!(body, "custom");
+        }
+        _ => panic!("unexpected HTTP request: {first}"),
+    }
+    b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
+}
+
+fn general_request_source(port: u16) -> String {
+    format!(
+        r#"async fn exercise() -> Result<bool, HttpError> {{
+posted = (await Http.post("http://127.0.0.1:{port}/direct", "direct"))?
+put = (await Http.put("http://127.0.0.1:{port}/bytes", List.of(u8(65), u8(66), u8(67))))?
+patched = (await Http.patch("http://127.0.0.1:{port}/patch", "patch"))?
+deleted = (await Http.delete("http://127.0.0.1:{port}/remove"))?
+request = Http.request("OPTIONS", "http://127.0.0.1:{port}/custom")?
+request = request.header("X-DISP", "safe")?
+request = request.text("custom")?
+custom = (await request.send_timeout(Duration.from_seconds(3)))?
+return Ok(posted.status() == 202 && put.status() == 202 && patched.status() == 202 && deleted.status() == 202 && custom.text()? == "ok")
+}}
+async fn main() {{ print(await exercise()) }}"#
+    )
+}
+
+#[test]
+fn general_methods_headers_text_and_byte_bodies_are_differential() {
+    let (port, served) = server(5, request_response);
+    assert_eq!(
+        run_source(&general_request_source(port)).unwrap(),
+        ["Result.Ok(true)"]
+    );
+    assert_eq!(served.join().unwrap(), 5);
+
+    let (port, served) = server(5, request_response);
+    let (output, generated) = native("general-request", &general_request_source(port), true);
+    if let Some(output) = output {
+        assert_eq!(output, "Result.Ok(true)\n");
+        assert_eq!(served.join().unwrap(), 5);
+    }
+    let generated = generated.unwrap();
+    assert!(generated.contains("disp_native_http_request"));
+    assert!(generated.contains("disp_http_builder_header"));
+    assert!(generated.contains("disp_http_builder_body"));
+    assert!(generated.contains("disp_http_request_from_builder"));
+    assert!(generated.contains("WINHTTP_OPTION_REDIRECT_POLICY_NEVER"));
+}
+
+#[test]
+fn request_futures_snapshot_inputs_and_non_get_redirects_are_not_replayed() {
+    let response = |request: &str| {
+        assert!(request.starts_with("POST /submit "));
+        assert!(request.ends_with("\r\n\r\noriginal"));
+        b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /danger\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+    };
+    let source_for = |port| {
+        format!(
+            r#"async fn main() {{
+var body = String.new()
+body.push_str("original")
+future = Http.post("http://127.0.0.1:{port}/submit", body)
+body.clear()
+result = await future
+print(match result {{ Ok(response) => response.status() == 307, Err(error) => false }})
+}}"#
+        )
+    };
+    let (port, served) = server(1, response);
+    assert_eq!(run_source(&source_for(port)).unwrap(), ["true"]);
+    assert_eq!(served.join().unwrap(), 1);
+
+    let (port, served) = server(1, response);
+    let (output, _) = native("request-snapshot", &source_for(port), false);
+    if let Some(output) = output {
+        assert_eq!(output, "true\n");
+        assert_eq!(served.join().unwrap(), 1);
+    }
+}
+
+#[test]
+fn requests_with_user_headers_do_not_forward_them_across_redirects() {
+    let response = |request: &str| {
+        assert!(request.starts_with("GET /secure "));
+        assert!(request.contains("Authorization: Bearer secret"));
+        b"HTTP/1.1 302 Found\r\nLocation: /other-origin-risk\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+    };
+    let source_for = |port| {
+        format!(
+            r#"async fn inspect() -> Result<bool, HttpError> {{
+request = Http.request("GET", "http://127.0.0.1:{port}/secure")?
+request = request.header("Authorization", "Bearer secret")?
+response = (await request.send())?
+return Ok(response.status() == 302)
+}}
+async fn main() {{ print(await inspect()) }}"#
+        )
+    };
+    let (port, served) = server(1, response);
+    assert_eq!(run_source(&source_for(port)).unwrap(), ["Result.Ok(true)"]);
+    assert_eq!(served.join().unwrap(), 1);
+
+    let (port, served) = server(1, response);
+    let (output, _) = native("header-redirect", &source_for(port), false);
+    if let Some(output) = output {
+        assert_eq!(output, "Result.Ok(true)\n");
+        assert_eq!(served.join().unwrap(), 1);
+    }
+}
+
+#[test]
+fn request_validation_is_typed_bounded_and_source_spanned() {
+    let method = check_source(
+        "async fn main() { value = Http.request(\"TRACE\", \"https://example.com\") }",
+    )
+    .unwrap_err();
+    assert!(method.message.contains("forbidden"), "{method}");
+
+    let header = check_source(
+        r#"async fn inspect() -> Result<bool, HttpError> {
+request = Http.request("GET", "https://example.com")?
+request = request.header("Content-Length", "99")?
+return Ok(true)
+}
+async fn main() {}"#,
+    )
+    .unwrap_err();
+    assert!(header.message.contains("controlled"), "{header}");
+    assert_eq!(header.span.start.line, 3);
+
+    let moved = check_source(
+        r#"async fn inspect() -> Result<bool, HttpError> {
+request = Http.request("GET", "https://example.com")?
+next = request.header("X-Test", "one")?
+future = request.send()
+return Ok(true)
+}
+async fn main() {}"#,
+    )
+    .unwrap_err();
+    assert!(moved.message.contains("moved"), "{moved}");
+    assert_eq!(moved.span.start.line, 4);
+
+    let body = check_source("async fn main() { future = Http.post(\"https://example.com\", 42) }")
+        .unwrap_err();
+    assert!(body.message.contains("HTTP body"), "{body}");
+
+    let dynamic = r#"async fn inspect() -> Result<bool, HttpError> {
+method = "TRACE"
+request = Http.request(method, "https://example.com")
+return Ok(match request { Ok(value) => false, Err(error) => true })
+}
+async fn main() { print(await inspect()) }"#;
+    assert_eq!(run_source(dynamic).unwrap(), ["Result.Ok(true)"]);
+    if let Some(output) = native("dynamic-method", dynamic, false).0 {
+        assert_eq!(output, "Result.Ok(true)\n");
+    }
+
+    let unsafe_header = r#"async fn inspect() -> Result<bool, HttpError> {
+request = Http.request("GET", "https://example.com")?
+value = "line\nbreak"
+result = request.header("X-Test", value)
+return Ok(match result { Ok(next) => false, Err(error) => true })
+}
+async fn main() { print(await inspect()) }"#;
+    assert_eq!(run_source(unsafe_header).unwrap(), ["Result.Ok(true)"]);
+    if let Some(output) = native("unsafe-header", unsafe_header, false).0 {
+        assert_eq!(output, "Result.Ok(true)\n");
+    }
+
+    let headers = r#"async fn inspect() -> Result<bool, HttpError> {
+var request = Http.request("GET", "https://example.com")?
+var index = 0
+while index < 101 {
+request = request.header("X-Test", "value")?
+index += 1
+}
+return Ok(false)
+}
+async fn main() { print(await inspect()) }"#;
+    assert!(
+        matches!(run_source(headers).unwrap().as_slice(), [value] if value.starts_with("Result.Err("))
+    );
+    if let Some(output) = native("header-limit", headers, false).0 {
+        assert!(output.starts_with("Result.Err("), "{output}");
+    }
+}
+
 fn redirect_response(request: &str) -> Vec<u8> {
     if request.starts_with("GET /start ") {
         b"HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -219,13 +438,15 @@ unused = Http.get(url)
 print(url.len() > 0)
 timed = await Http.get_timeout(url, Duration.from_millis(0))
 print(match timed {{ Ok(response) => false, Err(error) => true }})
+timed_post = await Http.post_timeout(url, "body", Duration.from_millis(0))
+print(match timed_post {{ Ok(response) => false, Err(error) => true }})
 }}"#
     );
-    assert_eq!(run_source(&source).unwrap(), ["true", "true"]);
+    assert_eq!(run_source(&source).unwrap(), ["true", "true", "true"]);
     assert!(matches!(listener.accept(), Err(error) if error.kind() == ErrorKind::WouldBlock));
     let (output, _) = native("lazy", &source, false);
     if let Some(output) = output {
-        assert_eq!(output, "true\ntrue\n");
+        assert_eq!(output, "true\ntrue\ntrue\n");
         assert!(matches!(listener.accept(), Err(error) if error.kind() == ErrorKind::WouldBlock));
     }
 }

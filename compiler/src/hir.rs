@@ -36,6 +36,7 @@ pub enum Type {
     SocketAddress,
     TcpStream,
     TlsStream,
+    HttpRequest,
     HttpResponse,
     TcpListener,
     UdpSocket,
@@ -94,6 +95,7 @@ impl Type {
             | Self::SocketAddress
             | Self::TcpStream
             | Self::TlsStream
+            | Self::HttpRequest
             | Self::HttpResponse
             | Self::TcpListener
             | Self::UdpSocket
@@ -775,6 +777,7 @@ impl<'a> Lowering<'a> {
             "SocketAddress" => Type::SocketAddress,
             "TcpStream" => Type::TcpStream,
             "TlsStream" => Type::TlsStream,
+            "HttpRequest" => Type::HttpRequest,
             "HttpResponse" => Type::HttpResponse,
             "TcpListener" => Type::TcpListener,
             "UdpSocket" => Type::UdpSocket,
@@ -1857,7 +1860,22 @@ impl FunctionLowering<'_, '_> {
                         span,
                     });
                 }
-                if owner == "Http" && matches!(field.as_str(), "get" | "get_timeout") {
+                if owner == "Http"
+                    && matches!(
+                        field.as_str(),
+                        "get"
+                            | "get_timeout"
+                            | "post"
+                            | "post_timeout"
+                            | "put"
+                            | "put_timeout"
+                            | "patch"
+                            | "patch_timeout"
+                            | "delete"
+                            | "delete_timeout"
+                            | "request"
+                    )
+                {
                     let args = arguments
                         .iter()
                         .map(|x| self.lower_expr(x))
@@ -1869,10 +1887,17 @@ impl FunctionLowering<'_, '_> {
                             receiver: None,
                             substitutions: vec![],
                         }),
-                        ty: Type::Future(Box::new(Type::Result(
-                            Box::new(Type::HttpResponse),
-                            Box::new(Type::Generic("HttpError".into())),
-                        ))),
+                        ty: if field == "request" {
+                            Type::Result(
+                                Box::new(Type::HttpRequest),
+                                Box::new(Type::Generic("HttpError".into())),
+                            )
+                        } else {
+                            Type::Future(Box::new(Type::Result(
+                                Box::new(Type::HttpResponse),
+                                Box::new(Type::Generic("HttpError".into())),
+                            )))
+                        },
                         span,
                     });
                 }
@@ -2511,6 +2536,36 @@ impl FunctionLowering<'_, '_> {
                         target: CallTarget::Intrinsic(format!("HttpResponse.{field}")),
                         arguments: args,
                         receiver: Some(ReceiverMode::Shared),
+                        substitutions: vec![],
+                    }),
+                    ty,
+                    span,
+                });
+            }
+            if matches!(receiver.ty, Type::HttpRequest) {
+                let mut args = vec![receiver];
+                args.extend(
+                    arguments
+                        .iter()
+                        .map(|x| self.lower_expr(x))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+                let ty = match field.as_str() {
+                    "header" | "text" | "bytes" => Type::Result(
+                        Box::new(Type::HttpRequest),
+                        Box::new(Type::Generic("HttpError".into())),
+                    ),
+                    "send" | "send_timeout" => Type::Future(Box::new(Type::Result(
+                        Box::new(Type::HttpResponse),
+                        Box::new(Type::Generic("HttpError".into())),
+                    ))),
+                    _ => Type::Unknown,
+                };
+                return Ok(Expr {
+                    kind: ExprKind::Call(Call {
+                        target: CallTarget::Intrinsic(format!("HttpRequest.{field}")),
+                        arguments: args,
+                        receiver: Some(ReceiverMode::Move),
                         substitutions: vec![],
                     }),
                     ty,
@@ -3653,6 +3708,7 @@ fn surface_type_is_copy(ty: &Type) -> bool {
         | Type::SocketAddress
         | Type::TcpStream
         | Type::TlsStream
+        | Type::HttpRequest
         | Type::HttpResponse
         | Type::TcpListener
         | Type::UdpSocket
