@@ -32,6 +32,8 @@ pub enum Type {
     CStr,
     Memory,
     Path,
+    SocketAddress,
+    TcpStream,
     Instant,
     Duration,
     Array(Box<Type>, usize),
@@ -82,6 +84,8 @@ impl Type {
             | Self::CString
             | Self::Memory
             | Self::Path
+            | Self::SocketAddress
+            | Self::TcpStream
             | Self::List(_)
             | Self::Map(_, _)
             | Self::Set(_)
@@ -755,9 +759,12 @@ impl<'a> Lowering<'a> {
             "CFloat" => Type::Float { width: 32 },
             "CDouble" => Type::Float { width: 64 },
             "Path" => Type::Path,
+            "SocketAddress" => Type::SocketAddress,
+            "TcpStream" => Type::TcpStream,
             "Instant" => Type::Instant,
             "Duration" => Type::Duration,
             "IoError" => Type::Generic("IoError".into()),
+            "NetworkError" => Type::Generic("NetworkError".into()),
             "[]" => Type::Slice(Box::new(
                 ty.arguments
                     .first()
@@ -1715,6 +1722,10 @@ impl FunctionLowering<'_, '_> {
                             Box::new(Type::Unit),
                             Box::new(Type::Generic("IoError".into())),
                         ))),
+                        "connect" => Type::Future(Box::new(Type::Result(
+                            Box::new(Type::TcpStream),
+                            Box::new(Type::Generic("NetworkError".into())),
+                        ))),
                         _ => Type::Future(Box::new(Type::Unit)),
                     };
                     return Ok(Expr {
@@ -2234,6 +2245,42 @@ impl FunctionLowering<'_, '_> {
                     span,
                 });
             }
+            if matches!(receiver.ty, Type::TcpStream) {
+                let mut args = vec![receiver];
+                args.extend(
+                    arguments
+                        .iter()
+                        .map(|x| self.lower_expr(x))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+                let ty = match field.as_str() {
+                    "read" => Type::Result(
+                        Box::new(Type::List(Box::new(Type::Int {
+                            signed: false,
+                            width: Some(8),
+                        }))),
+                        Box::new(Type::Generic("NetworkError".into())),
+                    ),
+                    "write" => Type::Result(
+                        Box::new(Type::Int {
+                            signed: false,
+                            width: None,
+                        }),
+                        Box::new(Type::Generic("NetworkError".into())),
+                    ),
+                    _ => Type::Unit,
+                };
+                return Ok(Expr {
+                    kind: ExprKind::Call(Call {
+                        target: CallTarget::Intrinsic(format!("TcpStream.{field}")),
+                        arguments: args,
+                        receiver: Some(ReceiverMode::Mutable),
+                        substitutions: vec![],
+                    }),
+                    ty,
+                    span,
+                });
+            }
             if let Type::Thread(result) = receiver.ty.clone()
                 && field == "join"
             {
@@ -2590,6 +2637,22 @@ impl FunctionLowering<'_, '_> {
                         substitutions: vec![],
                     }),
                     ty: Type::Path,
+                    span,
+                });
+            }
+            if name == "SocketAddress" {
+                let args = arguments
+                    .iter()
+                    .map(|x| self.lower_expr(x))
+                    .collect::<Result<Vec<_>, _>>()?;
+                return Ok(Expr {
+                    kind: ExprKind::Call(Call {
+                        target: CallTarget::Intrinsic("SocketAddress.new".into()),
+                        arguments: args,
+                        receiver: None,
+                        substitutions: vec![],
+                    }),
+                    ty: Type::SocketAddress,
                     span,
                 });
             }
@@ -3215,6 +3278,8 @@ fn surface_type_is_copy(ty: &Type) -> bool {
         | Type::CString
         | Type::Memory
         | Type::Path
+        | Type::SocketAddress
+        | Type::TcpStream
         | Type::List(_)
         | Type::Map(_, _)
         | Type::Set(_)

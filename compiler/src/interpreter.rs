@@ -7,6 +7,8 @@ use std::{
     any::Any,
     collections::HashMap,
     fs,
+    io::{Read, Write},
+    net::{Shutdown, TcpStream as StdTcpStream},
     path::PathBuf,
     sync::{
         Arc, Mutex as StdMutex, Weak,
@@ -98,6 +100,31 @@ enum FutureWork {
     ReadBytes(PathBuf),
     WriteText(PathBuf, RuntimeString),
     WriteBytes(PathBuf, Vec<u8>),
+    Connect(RuntimeSocketAddress),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeSocketAddress {
+    host: String,
+    port: u16,
+}
+
+#[derive(Clone)]
+struct RuntimeTcpStream(Arc<StdMutex<Option<StdTcpStream>>>);
+
+impl std::fmt::Debug for RuntimeTcpStream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("TcpStream")
+            .field(&Arc::as_ptr(&self.0))
+            .finish()
+    }
+}
+
+impl PartialEq for RuntimeTcpStream {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 impl RuntimeFuture {
@@ -513,6 +540,8 @@ enum Value {
     CStr(RuntimeCString),
     Memory(RuntimeMemory),
     Path(PathBuf),
+    SocketAddress(RuntimeSocketAddress),
+    TcpStream(RuntimeTcpStream),
     Instant(StdInstant),
     Duration(StdDuration),
     Thread(RuntimeThread),
@@ -798,6 +827,11 @@ impl Interpreter {
             FutureWork::WriteBytes(path, bytes) => {
                 Ok(runtime_result(fs::write(path, bytes).map(|()| Value::Unit)))
             }
+            FutureWork::Connect(address) => Ok(runtime_result(
+                StdTcpStream::connect((address.host.as_str(), address.port)).map(|stream| {
+                    Value::TcpStream(RuntimeTcpStream(Arc::new(StdMutex::new(Some(stream)))))
+                }),
+            )),
         }
     }
 
@@ -1545,6 +1579,31 @@ impl Interpreter {
                 if matches!(&callee.node, Expression::Identifier(name) if name == "String") {
                     return Ok(Value::String(RuntimeString::with_capacity(0)));
                 }
+                if matches!(&callee.node, Expression::Identifier(name) if name == "SocketAddress") {
+                    let host = self.evaluate(program, &arguments[0])?;
+                    let Value::String(host) = host else {
+                        return Err(self.error(
+                            "SocketAddress host must be String or str",
+                            arguments[0].span,
+                        ));
+                    };
+                    if host.text.is_empty() {
+                        return Err(self.error("socket host cannot be empty", arguments[0].span));
+                    }
+                    if host.text.contains('\0') {
+                        return Err(
+                            self.error("socket host cannot contain a NUL byte", arguments[0].span)
+                        );
+                    }
+                    let port = self.index_value(program, &arguments[1])?;
+                    let port = u16::try_from(port).map_err(|_| {
+                        self.error("socket port is outside 0 through 65535", arguments[1].span)
+                    })?;
+                    return Ok(Value::SocketAddress(RuntimeSocketAddress {
+                        host: host.text,
+                        port,
+                    }));
+                }
                 if matches!(&callee.node, Expression::Identifier(name) if name == "Path") {
                     let value = self.evaluate(program, &arguments[0])?;
                     let path = runtime_path(value).ok_or_else(|| {
@@ -1726,6 +1785,18 @@ impl Interpreter {
                             Ok(Value::Future(RuntimeFuture::operation(FutureWork::Sleep(
                                 duration,
                             ))))
+                        }
+                        "connect" => {
+                            let value = self.consume(program, &arguments[0])?;
+                            let Value::SocketAddress(address) = value else {
+                                return Err(self.error(
+                                    "Async.connect expects SocketAddress",
+                                    arguments[0].span,
+                                ));
+                            };
+                            Ok(Value::Future(RuntimeFuture::operation(
+                                FutureWork::Connect(address),
+                            )))
                         }
                         "read_text" | "read_bytes" => {
                             let value = self.consume(program, &arguments[0])?;
@@ -2308,6 +2379,79 @@ impl Interpreter {
                             );
                         };
                         return handle.join(expression.span).map_err(RuntimeFault::Error);
+                    }
+                    if let Value::TcpStream(stream) = self.evaluate(program, object)? {
+                        return match field.as_str() {
+                            "read" => {
+                                let limit = self.index_value(program, &arguments[0])?;
+                                if limit > 16 * 1024 * 1024 {
+                                    return Err(self.error(
+                                        "TCP read limit exceeds the 16 MiB safety limit",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                let mut guard = stream.0.lock().map_err(|_| {
+                                    self.error("TCP stream state is poisoned", object.span)
+                                })?;
+                                let result = if let Some(socket) = guard.as_mut() {
+                                    let mut bytes = vec![0; limit];
+                                    socket.read(&mut bytes).map(|count| {
+                                        bytes.truncate(count);
+                                        Value::List {
+                                            capacity: bytes.len(),
+                                            values: bytes
+                                                .into_iter()
+                                                .map(|byte| Value::Unsigned(byte as u128, 8))
+                                                .collect(),
+                                        }
+                                    })
+                                } else {
+                                    Err(std::io::Error::new(
+                                        std::io::ErrorKind::NotConnected,
+                                        "TCP stream is closed",
+                                    ))
+                                };
+                                Ok(runtime_result(result))
+                            }
+                            "write" => {
+                                let value = self.evaluate(program, &arguments[0])?;
+                                let values = match value {
+                                    Value::List { values, .. } | Value::Slice(values) => values,
+                                    _ => unreachable!("type checking validates TCP bytes"),
+                                };
+                                let bytes = values
+                                    .into_iter()
+                                    .map(|value| match value {
+                                        Value::Unsigned(byte, 8) => byte as u8,
+                                        _ => unreachable!("type checking validates u8 elements"),
+                                    })
+                                    .collect::<Vec<_>>();
+                                let mut guard = stream.0.lock().map_err(|_| {
+                                    self.error("TCP stream state is poisoned", object.span)
+                                })?;
+                                let result = if let Some(socket) = guard.as_mut() {
+                                    socket
+                                        .write_all(&bytes)
+                                        .map(|()| Value::UInt(bytes.len() as u64))
+                                } else {
+                                    Err(std::io::Error::new(
+                                        std::io::ErrorKind::NotConnected,
+                                        "TCP stream is closed",
+                                    ))
+                                };
+                                Ok(runtime_result(result))
+                            }
+                            "close" => {
+                                let mut guard = stream.0.lock().map_err(|_| {
+                                    self.error("TCP stream state is poisoned", object.span)
+                                })?;
+                                if let Some(socket) = guard.take() {
+                                    let _ = socket.shutdown(Shutdown::Both);
+                                }
+                                Ok(Value::Unit)
+                            }
+                            _ => Err(self.error("unknown TcpStream operation", expression.span)),
+                        };
                     }
                     if let Value::Path(path) = self.evaluate(program, object)? {
                         return match field.as_str() {
@@ -3665,6 +3809,8 @@ fn value_type_name(value: &Value) -> &str {
         Value::CStr(_) => "CStr",
         Value::Memory(_) => "Memory",
         Value::Path(_) => "Path",
+        Value::SocketAddress(_) => "SocketAddress",
+        Value::TcpStream(_) => "TcpStream",
         Value::Instant(_) => "Instant",
         Value::Duration(_) => "Duration",
         Value::Thread(_) => "Thread",
@@ -3731,6 +3877,8 @@ fn value_is_copy(program: &Program, value: &Value) -> bool {
         | Value::MutexGuard(_)
         | Value::AtomicInt(_)
         | Value::Path(_)
+        | Value::SocketAddress(_)
+        | Value::TcpStream(_)
         | Value::String(_)
         | Value::CString(_)
         | Value::Memory(_)
@@ -4096,6 +4244,8 @@ fn display_value(value: Value) -> String {
         Value::CString(value) | Value::CStr(value) => value.text(),
         Value::Memory(_) => "<Memory>".into(),
         Value::Path(value) => value.to_string_lossy().into_owned(),
+        Value::SocketAddress(value) => format!("{}:{}", value.host, value.port),
+        Value::TcpStream(_) => "<TcpStream>".into(),
         Value::Instant(_) => "<Instant>".into(),
         Value::Duration(value) => format!("{}ns", value.as_nanos()),
         Value::Thread(_) => "<Thread>".into(),

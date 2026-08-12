@@ -6,6 +6,7 @@ pub fn compile_and_link(
     object: &Path,
     executable: &Path,
     optimized: bool,
+    networking: bool,
     libraries: &[String],
 ) -> Result<(), Diagnostic> {
     let mut compile = vec![
@@ -17,6 +18,9 @@ pub fn compile_and_link(
     ];
     if !cfg!(windows) {
         compile.push("-pthread".into());
+    }
+    if networking {
+        compile.push("-DDISP_NETWORKING".into());
     }
     compile.extend([
         "-c".into(),
@@ -34,6 +38,8 @@ pub fn compile_and_link(
     ];
     if !cfg!(windows) {
         link.push("-pthread".into());
+    } else if networking {
+        link.push("-lws2_32".into());
     }
     for library in libraries {
         link.push(format!("-l{library}"));

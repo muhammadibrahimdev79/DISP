@@ -22,6 +22,8 @@ pub enum Type {
     CStr,
     Memory,
     Path,
+    SocketAddress,
+    TcpStream,
     Instant,
     Duration,
     Array(Box<Type>, usize),
@@ -39,6 +41,7 @@ pub enum Type {
     Bool,
     ConversionError,
     IoError,
+    NetworkError,
     Unit,
     Struct(TypeId, Vec<Type>),
     Enum(TypeId, Vec<Type>),
@@ -1572,6 +1575,19 @@ impl TypeChecker {
                         )?;
                         return Ok(Type::Future(Box::new(Type::Unit)));
                     }
+                    if field == "connect" && arguments.len() == 1 {
+                        let address = self.check_expression(&arguments[0])?;
+                        self.require_same(
+                            &Type::SocketAddress,
+                            &address,
+                            arguments[0].span,
+                            "TCP connect address",
+                        )?;
+                        return Ok(Type::Future(Box::new(Type::Result(
+                            Box::new(Type::TcpStream),
+                            Box::new(Type::NetworkError),
+                        ))));
+                    }
                     if matches!(field.as_str(), "read_text" | "read_bytes") && arguments.len() == 1
                     {
                         self.require_path(&arguments[0])?;
@@ -1690,6 +1706,32 @@ impl TypeChecker {
                         ));
                     }
                     return Ok(Type::Path);
+                }
+                if matches!(&callee.node, Expression::Identifier(name) if name == "SocketAddress") {
+                    if arguments.len() != 2 {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            "`SocketAddress` expects a host and port",
+                            expression.span,
+                        ));
+                    }
+                    let host = self.check_expression(&arguments[0])?;
+                    if !matches!(host, Type::String | Type::Str) {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            "socket host must be String or str",
+                            arguments[0].span,
+                        ));
+                    }
+                    let port = self.check_expression(&arguments[1])?;
+                    if !is_integer(&port) {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            "socket port must be an integer from 0 through 65535",
+                            arguments[1].span,
+                        ));
+                    }
+                    return Ok(Type::SocketAddress);
                 }
                 if let Expression::FieldAccess { object, field, .. } = &callee.node
                     && let Expression::Identifier(owner) = &object.node
@@ -2550,6 +2592,41 @@ impl TypeChecker {
                             _ => {}
                         }
                     }
+                    if matches!(receiver, Type::TcpStream) {
+                        match field.as_str() {
+                            "read" if arguments.len() == 1 => {
+                                let limit = self.check_expression(&arguments[0])?;
+                                if !is_integer(&limit) {
+                                    return Err(Diagnostic::new(
+                                        DiagnosticKind::Type,
+                                        "TCP read limit must be an integer",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                return Ok(Type::Result(
+                                    Box::new(Type::List(Box::new(Type::Unsigned(8)))),
+                                    Box::new(Type::NetworkError),
+                                ));
+                            }
+                            "write" if arguments.len() == 1 => {
+                                let bytes = self.check_expression(&arguments[0])?;
+                                if !matches!(bytes, Type::List(ref element) | Type::Slice(ref element) if matches!(**element, Type::Unsigned(8)))
+                                {
+                                    return Err(Diagnostic::new(
+                                        DiagnosticKind::Type,
+                                        "TCP write expects List<u8> or a u8 slice",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                return Ok(Type::Result(
+                                    Box::new(Type::UInt),
+                                    Box::new(Type::NetworkError),
+                                ));
+                            }
+                            "close" if arguments.is_empty() => return Ok(Type::Unit),
+                            _ => {}
+                        }
+                    }
                     if matches!(receiver, Type::Instant)
                         && field == "elapsed"
                         && arguments.is_empty()
@@ -3295,9 +3372,12 @@ impl TypeChecker {
             "CFloat" if ty.arguments.is_empty() => Type::Float32,
             "CDouble" if ty.arguments.is_empty() => Type::Float,
             "Path" if ty.arguments.is_empty() => Type::Path,
+            "SocketAddress" if ty.arguments.is_empty() => Type::SocketAddress,
+            "TcpStream" if ty.arguments.is_empty() => Type::TcpStream,
             "Instant" if ty.arguments.is_empty() => Type::Instant,
             "Duration" if ty.arguments.is_empty() => Type::Duration,
             "IoError" if ty.arguments.is_empty() => Type::IoError,
+            "NetworkError" if ty.arguments.is_empty() => Type::NetworkError,
             "AtomicInt" if ty.arguments.is_empty() => Type::AtomicInt,
             "[]" if ty.arguments.len() == 1 => {
                 Type::Slice(Box::new(self.resolve_type(&ty.arguments[0])?))
@@ -3610,6 +3690,8 @@ impl TypeChecker {
             Type::CStr => "CStr".into(),
             Type::Memory => "Memory".into(),
             Type::Path => "Path".into(),
+            Type::SocketAddress => "SocketAddress".into(),
+            Type::TcpStream => "TcpStream".into(),
             Type::Instant => "Instant".into(),
             Type::Duration => "Duration".into(),
             Type::Str => "str".into(),
@@ -3632,6 +3714,7 @@ impl TypeChecker {
             Type::Bool => "Bool".into(),
             Type::ConversionError => "ConversionError".into(),
             Type::IoError => "IoError".into(),
+            Type::NetworkError => "NetworkError".into(),
             Type::Unit => "Unit".into(),
             Type::Struct(id, arguments) => self.format_nominal(&self.structs[id].name, arguments),
             Type::Enum(id, arguments) => self.format_nominal(&self.enums[id].name, arguments),

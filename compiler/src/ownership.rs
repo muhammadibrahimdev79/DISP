@@ -30,6 +30,8 @@ enum Ty {
     CStr,
     Memory,
     Path,
+    SocketAddress,
+    TcpStream,
     Instant,
     Duration,
     Function,
@@ -1169,6 +1171,12 @@ impl<'a> Analyzer<'a> {
                 }
                 return Ok(Ty::Path);
             }
+            if name == "SocketAddress" {
+                for argument in arguments {
+                    self.check_expr(argument, UseMode::Read)?;
+                }
+                return Ok(Ty::SocketAddress);
+            }
             if name == "print" {
                 for argument in arguments {
                     self.check_expr(argument, UseMode::Read)?;
@@ -1244,6 +1252,13 @@ impl<'a> Analyzer<'a> {
                     "sleep" => {
                         self.check_expr(&arguments[0], UseMode::Read)?;
                         Ok(Ty::Future(Box::new(Ty::Unit)))
+                    }
+                    "connect" => {
+                        self.check_expr(&arguments[0], UseMode::Consume)?;
+                        Ok(Ty::Future(Box::new(Ty::Result(
+                            Box::new(Ty::TcpStream),
+                            Box::new(Ty::Owned("NetworkError".into())),
+                        ))))
                     }
                     "read_text" | "read_bytes" => {
                         self.check_expr(&arguments[0], UseMode::Consume)?;
@@ -1406,6 +1421,25 @@ impl<'a> Analyzer<'a> {
                     "name" | "extension" => Ty::Option(Box::new(Ty::Owned("String".into()))),
                     "parent" => Ty::Option(Box::new(Ty::Path)),
                     _ => Ty::Copy,
+                });
+            }
+            if matches!(self.expr_ty(object), Ok(Ty::TcpStream)) {
+                let place = self.place(object)?;
+                self.check_borrow(&place, true, object.span)?;
+                self.use_place(&place, UseMode::Read, object.span)?;
+                for argument in arguments {
+                    self.check_expr(argument, UseMode::Read)?;
+                }
+                return Ok(match field.as_str() {
+                    "read" => Ty::Result(
+                        Box::new(Ty::List(Box::new(Ty::Copy))),
+                        Box::new(Ty::Owned("NetworkError".into())),
+                    ),
+                    "write" => Ty::Result(
+                        Box::new(Ty::Copy),
+                        Box::new(Ty::Owned("NetworkError".into())),
+                    ),
+                    _ => Ty::Unit,
                 });
             }
             if matches!(self.expr_ty(object), Ok(Ty::Instant)) {
@@ -2508,6 +2542,8 @@ impl<'a> Analyzer<'a> {
             "CInt" | "CUInt" | "CSize" | "CSSize" | "CChar" | "CUChar" | "CShort" | "CUShort"
             | "CLongLong" | "CULongLong" | "CFloat" | "CDouble" => Ty::Copy,
             "Path" => Ty::Path,
+            "SocketAddress" => Ty::SocketAddress,
+            "TcpStream" => Ty::TcpStream,
             "Instant" => Ty::Instant,
             "Duration" => Ty::Duration,
             "Self" if self.self_type.is_some() => {
@@ -2550,6 +2586,8 @@ impl<'a> Analyzer<'a> {
             Ty::Array(element) => self.ty_is_copy(element),
             Ty::Slice(_) | Ty::Str | Ty::CStr | Ty::Instant | Ty::Duration => true,
             Ty::Path
+            | Ty::SocketAddress
+            | Ty::TcpStream
             | Ty::CString
             | Ty::Memory
             | Ty::List(_)

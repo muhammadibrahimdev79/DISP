@@ -22,7 +22,9 @@ awaited or is cancelled with deterministic cleanup before its async scope exits.
 `spawn function()` syntax creates an operating-system thread. An `async fn main()` is driven
 automatically. `Async.sleep`, `Async.read_text`, `Async.read_bytes`, `Async.write_text`, and
 `Async.write_bytes` are lazy owned futures; synchronous `Time.*` and `File.*` operations remain
-available. Cancelling an unpolled I/O future has no side effects. Once native I/O has started,
+available. `SocketAddress` validates owned host/port pairs and `Async.connect` produces an owned
+`TcpStream` with typed `NetworkError` failures, byte reads/writes, explicit close, and automatic
+drop cleanup. Cancelling an unpolled I/O future has no side effects. Once native I/O has started,
 cancellation discards its result but lets the operating-system operation finish, and shutdown
 drains that work so owned resources are released deterministically. The implementation
 remains under active development and should not

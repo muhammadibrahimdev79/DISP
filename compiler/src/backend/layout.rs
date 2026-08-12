@@ -67,6 +67,15 @@ impl<'a> LayoutEngine<'a> {
                     self.target.pointer_alignment,
                 ])
             }
+            hir::Type::SocketAddress => aggregate(&[
+                self.target.pointer_alignment,
+                self.target.pointer_alignment,
+                2,
+            ]),
+            hir::Type::TcpStream => scalar(
+                u64::from(self.target.pointer_width) / 8,
+                self.target.pointer_alignment,
+            ),
             hir::Type::Str => {
                 aggregate(&[self.target.pointer_alignment, self.target.pointer_alignment])
             }

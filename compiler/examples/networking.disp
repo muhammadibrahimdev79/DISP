@@ -1,0 +1,10 @@
+async fn inspect(address: SocketAddress) {
+    result = await Async.connect(address)
+    print(match result { Ok(stream) => true, Err(error) => false })
+}
+
+async fn main() {
+    // Port zero is never a remote service, so this demonstrates typed failure
+    // without relying on the public internet.
+    await inspect(SocketAddress("127.0.0.1", 0))
+}

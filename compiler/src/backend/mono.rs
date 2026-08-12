@@ -153,12 +153,237 @@ pub fn collect(program: &mir::Program) -> Result<MonoProgram, Diagnostic> {
                 &generic_names,
             )?;
         }
+        for block in &function.blocks {
+            for statement in &block.statements {
+                collect_statement_types(
+                    program,
+                    function,
+                    statement,
+                    &substitutions,
+                    &mut types,
+                    &generic_names,
+                )?;
+            }
+            collect_terminator_types(
+                program,
+                function,
+                &block.terminator,
+                &substitutions,
+                &mut types,
+                &generic_names,
+            )?;
+        }
     }
     Ok(MonoProgram {
         instances,
         types: types.into_iter().collect(),
         entry,
     })
+}
+
+fn collect_place_type(
+    program: &mir::Program,
+    function: &mir::Function,
+    place: &mir::Place,
+    substitutions: &HashMap<String, hir::Type>,
+    types: &mut BTreeSet<TypeInstance>,
+    generic_names: &BTreeSet<String>,
+) -> Result<(), Diagnostic> {
+    let ty = projected_place_type(program, function, place)
+        .ok_or_else(|| error("MIR place has no type during monomorphization"))?;
+    collect_type(
+        program,
+        &substitute(&ty, substitutions),
+        types,
+        generic_names,
+    )
+}
+
+fn collect_operand_type(
+    program: &mir::Program,
+    function: &mir::Function,
+    operand: &mir::Operand,
+    substitutions: &HashMap<String, hir::Type>,
+    types: &mut BTreeSet<TypeInstance>,
+    generic_names: &BTreeSet<String>,
+) -> Result<(), Diagnostic> {
+    if let mir::Operand::Move(place) | mir::Operand::Copy(place) = operand {
+        collect_place_type(
+            program,
+            function,
+            place,
+            substitutions,
+            types,
+            generic_names,
+        )?;
+    }
+    Ok(())
+}
+
+fn collect_rvalue_types(
+    program: &mir::Program,
+    function: &mir::Function,
+    rvalue: &mir::Rvalue,
+    substitutions: &HashMap<String, hir::Type>,
+    types: &mut BTreeSet<TypeInstance>,
+    generic_names: &BTreeSet<String>,
+) -> Result<(), Diagnostic> {
+    let mut operand = |value| {
+        collect_operand_type(
+            program,
+            function,
+            value,
+            substitutions,
+            types,
+            generic_names,
+        )
+    };
+    match rvalue {
+        mir::Rvalue::Use(value)
+        | mir::Rvalue::UnaryOp(_, value)
+        | mir::Rvalue::Cast { operand: value, .. } => operand(value)?,
+        mir::Rvalue::BinaryOp(_, left, right) => {
+            operand(left)?;
+            operand(right)?;
+        }
+        mir::Rvalue::Closure { captures, .. } | mir::Rvalue::Aggregate(_, captures) => {
+            for value in captures {
+                operand(value)?;
+            }
+        }
+        mir::Rvalue::BorrowShared(place)
+        | mir::Rvalue::BorrowMut(place)
+        | mir::Rvalue::RawAddress { place, .. }
+        | mir::Rvalue::Discriminant(place)
+        | mir::Rvalue::Len(place) => collect_place_type(
+            program,
+            function,
+            place,
+            substitutions,
+            types,
+            generic_names,
+        )?,
+        mir::Rvalue::Function(_) => {}
+    }
+    if let mir::Rvalue::Cast { target, .. } = rvalue {
+        collect_type(
+            program,
+            &substitute(target, substitutions),
+            types,
+            generic_names,
+        )?;
+    }
+    Ok(())
+}
+
+fn collect_statement_types(
+    program: &mir::Program,
+    function: &mir::Function,
+    statement: &mir::Statement,
+    substitutions: &HashMap<String, hir::Type>,
+    types: &mut BTreeSet<TypeInstance>,
+    generic_names: &BTreeSet<String>,
+) -> Result<(), Diagnostic> {
+    match &statement.kind {
+        mir::StatementKind::Assign(place, rvalue) => {
+            collect_place_type(
+                program,
+                function,
+                place,
+                substitutions,
+                types,
+                generic_names,
+            )?;
+            collect_rvalue_types(
+                program,
+                function,
+                rvalue,
+                substitutions,
+                types,
+                generic_names,
+            )?;
+        }
+        mir::StatementKind::Drop { place, .. } => collect_place_type(
+            program,
+            function,
+            place,
+            substitutions,
+            types,
+            generic_names,
+        )?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn collect_terminator_types(
+    program: &mir::Program,
+    function: &mir::Function,
+    terminator: &mir::Terminator,
+    substitutions: &HashMap<String, hir::Type>,
+    types: &mut BTreeSet<TypeInstance>,
+    generic_names: &BTreeSet<String>,
+) -> Result<(), Diagnostic> {
+    let mut operand = |value| {
+        collect_operand_type(
+            program,
+            function,
+            value,
+            substitutions,
+            types,
+            generic_names,
+        )
+    };
+    match terminator {
+        mir::Terminator::SwitchBool { condition, .. }
+        | mir::Terminator::SwitchValue {
+            discriminant: condition,
+            ..
+        }
+        | mir::Terminator::SwitchEnum {
+            discriminant: condition,
+            ..
+        } => operand(condition)?,
+        mir::Terminator::Call {
+            arguments,
+            destination,
+            ..
+        }
+        | mir::Terminator::Spawn {
+            arguments,
+            destination,
+            ..
+        } => {
+            for argument in arguments {
+                operand(argument)?;
+            }
+            collect_place_type(
+                program,
+                function,
+                destination,
+                substitutions,
+                types,
+                generic_names,
+            )?;
+        }
+        mir::Terminator::Await {
+            future,
+            destination,
+            ..
+        } => {
+            operand(future)?;
+            collect_place_type(
+                program,
+                function,
+                destination,
+                substitutions,
+                types,
+                generic_names,
+            )?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn collect_type(
@@ -261,6 +486,7 @@ fn collect_type(
         hir::Type::Future(result) => {
             collect_type(program, result, types, generic_names)?;
         }
+        hir::Type::SocketAddress | hir::Type::TcpStream => {}
         hir::Type::Task(result) => {
             collect_type(program, result, types, generic_names)?;
         }
@@ -343,7 +569,7 @@ pub fn resolve_target(
                 .filter(|local| local.kind == mir::LocalKind::Argument)
                 .zip(arguments)
             {
-                if let Some(actual) = operand_type(caller, argument) {
+                if let Some(actual) = operand_type(program, caller, argument) {
                     let actual = substitute(&actual, &caller_map);
                     if !match_type(&parameter.ty, &actual, &mut inferred) {
                         return Err(error("call arguments do not match during monomorphization"));
@@ -369,7 +595,7 @@ pub fn resolve_target(
             let receiver = arguments
                 .first()
                 .ok_or_else(|| error("trait call has no receiver"))?;
-            let receiver_ty = operand_type(caller, receiver)
+            let receiver_ty = operand_type(program, caller, receiver)
                 .map(|ty| substitute(&ty, &caller_map))
                 .ok_or_else(|| error("trait receiver has no concrete type"))?;
             let receiver_ty = match receiver_ty {
@@ -408,12 +634,84 @@ pub fn resolve_target(
     }
 }
 
-fn operand_type(function: &mir::Function, operand: &mir::Operand) -> Option<hir::Type> {
+fn projected_place_type(
+    program: &mir::Program,
+    function: &mir::Function,
+    place: &mir::Place,
+) -> Option<hir::Type> {
+    let mut ty = function.locals.get(place.local.0)?.ty.clone();
+    for projection in &place.projections {
+        ty = match (projection, ty) {
+            (mir::Projection::SafeDereference, hir::Type::Reference { inner, .. })
+            | (mir::Projection::SafeDereference, hir::Type::MutexGuard(inner))
+            | (mir::Projection::RawDereference, hir::Type::RawPointer { inner, .. }) => *inner,
+            (mir::Projection::Field(index), hir::Type::Struct(id, arguments)) => {
+                let declaration = program.structs.get(id.0)?;
+                let substitutions = declaration
+                    .generic_parameters
+                    .iter()
+                    .cloned()
+                    .zip(arguments)
+                    .collect::<HashMap<_, _>>();
+                substitute(&declaration.fields.get(*index)?.ty, &substitutions)
+            }
+            (mir::Projection::VariantField(variant, index), hir::Type::Enum(id, arguments)) => {
+                let declaration = program.enums.get(id.0)?;
+                let substitutions = declaration
+                    .generic_parameters
+                    .iter()
+                    .cloned()
+                    .zip(arguments)
+                    .collect::<HashMap<_, _>>();
+                let variant = declaration
+                    .variants
+                    .iter()
+                    .find(|candidate| candidate.id == *variant)?;
+                substitute(variant.payload.get(*index)?, &substitutions)
+            }
+            (mir::Projection::VariantField(variant, 0), hir::Type::Option(inner))
+                if *variant == hir::builtin_variant("Some") =>
+            {
+                *inner
+            }
+            (mir::Projection::VariantField(variant, 0), hir::Type::Result(ok, error)) => {
+                if *variant == hir::builtin_variant("Ok") {
+                    *ok
+                } else if *variant == hir::builtin_variant("Err") {
+                    *error
+                } else {
+                    return None;
+                }
+            }
+            (
+                mir::Projection::Index { .. },
+                hir::Type::Array(element, _)
+                | hir::Type::Slice(element)
+                | hir::Type::List(element)
+                | hir::Type::Set(element),
+            ) => *element,
+            (
+                mir::Projection::Subslice { .. },
+                hir::Type::Array(element, _) | hir::Type::Slice(element) | hir::Type::List(element),
+            ) => hir::Type::Slice(element),
+            (mir::Projection::Subslice { .. }, hir::Type::String | hir::Type::Str) => {
+                hir::Type::Str
+            }
+            _ => return None,
+        };
+    }
+    Some(ty)
+}
+
+fn operand_type(
+    program: &mir::Program,
+    function: &mir::Function,
+    operand: &mir::Operand,
+) -> Option<hir::Type> {
     match operand {
-        mir::Operand::Move(place) | mir::Operand::Copy(place) => function
-            .locals
-            .get(place.local.0)
-            .map(|local| local.ty.clone()),
+        mir::Operand::Move(place) | mir::Operand::Copy(place) => {
+            projected_place_type(program, function, place)
+        }
         mir::Operand::Constant(constant) => Some(match constant {
             mir::Constant::Signed(_, width) => hir::Type::Int {
                 signed: true,
@@ -533,6 +831,8 @@ pub fn type_code(ty: &hir::Type) -> String {
         hir::Type::CStr => "cz".into(),
         hir::Type::Memory => "mem".into(),
         hir::Type::Path => "p".into(),
+        hir::Type::SocketAddress => "na".into(),
+        hir::Type::TcpStream => "nt".into(),
         hir::Type::Instant => "ti".into(),
         hir::Type::Duration => "td".into(),
         hir::Type::Str => "z".into(),

@@ -8,12 +8,22 @@ pub const C_RUNTIME: &str = r#"
 #include <string.h>
 #include <math.h>
 #include <errno.h>
+#include <limits.h>
 #include <time.h>
 #include <sys/stat.h>
 #ifdef _WIN32
+#ifdef DISP_NETWORKING
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
 #include <windows.h>
 #include <direct.h>
 #else
+#ifdef DISP_NETWORKING
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#endif
 #include <dirent.h>
 #include <pthread.h>
 #include <sched.h>
@@ -169,14 +179,72 @@ typedef struct disp_async_file_state {
     disp_native_string value;
     disp_native_string error;
 } disp_async_file_state;
-static atomic_size_t disp_async_file_jobs=ATOMIC_VAR_INIT(0);
+static atomic_size_t disp_async_jobs=ATOMIC_VAR_INIT(0);
 static void disp_async_file_release(disp_async_file_state *state){if(atomic_fetch_sub_explicit(&state->refs,1,memory_order_acq_rel)!=1)return;atomic_thread_fence(memory_order_acquire);disp_path_drop(&state->path);disp_string_drop(&state->input);disp_string_drop(&state->value);disp_string_drop(&state->error);disp_dealloc(state);}
-static void disp_async_file_worker(void *raw){disp_async_file_state *state=(disp_async_file_state*)raw;if(state->operation==DISP_ASYNC_READ_TEXT)state->ok=disp_file_read_text(&state->path,&state->value,&state->error);else if(state->operation==DISP_ASYNC_READ_BYTES)state->ok=disp_file_read_bytes(&state->path,&state->value,&state->error);else state->ok=disp_file_write_text(&state->path,state->input.data,state->input.len,false,&state->error);disp_path_drop(&state->path);disp_string_drop(&state->input);atomic_store_explicit(&state->done,true,memory_order_release);disp_async_file_release(state);atomic_fetch_sub_explicit(&disp_async_file_jobs,1,memory_order_acq_rel);}
+static void disp_async_file_worker(void *raw){disp_async_file_state *state=(disp_async_file_state*)raw;if(state->operation==DISP_ASYNC_READ_TEXT)state->ok=disp_file_read_text(&state->path,&state->value,&state->error);else if(state->operation==DISP_ASYNC_READ_BYTES)state->ok=disp_file_read_bytes(&state->path,&state->value,&state->error);else state->ok=disp_file_write_text(&state->path,state->input.data,state->input.len,false,&state->error);disp_path_drop(&state->path);disp_string_drop(&state->input);atomic_store_explicit(&state->done,true,memory_order_release);disp_async_file_release(state);atomic_fetch_sub_explicit(&disp_async_jobs,1,memory_order_acq_rel);}
 static disp_async_file_state *disp_async_file_create(disp_async_file_operation operation,disp_native_path path,disp_native_string input,int line,int column){disp_async_file_state *state=(disp_async_file_state*)disp_alloc_zeroed(1,sizeof(disp_async_file_state),_Alignof(disp_async_file_state));atomic_init(&state->refs,1);atomic_init(&state->done,false);atomic_init(&state->cancelled,false);state->operation=operation;state->path=path;state->input=input;state->line=line;state->column=column;return state;}
-static bool disp_async_file_poll(disp_async_file_state *state){if(!state||state->taken)dv_panic("async file operation has already completed",0,0);if(!state->started){state->started=true;atomic_fetch_add_explicit(&state->refs,1,memory_order_relaxed);atomic_fetch_add_explicit(&disp_async_file_jobs,1,memory_order_relaxed);uintptr_t handle=disp_thread_start(disp_async_file_worker,state,state->line,state->column);disp_thread_detach(handle);}if(!atomic_load_explicit(&state->done,memory_order_acquire)){disp_reactor_offer(1000000ULL);return false;}return true;}
+static bool disp_async_file_poll(disp_async_file_state *state){if(!state||state->taken)dv_panic("async file operation has already completed",0,0);if(!state->started){state->started=true;atomic_fetch_add_explicit(&state->refs,1,memory_order_relaxed);atomic_fetch_add_explicit(&disp_async_jobs,1,memory_order_relaxed);uintptr_t handle=disp_thread_start(disp_async_file_worker,state,state->line,state->column);disp_thread_detach(handle);}if(!atomic_load_explicit(&state->done,memory_order_acquire)){disp_reactor_offer(1000000ULL);return false;}return true;}
 static void disp_async_file_take(disp_async_file_state *state,bool *ok,disp_native_string *value,disp_native_string *error){if(!atomic_load_explicit(&state->done,memory_order_acquire)||state->taken)dv_panic("async file result is not ready",0,0);state->taken=true;*ok=state->ok;*value=state->value;*error=state->error;state->value=(disp_native_string){0};state->error=(disp_native_string){0};}
 static void disp_async_file_drop(void *raw){disp_async_file_state *state=(disp_async_file_state*)raw;if(!state)return;atomic_store_explicit(&state->cancelled,true,memory_order_release);disp_async_file_release(state);}
-static void disp_async_file_drain(void){while(atomic_load_explicit(&disp_async_file_jobs,memory_order_acquire))disp_time_sleep(1000000ULL);}
+static void disp_async_file_drain(void){while(atomic_load_explicit(&disp_async_jobs,memory_order_acquire))disp_time_sleep(1000000ULL);}
+#ifdef DISP_NETWORKING
+static disp_native_socket_address disp_socket_address_create(const char *host,size_t len,uint64_t port,int line,int column){if(!len)dv_panic("socket host cannot be empty",line,column);if(memchr(host,0,len))dv_panic("socket host cannot contain a NUL byte",line,column);if(port>65535)dv_panic("socket port is outside 0 through 65535",line,column);disp_native_socket_address address={0};address.host=(char*)disp_alloc(len+1,1);memcpy(address.host,host,len);address.host[len]=0;address.len=len;address.port=(uint16_t)port;return address;}
+static void disp_socket_address_drop(disp_native_socket_address *address){disp_dealloc(address->host);address->host=NULL;address->len=0;address->port=0;}
+#ifdef _WIN32
+typedef SOCKET disp_socket_handle;
+#define DISP_INVALID_SOCKET INVALID_SOCKET
+static INIT_ONCE disp_network_once=INIT_ONCE_STATIC_INIT;
+static int disp_network_init_error=0;
+static void disp_network_cleanup(void){WSACleanup();}
+static BOOL CALLBACK disp_network_init_once(PINIT_ONCE once,PVOID parameter,PVOID *context){(void)once;(void)parameter;(void)context;WSADATA data;disp_network_init_error=WSAStartup(MAKEWORD(2,2),&data);if(!disp_network_init_error)atexit(disp_network_cleanup);return TRUE;}
+static void disp_network_init(void){InitOnceExecuteOnce(&disp_network_once,disp_network_init_once,NULL,NULL);if(disp_network_init_error)dv_panic("could not initialize Windows networking",0,0);}
+static void disp_socket_close(disp_socket_handle socket){if(socket!=DISP_INVALID_SOCKET)closesocket(socket);}
+static int disp_socket_error_code(void){return WSAGetLastError();}
+#else
+typedef int disp_socket_handle;
+#define DISP_INVALID_SOCKET (-1)
+static void disp_network_init(void){}
+static void disp_socket_close(disp_socket_handle socket){if(socket!=DISP_INVALID_SOCKET)close(socket);}
+static int disp_socket_error_code(void){return errno;}
+#endif
+struct disp_tcp_state { disp_socket_handle socket;bool closed; };
+static disp_native_string disp_network_error_code(const char *operation,int code){char message[160];int length=snprintf(message,sizeof(message),"%s failed with network error %d",operation,code);if(length<0)length=0;return disp_owned_bytes(message,(size_t)length);}
+static void disp_tcp_stream_drop(disp_native_tcp_stream *stream){if(!stream->state)return;if(!stream->state->closed)disp_socket_close(stream->state->socket);disp_dealloc(stream->state);stream->state=NULL;}
+static void disp_tcp_stream_close(disp_native_tcp_stream *stream){if(!stream->state||stream->state->closed)return;disp_socket_close(stream->state->socket);stream->state->closed=true;}
+static bool disp_tcp_stream_read(disp_native_tcp_stream *stream,size_t limit,disp_native_string *bytes,disp_native_string *error,int line,int column){if(!stream->state||stream->state->closed){*error=disp_owned_bytes("TCP stream is closed",20);return false;}if(limit>16777216ULL)dv_panic("TCP read limit exceeds the 16 MiB safety limit",line,column);if(!limit)return true;char *data=(char*)disp_alloc(limit,1);
+#ifdef _WIN32
+int count=recv(stream->state->socket,data,(int)limit,0);
+#else
+ssize_t count=recv(stream->state->socket,data,limit,0);
+#endif
+if(count<0){int code=disp_socket_error_code();disp_dealloc(data);*error=disp_network_error_code("TCP read",code);return false;}if(!count){disp_dealloc(data);return true;}bytes->data=data;bytes->len=(size_t)count;bytes->cap=limit;return true;}
+static bool disp_tcp_stream_write(disp_native_tcp_stream *stream,const char *bytes,size_t len,size_t *written,disp_native_string *error){if(!stream->state||stream->state->closed){*error=disp_owned_bytes("TCP stream is closed",20);return false;}*written=0;while(*written<len){
+#ifdef _WIN32
+int chunk=(int)((len-*written)>INT_MAX?INT_MAX:(len-*written));int count=send(stream->state->socket,bytes+*written,chunk,0);
+#else
+ssize_t count=send(stream->state->socket,bytes+*written,len-*written,
+#ifdef MSG_NOSIGNAL
+MSG_NOSIGNAL
+#else
+0
+#endif
+);
+#endif
+if(count<=0){*error=disp_network_error_code("TCP write",disp_socket_error_code());return false;}*written+=(size_t)count;}return true;}
+typedef struct { atomic_size_t refs;atomic_bool done;atomic_bool cancelled;bool started;bool taken;bool ok;int line;int column;disp_native_socket_address address;disp_native_tcp_stream stream;disp_native_string error; } disp_connect_state;
+static void disp_connect_release(disp_connect_state *state){if(atomic_fetch_sub_explicit(&state->refs,1,memory_order_acq_rel)!=1)return;atomic_thread_fence(memory_order_acquire);disp_socket_address_drop(&state->address);disp_tcp_stream_drop(&state->stream);disp_string_drop(&state->error);disp_dealloc(state);}
+static void disp_connect_worker(void *raw){disp_connect_state *state=(disp_connect_state*)raw;disp_network_init();char port[6];snprintf(port,sizeof(port),"%u",(unsigned)state->address.port);struct addrinfo hints={0},*addresses=NULL;hints.ai_family=AF_UNSPEC;hints.ai_socktype=SOCK_STREAM;hints.ai_protocol=IPPROTO_TCP;int status=getaddrinfo(state->address.host,port,&hints,&addresses);if(status!=0){
+#ifdef _WIN32
+const char *message=gai_strerrorA(status);
+#else
+const char *message=gai_strerror(status);
+#endif
+state->error=disp_owned_bytes(message?message:"address resolution failed",message?strlen(message):25);}else{int last_error=0;for(struct addrinfo *address=addresses;address;address=address->ai_next){if(atomic_load_explicit(&state->cancelled,memory_order_acquire))break;disp_socket_handle socket_handle=socket(address->ai_family,address->ai_socktype,address->ai_protocol);if(socket_handle==DISP_INVALID_SOCKET){last_error=disp_socket_error_code();continue;}if(connect(socket_handle,address->ai_addr,(int)address->ai_addrlen)==0){disp_tcp_state *stream=(disp_tcp_state*)disp_alloc(sizeof(disp_tcp_state),_Alignof(disp_tcp_state));stream->socket=socket_handle;stream->closed=false;state->stream=(disp_native_tcp_stream){.state=stream};state->ok=true;break;}last_error=disp_socket_error_code();disp_socket_close(socket_handle);}if(!state->ok&&!atomic_load_explicit(&state->cancelled,memory_order_acquire))state->error=disp_network_error_code("TCP connect",last_error);freeaddrinfo(addresses);}disp_socket_address_drop(&state->address);atomic_store_explicit(&state->done,true,memory_order_release);disp_connect_release(state);atomic_fetch_sub_explicit(&disp_async_jobs,1,memory_order_acq_rel);}
+static disp_connect_state *disp_connect_create(disp_native_socket_address address,int line,int column){disp_connect_state *state=(disp_connect_state*)disp_alloc_zeroed(1,sizeof(disp_connect_state),_Alignof(disp_connect_state));atomic_init(&state->refs,1);atomic_init(&state->done,false);atomic_init(&state->cancelled,false);state->address=address;state->line=line;state->column=column;return state;}
+static bool disp_connect_poll(disp_connect_state *state){if(!state||state->taken)dv_panic("TCP connect future has already completed",0,0);if(!state->started){state->started=true;atomic_fetch_add_explicit(&state->refs,1,memory_order_relaxed);atomic_fetch_add_explicit(&disp_async_jobs,1,memory_order_relaxed);uintptr_t handle=disp_thread_start(disp_connect_worker,state,state->line,state->column);disp_thread_detach(handle);}if(!atomic_load_explicit(&state->done,memory_order_acquire)){disp_reactor_offer(1000000ULL);return false;}return true;}
+static void disp_connect_take(disp_connect_state *state,bool *ok,disp_native_tcp_stream *stream,disp_native_string *error){if(!atomic_load_explicit(&state->done,memory_order_acquire)||state->taken)dv_panic("TCP connect result is not ready",0,0);state->taken=true;*ok=state->ok;*stream=state->stream;*error=state->error;state->stream=(disp_native_tcp_stream){0};state->error=(disp_native_string){0};}
+static void disp_connect_drop(void *raw){disp_connect_state *state=(disp_connect_state*)raw;if(!state)return;atomic_store_explicit(&state->cancelled,true,memory_order_release);disp_connect_release(state);}
+#endif
 static bool disp_directory_create(const disp_native_path *path,disp_native_string *error){
 #ifdef _WIN32
 int result=_mkdir(path->data);

@@ -634,17 +634,20 @@ UdpSocket
 
 # 34. TCP
 
-Example:
+The currently implemented client foundation uses an explicit validated address and a lazy
+connect future. A stream is owned, non-Copy, and closed deterministically when dropped:
 
 ```disp
-let socket = TcpSocket.connect("example.com", 443)?
+connected = await Async.connect(SocketAddress("example.com", 443))
+var stream = connected?
+stream.write(request_bytes)?
+response = stream.read(4096)?
+stream.close()
 ```
 
-Async:
-
-```disp
-let socket = await TcpSocket.connect("example.com", 443)?
-```
+`read` and `write` return `Result<_, NetworkError>`. Reads are bounded to 16 MiB per call,
+and text protocols must explicitly validate or decode the returned `List<u8>`. Server listeners,
+UDP, readiness-driven stream operations, and high-level protocol clients remain design work.
 
 ---
 

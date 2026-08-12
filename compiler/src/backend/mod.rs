@@ -45,6 +45,7 @@ pub fn build(
     let abi = abi::lower(hir, mir, &mono, target)?;
     let native_types = native_types::generate(hir, &mono, target)?;
     let generated = codegen::generate(mir, &mono, &abi, &native_types)?;
+    let networking = generated.source.contains("disp_Async_connect_poll_");
     let project_root;
     let (stem, parent) = if source_path.is_dir() {
         project_root = if source_path.is_absolute() {
@@ -101,6 +102,7 @@ pub fn build(
         &object_path,
         &executable_path,
         options.optimized,
+        networking,
         &libraries,
     )?;
     if !options.emit_c {

@@ -48,8 +48,8 @@ pub fn generate(
     for result in task_result_types(program, instances) {
         task_result_drop_wrapper(program, &result, &mut output);
     }
-    for (operation, result) in async_io_operations(program, instances) {
-        async_io_poll_wrapper(&operation, &result, &mut output);
+    for (operation, result) in async_operations(program, instances) {
+        async_poll_wrapper(&operation, &result, &mut output);
     }
     for target in callable_targets(program, instances)? {
         callable_wrapper(program, &target, &mut output);
@@ -153,7 +153,7 @@ fn task_result_drop_wrapper(program: &mir::Program, result: &hir::Type, output: 
     .unwrap();
 }
 
-fn async_io_operations(
+fn async_operations(
     program: &mir::Program,
     instances: &mono::MonoProgram,
 ) -> BTreeSet<(String, hir::Type)> {
@@ -173,6 +173,7 @@ fn async_io_operations(
                         | "Async.read_bytes"
                         | "Async.write_text"
                         | "Async.write_bytes"
+                        | "Async.connect"
                 )
             {
                 let hir::Type::Future(result) =
@@ -187,7 +188,7 @@ fn async_io_operations(
     operations
 }
 
-fn async_io_poll_name(operation: &str, result: &hir::Type) -> String {
+fn async_poll_name(operation: &str, result: &hir::Type) -> String {
     format!(
         "disp_{}_poll_{}",
         operation.replace('.', "_"),
@@ -195,9 +196,17 @@ fn async_io_poll_name(operation: &str, result: &hir::Type) -> String {
     )
 }
 
-fn async_io_poll_wrapper(operation: &str, result: &hir::Type, output: &mut String) {
+fn async_poll_wrapper(operation: &str, result: &hir::Type, output: &mut String) {
     let result_c = native_types::c_type(result);
-    let poll = async_io_poll_name(operation, result);
+    let poll = async_poll_name(operation, result);
+    if operation == "Async.connect" {
+        writeln!(
+            output,
+            "static bool {poll}(void *raw,void *output){{disp_connect_state *state=(disp_connect_state*)raw;if(!disp_connect_poll(state))return false;bool ok=false;disp_native_tcp_stream stream={{0}};disp_native_string error={{0}};disp_connect_take(state,&ok,&stream,&error);{result_c} *result=({result_c}*)output;*result=({result_c}){{0}};if(ok){{result->tag=0;result->payload.v0.f0=stream;}}else{{result->tag=1;result->payload.v1.f0=error;}}return true;}}"
+        )
+        .unwrap();
+        return;
+    }
     writeln!(
         output,
         "static bool {poll}(void *raw,void *output){{disp_async_file_state *state=(disp_async_file_state*)raw;if(!disp_async_file_poll(state))return false;bool ok=false;disp_native_string value={{0}},error={{0}};disp_async_file_take(state,&ok,&value,&error);{result_c} *result=({result_c}*)output;*result=({result_c}){{0}};if(ok){{"
@@ -434,6 +443,8 @@ pub fn supported(program: &mir::Program, ty: &hir::Type) -> bool {
         | hir::Type::CStr
         | hir::Type::Memory
         | hir::Type::Path
+        | hir::Type::SocketAddress
+        | hir::Type::TcpStream
         | hir::Type::Instant
         | hir::Type::Duration
         | hir::Type::Int { .. }
@@ -485,7 +496,12 @@ pub fn supported(program: &mir::Program, ty: &hir::Type) -> bool {
                 .all(|argument| supported(program, argument))
                 && supported(program, result)
         }
-        hir::Type::Generic(name) => matches!(name.as_str(), "ConversionError" | "IoError"),
+        hir::Type::Generic(name) => {
+            matches!(
+                name.as_str(),
+                "ConversionError" | "IoError" | "NetworkError"
+            )
+        }
         _ => false,
     }
 }
@@ -915,6 +931,19 @@ fn terminator(
                     );
                     format!("disp_future_sleep({duration})")
                 }
+                hir::CallTarget::Intrinsic(name) if name == "Async.connect" => {
+                    let hir::Type::Future(result) = &destination_ty else {
+                        unreachable!("Async.connect destination must be Future<T>")
+                    };
+                    let address_ty = operand_ty(program, function, &arguments[0], substitutions);
+                    let address =
+                        operand(program, function, &arguments[0], &address_ty, substitutions);
+                    let poll = async_poll_name(name, result);
+                    format!(
+                        "({{disp_connect_state *_state=disp_connect_create({address},{},{});(disp_native_future){{.context=_state,.poll={poll},.drop=disp_connect_drop}};}})",
+                        span.start.line, span.start.column
+                    )
+                }
                 hir::CallTarget::Intrinsic(name)
                     if matches!(
                         name.as_str(),
@@ -936,7 +965,7 @@ fn terminator(
                         "Async.write_bytes" => "DISP_ASYNC_WRITE_BYTES",
                         _ => unreachable!(),
                     };
-                    let poll = async_io_poll_name(name, result);
+                    let poll = async_poll_name(name, result);
                     let input = if matches!(name.as_str(), "Async.write_text" | "Async.write_bytes")
                     {
                         let input_ty = operand_ty(program, function, &arguments[1], substitutions);
@@ -1198,6 +1227,66 @@ fn terminator(
                         "disp_path_from_bytes(({source})->data,({source})->len,{},{})",
                         span.start.line, span.start.column
                     )
+                }
+                hir::CallTarget::Intrinsic(name) if name == "SocketAddress.new" => {
+                    let (host, _) =
+                        system_argument(program, function, &arguments[0], substitutions);
+                    let port_ty = operand_ty(program, function, &arguments[1], substitutions);
+                    let port = operand(program, function, &arguments[1], &port_ty, substitutions);
+                    let (port_c, invalid) =
+                        if matches!(port_ty, hir::Type::Int { signed: true, .. }) {
+                            ("__int128", "_port<0||_port>65535")
+                        } else {
+                            ("unsigned __int128", "_port>65535")
+                        };
+                    format!(
+                        "({{{port_c} _port=({port_c})({port});if({invalid})dv_panic(\"socket port is outside 0 through 65535\",{},{});disp_socket_address_create(({host})->data,({host})->len,(uint64_t)_port,{},{});}})",
+                        span.start.line, span.start.column, span.start.line, span.start.column
+                    )
+                }
+                hir::CallTarget::Intrinsic(name) if name.starts_with("TcpStream.") => {
+                    let (stream, _) =
+                        system_argument(program, function, &arguments[0], substitutions);
+                    match name.as_str() {
+                        "TcpStream.close" => {
+                            format!("(disp_tcp_stream_close({stream}),(disp_native_unit){{0}})")
+                        }
+                        "TcpStream.read" => {
+                            let limit_ty =
+                                operand_ty(program, function, &arguments[1], substitutions);
+                            let limit =
+                                operand(program, function, &arguments[1], &limit_ty, substitutions);
+                            let (limit_c, invalid) =
+                                if matches!(limit_ty, hir::Type::Int { signed: true, .. }) {
+                                    ("__int128", "_limit<0||_limit>16777216")
+                                } else {
+                                    ("unsigned __int128", "_limit>16777216")
+                                };
+                            let result_c = native_types::c_type(&destination_ty);
+                            let hir::Type::Result(value, _) = &destination_ty else {
+                                unreachable!("TCP read must return Result")
+                            };
+                            let list_c = native_types::c_type(value);
+                            format!(
+                                "({{{limit_c} _limit=({limit_c})({limit});if({invalid})dv_panic(\"TCP read limit exceeds the 16 MiB safety limit\",{},{});{result_c} _r={{0}};disp_native_string _bytes={{0}},_error={{0}};if(disp_tcp_stream_read({stream},(size_t)_limit,&_bytes,&_error,{},{})){{_r.tag=0;_r.payload.v0.f0=({list_c}){{.data=(uint8_t*)_bytes.data,.len=_bytes.len,.cap=_bytes.cap}};}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})",
+                                span.start.line,
+                                span.start.column,
+                                span.start.line,
+                                span.start.column
+                            )
+                        }
+                        "TcpStream.write" => {
+                            let bytes_ty =
+                                operand_ty(program, function, &arguments[1], substitutions);
+                            let bytes =
+                                operand(program, function, &arguments[1], &bytes_ty, substitutions);
+                            let result_c = native_types::c_type(&destination_ty);
+                            format!(
+                                "({{{result_c} _r={{0}};size_t _written=0;disp_native_string _error={{0}};if(disp_tcp_stream_write({stream},(const char*)({bytes}).data,({bytes}).len,&_written,&_error)){{_r.tag=0;_r.payload.v0.f0=(uint64_t)_written;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                            )
+                        }
+                        _ => unreachable!(),
+                    }
                 }
                 hir::CallTarget::Intrinsic(name) if name.starts_with("Path.") => {
                     let (path, _) =
@@ -2608,6 +2697,8 @@ fn to_dv(value: &str, ty: &hir::Type) -> String {
         hir::Type::CStr => format!("dv_string(({value}),strlen({value}))"),
         hir::Type::Memory => "dv_string(\"<Memory>\",8)".into(),
         hir::Type::Path => format!("dv_string(({value}).data,({value}).len)"),
+        hir::Type::SocketAddress => "dv_string(\"<SocketAddress>\",15)".into(),
+        hir::Type::TcpStream => "dv_string(\"<TcpStream>\",11)".into(),
         hir::Type::Instant | hir::Type::Duration => {
             format!("dv_u((unsigned __int128)({value}).nanos,64)")
         }
@@ -2841,6 +2932,8 @@ fn drop_value_depth(program: &mir::Program, value: &str, ty: &hir::Type, depth: 
         hir::Type::CString => format!("disp_cstring_drop(&({value}));"),
         hir::Type::Memory => format!("disp_memory_drop(&({value}));"),
         hir::Type::Path => format!("disp_path_drop(&({value}));"),
+        hir::Type::SocketAddress => format!("disp_socket_address_drop(&({value}));"),
+        hir::Type::TcpStream => format!("disp_tcp_stream_drop(&({value}));"),
         hir::Type::Thread(result) => {
             let result_c = native_types::c_type(result);
             let result_drop = drop_value_depth(
