@@ -26,6 +26,7 @@ enum Ty {
     Str,
     CString,
     CStr,
+    Memory,
     Path,
     Instant,
     Duration,
@@ -1096,6 +1097,18 @@ impl<'a> Analyzer<'a> {
                     Box::new(Ty::Owned("String".into())),
                 ));
             }
+            if matches!(&object.node, Expression::Identifier(name) if name == "Memory")
+                && field == "allocate"
+                && arguments.len() == 2
+            {
+                for argument in arguments {
+                    self.check_expr(argument, UseMode::Read)?;
+                }
+                return Ok(Ty::Result(
+                    Box::new(Ty::Memory),
+                    Box::new(Ty::Owned("String".into())),
+                ));
+            }
             if matches!(&object.node, Expression::Identifier(name) if name == "List") {
                 for argument in arguments {
                     self.check_expr(
@@ -1231,6 +1244,38 @@ impl<'a> Analyzer<'a> {
                     Ty::Owned("String".into())
                 } else {
                     Ty::Copy
+                });
+            }
+            if matches!(self.expr_ty(object), Ok(Ty::Memory)) {
+                if matches!(
+                    field.as_str(),
+                    "write" | "fill" | "copy_from" | "as_mut_ptr"
+                ) {
+                    let place = self.place(object)?;
+                    self.check_borrow(&place, true, object.span)?;
+                } else {
+                    self.check_expr(object, UseMode::Read)?;
+                }
+                for argument in arguments {
+                    self.check_expr(argument, UseMode::Read)?;
+                }
+                return Ok(match field.as_str() {
+                    "as_ptr" => Ty::RawPointer(Box::new(Ty::Copy), false),
+                    "as_mut_ptr" => Ty::RawPointer(Box::new(Ty::Copy), true),
+                    _ => Ty::Copy,
+                });
+            }
+            if let Ok(Ty::RawPointer(inner, mutable)) = self.expr_ty(object)
+                && matches!(field.as_str(), "offset" | "read" | "write")
+            {
+                self.check_expr(object, UseMode::Read)?;
+                for argument in arguments {
+                    self.check_expr(argument, UseMode::Read)?;
+                }
+                return Ok(match field.as_str() {
+                    "offset" => Ty::RawPointer(inner, mutable),
+                    "read" => *inner,
+                    _ => Ty::Unit,
                 });
             }
             if let Ok(Ty::Map(key, value)) = self.expr_ty(object) {
@@ -2025,6 +2070,7 @@ impl<'a> Analyzer<'a> {
             "str" => Ty::Str,
             "CString" => Ty::CString,
             "CStr" => Ty::CStr,
+            "Memory" => Ty::Memory,
             "CInt" | "CUInt" | "CSize" | "CSSize" | "CChar" | "CUChar" | "CShort" | "CUShort"
             | "CLongLong" | "CULongLong" | "CFloat" | "CDouble" => Ty::Copy,
             "Path" => Ty::Path,
@@ -2071,6 +2117,7 @@ impl<'a> Analyzer<'a> {
             Ty::Slice(_) | Ty::Str | Ty::CStr | Ty::Instant | Ty::Duration => true,
             Ty::Path
             | Ty::CString
+            | Ty::Memory
             | Ty::List(_)
             | Ty::Map(_, _)
             | Ty::Set(_)

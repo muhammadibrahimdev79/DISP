@@ -489,6 +489,7 @@ pub fn type_code(ty: &hir::Type) -> String {
         hir::Type::String => "s".into(),
         hir::Type::CString => "cs".into(),
         hir::Type::CStr => "cz".into(),
+        hir::Type::Memory => "mem".into(),
         hir::Type::Path => "p".into(),
         hir::Type::Instant => "ti".into(),
         hir::Type::Duration => "td".into(),

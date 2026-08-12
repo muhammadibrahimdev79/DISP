@@ -374,6 +374,10 @@ fn representative_examples_match_the_interpreter_natively() {
             "c_interop_example",
             include_str!("../examples/c_interop.disp"),
         ),
+        (
+            "system_memory_example",
+            include_str!("../examples/system_memory.disp"),
+        ),
         ("hello_example", include_str!("../hello.disp")),
     ] {
         let expected = run_source(source).unwrap().join("\n") + "\n";

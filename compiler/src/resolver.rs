@@ -56,7 +56,7 @@ impl Resolver {
         };
         for builtin in [
             "print", "Some", "None", "Ok", "Err", "i8", "i16", "i32", "i64", "i128", "u8", "u16",
-            "u32", "u64", "u128", "int", "uint", "f32", "f64", "CString",
+            "u32", "u64", "u128", "int", "uint", "f32", "f64", "CString", "Memory",
         ] {
             let id = resolver.add_symbol(builtin, SymbolKind::Builtin, Span::point(1, 1));
             resolver.globals.insert(builtin.into(), id);
@@ -694,8 +694,9 @@ impl Resolver {
             "Thread" => Some(1),
             "Mutex" | "MutexGuard" => Some(1),
             "AtomicInt" => Some(0),
-            "CString" | "CStr" | "CInt" | "CUInt" | "CSize" | "CSSize" | "CChar" | "CUChar"
-            | "CShort" | "CUShort" | "CLongLong" | "CULongLong" | "CFloat" | "CDouble" => Some(0),
+            "CString" | "CStr" | "Memory" | "CInt" | "CUInt" | "CSize" | "CSSize" | "CChar"
+            | "CUChar" | "CShort" | "CUShort" | "CLongLong" | "CULongLong" | "CFloat"
+            | "CDouble" => Some(0),
             "[]" => Some(1),
             name if name.starts_with("[;") && name.ends_with(']') => Some(1),
             "int" | "f64" | "str" | "String" | "Path" | "Instant" | "Duration" | "IoError"

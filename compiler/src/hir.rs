@@ -27,6 +27,7 @@ pub enum Type {
     Str,
     CString,
     CStr,
+    Memory,
     Path,
     Instant,
     Duration,
@@ -74,6 +75,7 @@ impl Type {
             Self::Slice(_) | Self::Str | Self::CStr => true,
             Self::String
             | Self::CString
+            | Self::Memory
             | Self::Path
             | Self::List(_)
             | Self::Map(_, _)
@@ -661,6 +663,7 @@ impl<'a> Lowering<'a> {
             "str" => Type::Str,
             "CString" => Type::CString,
             "CStr" => Type::CStr,
+            "Memory" => Type::Memory,
             "CInt" => Type::Int {
                 signed: true,
                 width: Some(32),
@@ -1464,6 +1467,22 @@ impl FunctionLowering<'_, '_> {
                         span,
                     });
                 }
+                if owner == "Memory" {
+                    let args = arguments
+                        .iter()
+                        .map(|x| self.lower_expr(x))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    return Ok(Expr {
+                        kind: ExprKind::Call(Call {
+                            target: CallTarget::Intrinsic(format!("Memory.{field}")),
+                            arguments: args,
+                            receiver: None,
+                            substitutions: vec![],
+                        }),
+                        ty: Type::Result(Box::new(Type::Memory), Box::new(Type::String)),
+                        span,
+                    });
+                }
                 if owner == "List" {
                     let args = arguments
                         .iter()
@@ -2008,6 +2027,96 @@ impl FunctionLowering<'_, '_> {
                         "to_string" => Type::String,
                         "as_c_str" if matches!(receiver_ty, Type::CString) => Type::CStr,
                         _ => Type::Unknown,
+                    },
+                    span,
+                });
+            }
+            if matches!(receiver.ty, Type::Memory)
+                && matches!(
+                    field.as_str(),
+                    "len"
+                        | "alignment"
+                        | "is_empty"
+                        | "read"
+                        | "write"
+                        | "fill"
+                        | "copy_from"
+                        | "as_ptr"
+                        | "as_mut_ptr"
+                )
+            {
+                let mode = if matches!(
+                    field.as_str(),
+                    "write" | "fill" | "copy_from" | "as_mut_ptr"
+                ) {
+                    ReceiverMode::Mutable
+                } else {
+                    ReceiverMode::Shared
+                };
+                let mut args = vec![receiver];
+                args.extend(
+                    arguments
+                        .iter()
+                        .map(|x| self.lower_expr(x))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+                return Ok(Expr {
+                    kind: ExprKind::Call(Call {
+                        target: CallTarget::Intrinsic(format!("Memory.{field}")),
+                        arguments: args,
+                        receiver: Some(mode),
+                        substitutions: vec![],
+                    }),
+                    ty: match field.as_str() {
+                        "len" | "alignment" => Type::Int {
+                            signed: false,
+                            width: None,
+                        },
+                        "is_empty" => Type::Bool,
+                        "read" => Type::Int {
+                            signed: false,
+                            width: Some(8),
+                        },
+                        "as_ptr" => Type::RawPointer {
+                            mutable: false,
+                            inner: Box::new(Type::Int {
+                                signed: false,
+                                width: Some(8),
+                            }),
+                        },
+                        "as_mut_ptr" => Type::RawPointer {
+                            mutable: true,
+                            inner: Box::new(Type::Int {
+                                signed: false,
+                                width: Some(8),
+                            }),
+                        },
+                        _ => Type::Unit,
+                    },
+                    span,
+                });
+            }
+            if let Type::RawPointer { mutable, inner } = receiver.ty.clone()
+                && matches!(field.as_str(), "offset" | "read" | "write")
+            {
+                let mut args = vec![receiver];
+                args.extend(
+                    arguments
+                        .iter()
+                        .map(|x| self.lower_expr(x))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+                return Ok(Expr {
+                    kind: ExprKind::Call(Call {
+                        target: CallTarget::Intrinsic(format!("RawPointer.{field}")),
+                        arguments: args,
+                        receiver: None,
+                        substitutions: vec![(*inner).clone()],
+                    }),
+                    ty: match field.as_str() {
+                        "offset" => Type::RawPointer { mutable, inner },
+                        "read" => *inner,
+                        _ => Type::Unit,
                     },
                     span,
                 });
@@ -2733,6 +2842,7 @@ fn surface_type_is_copy(ty: &Type) -> bool {
         Type::Result(ok, error) => surface_type_is_copy(ok) && surface_type_is_copy(error),
         Type::String
         | Type::CString
+        | Type::Memory
         | Type::Path
         | Type::List(_)
         | Type::Map(_, _)

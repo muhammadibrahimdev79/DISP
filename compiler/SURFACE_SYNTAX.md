@@ -159,6 +159,40 @@ deterministic semantic-oracle support for `abs`, `strlen`, and `sqrt`; other for
 functions produce a controlled diagnostic requiring native execution rather than
 inventing foreign behavior.
 
+## System memory
+
+`Memory` is an owned, zero-initialized byte allocation. Size and alignment are explicit,
+but allocation ownership and platform allocator details remain encapsulated:
+
+```disp
+memory = Memory.allocate(4096, 64)?
+memory.write(0, u8(42))
+print(memory.read(0))
+memory.fill(u8(0))
+```
+
+The alignment must be a non-zero power of two no larger than 1 MiB. Invalid alignment or
+size overflow is a recoverable `Result<Memory, String>` error. `read`, `write`, `fill`,
+and `copy_from` are safe, bounds-checked operations; copying uses overlap-safe semantics.
+The allocation is released deterministically on normal scope exit, return, `?`
+propagation, and other compiler-generated control-flow cleanup paths.
+
+Raw pointer views are available without transferring ownership. Pointer arithmetic,
+reads, and writes remain explicit and require `unsafe`:
+
+```disp
+unsafe {
+    pointer = memory.as_mut_ptr()
+    pointer.write(u8(7))
+    pointer.offset(1).write(u8(8))
+}
+```
+
+Raw pointer operations currently accept only `Copy` element types. Raw pointers are not
+sent across thread boundaries, and owned DISP values never become raw allocations
+implicitly. Once code enters `unsafe`, it is responsible for pointer lifetime,
+alignment, and bounds; safe `Memory` methods remain the preferred interface.
+
 ## Collection loops
 
 ```disp

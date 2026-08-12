@@ -147,6 +147,7 @@ pub fn supported(program: &mir::Program, ty: &hir::Type) -> bool {
         | hir::Type::Str
         | hir::Type::CString
         | hir::Type::CStr
+        | hir::Type::Memory
         | hir::Type::Path
         | hir::Type::Instant
         | hir::Type::Duration
@@ -628,6 +629,16 @@ fn terminator(
                         message.len()
                     )
                 }
+                hir::CallTarget::Intrinsic(name) if name == "Memory.allocate" => {
+                    let size_ty = operand_ty(program, function, &arguments[0], substitutions);
+                    let align_ty = operand_ty(program, function, &arguments[1], substitutions);
+                    let size = operand(program, function, &arguments[0], &size_ty, substitutions);
+                    let align = operand(program, function, &arguments[1], &align_ty, substitutions);
+                    let result_c = native_types::c_type(&destination_ty);
+                    format!(
+                        "({{size_t _size=(size_t)({size});size_t _align=(size_t)({align});{result_c} _result={{0}};const char *_error=NULL;if(!_align||(_align&(_align-1)))_error=\"Memory alignment must be a non-zero power of two\";else if(_align>((size_t)1<<20))_error=\"Memory alignment exceeds the supported maximum\";else if(_size>SIZE_MAX-sizeof(DispAllocationHeader)-(_align-1))_error=\"Memory size overflow\";if(_error){{_result.tag=1;_result.payload.v1.f0=disp_owned_bytes(_error,strlen(_error));}}else{{_result.tag=0;_result.payload.v0.f0=(disp_native_memory){{.data=_size?(uint8_t*)disp_alloc_zeroed(1,_size,_align):NULL,.len=_size,.align=_align}};}}_result;}})"
+                    )
+                }
                 hir::CallTarget::Intrinsic(name) if name == "Path.new" => {
                     let (source, _) =
                         system_argument(program, function, &arguments[0], substitutions);
@@ -993,6 +1004,141 @@ fn terminator(
                         hir::Type::Slice(_) => format!(
                             "({slice_c}){{.data=({receiver})->data,.len=({receiver})->len}}"
                         ),
+                        _ => unreachable!(),
+                    }
+                }
+                hir::CallTarget::Intrinsic(name)
+                    if matches!(
+                        name.as_str(),
+                        "RawPointer.offset" | "RawPointer.read" | "RawPointer.write"
+                    ) =>
+                {
+                    let pointer_ty = operand_ty(program, function, &arguments[0], substitutions);
+                    let pointer =
+                        operand(program, function, &arguments[0], &pointer_ty, substitutions);
+                    match name.as_str() {
+                        "RawPointer.offset" => {
+                            let offset_ty =
+                                operand_ty(program, function, &arguments[1], substitutions);
+                            let offset = operand(
+                                program,
+                                function,
+                                &arguments[1],
+                                &offset_ty,
+                                substitutions,
+                            );
+                            format!("(({pointer})+(ptrdiff_t)({offset}))")
+                        }
+                        "RawPointer.read" => format!("(*({pointer}))"),
+                        "RawPointer.write" => {
+                            let value_ty =
+                                operand_ty(program, function, &arguments[1], substitutions);
+                            let value =
+                                operand(program, function, &arguments[1], &value_ty, substitutions);
+                            format!("((*({pointer})={value}),(disp_native_unit){{0}})")
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                hir::CallTarget::Intrinsic(name)
+                    if matches!(
+                        name.as_str(),
+                        "Memory.len"
+                            | "Memory.alignment"
+                            | "Memory.is_empty"
+                            | "Memory.read"
+                            | "Memory.write"
+                            | "Memory.fill"
+                            | "Memory.copy_from"
+                            | "Memory.as_ptr"
+                            | "Memory.as_mut_ptr"
+                    ) =>
+                {
+                    let receiver_ty = operand_ty(program, function, &arguments[0], substitutions);
+                    let receiver = operand(
+                        program,
+                        function,
+                        &arguments[0],
+                        &receiver_ty,
+                        substitutions,
+                    );
+                    match name.as_str() {
+                        "Memory.len" => format!("({receiver})->len"),
+                        "Memory.alignment" => format!("({receiver})->align"),
+                        "Memory.is_empty" => format!("(({receiver})->len==0)"),
+                        "Memory.as_ptr" | "Memory.as_mut_ptr" => {
+                            format!("({receiver})->data")
+                        }
+                        "Memory.read" => {
+                            let index_ty =
+                                operand_ty(program, function, &arguments[1], substitutions);
+                            let index =
+                                operand(program, function, &arguments[1], &index_ty, substitutions);
+                            format!(
+                                "({{size_t _index=(size_t)({index});if(_index>=({receiver})->len)dv_panic(\"Memory index out of bounds\",{},{});({receiver})->data[_index];}})",
+                                span.start.line, span.start.column
+                            )
+                        }
+                        "Memory.write" => {
+                            let index_ty =
+                                operand_ty(program, function, &arguments[1], substitutions);
+                            let value_ty =
+                                operand_ty(program, function, &arguments[2], substitutions);
+                            let index =
+                                operand(program, function, &arguments[1], &index_ty, substitutions);
+                            let value =
+                                operand(program, function, &arguments[2], &value_ty, substitutions);
+                            format!(
+                                "({{size_t _index=(size_t)({index});if(_index>=({receiver})->len)dv_panic(\"Memory index out of bounds\",{},{});({receiver})->data[_index]=(uint8_t)({value});(disp_native_unit){{0}};}})",
+                                span.start.line, span.start.column
+                            )
+                        }
+                        "Memory.fill" => {
+                            let value_ty =
+                                operand_ty(program, function, &arguments[1], substitutions);
+                            let value =
+                                operand(program, function, &arguments[1], &value_ty, substitutions);
+                            format!(
+                                "({{if(({receiver})->len)memset(({receiver})->data,(uint8_t)({value}),({receiver})->len);(disp_native_unit){{0}};}})"
+                            )
+                        }
+                        "Memory.copy_from" => {
+                            let destination_ty =
+                                operand_ty(program, function, &arguments[1], substitutions);
+                            let source_ty =
+                                operand_ty(program, function, &arguments[2], substitutions);
+                            let offset_ty =
+                                operand_ty(program, function, &arguments[3], substitutions);
+                            let count_ty =
+                                operand_ty(program, function, &arguments[4], substitutions);
+                            let destination = operand(
+                                program,
+                                function,
+                                &arguments[1],
+                                &destination_ty,
+                                substitutions,
+                            );
+                            let source = operand(
+                                program,
+                                function,
+                                &arguments[2],
+                                &source_ty,
+                                substitutions,
+                            );
+                            let offset = operand(
+                                program,
+                                function,
+                                &arguments[3],
+                                &offset_ty,
+                                substitutions,
+                            );
+                            let count =
+                                operand(program, function, &arguments[4], &count_ty, substitutions);
+                            format!(
+                                "({{size_t _destination=(size_t)({destination});size_t _offset=(size_t)({offset});size_t _count=(size_t)({count});if(_destination>({receiver})->len||_count>({receiver})->len-_destination||_offset>({source})->len||_count>({source})->len-_offset)dv_panic(\"Memory copy range is out of bounds\",{},{});if(_count)memmove(({receiver})->data+_destination,({source})->data+_offset,_count);(disp_native_unit){{0}};}})",
+                                span.start.line, span.start.column
+                            )
+                        }
                         _ => unreachable!(),
                     }
                 }
@@ -1816,6 +1962,7 @@ fn to_dv(value: &str, ty: &hir::Type) -> String {
         hir::Type::String => format!("dv_string(({value}).data,({value}).len)"),
         hir::Type::CString => format!("dv_string(({value}).data,({value}).len)"),
         hir::Type::CStr => format!("dv_string(({value}),strlen({value}))"),
+        hir::Type::Memory => "dv_string(\"<Memory>\",8)".into(),
         hir::Type::Path => format!("dv_string(({value}).data,({value}).len)"),
         hir::Type::Instant | hir::Type::Duration => {
             format!("dv_u((unsigned __int128)({value}).nanos,64)")
@@ -2048,6 +2195,7 @@ fn drop_value_depth(program: &mir::Program, value: &str, ty: &hir::Type, depth: 
     match ty {
         hir::Type::String => format!("disp_string_drop(&({value}));"),
         hir::Type::CString => format!("disp_cstring_drop(&({value}));"),
+        hir::Type::Memory => format!("disp_memory_drop(&({value}));"),
         hir::Type::Path => format!("disp_path_drop(&({value}));"),
         hir::Type::Thread(result) => {
             let result_c = native_types::c_type(result);

@@ -20,6 +20,7 @@ pub enum Type {
     Str,
     CString,
     CStr,
+    Memory,
     Path,
     Instant,
     Duration,
@@ -1573,6 +1574,35 @@ impl TypeChecker {
                     ));
                 }
                 if let Expression::FieldAccess { object, field, .. } = &callee.node
+                    && matches!(&object.node, Expression::Identifier(name) if name == "Memory")
+                {
+                    if field != "allocate" || arguments.len() != 2 {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            format!(
+                                "no Memory constructor `{field}` with {} arguments",
+                                arguments.len()
+                            ),
+                            expression.span,
+                        ));
+                    }
+                    for (index, argument) in arguments.iter().enumerate() {
+                        let actual = self.check_expression(argument)?;
+                        if !is_integer(&actual) {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Type,
+                                if index == 0 {
+                                    "Memory size must be an integer"
+                                } else {
+                                    "Memory alignment must be an integer"
+                                },
+                                argument.span,
+                            ));
+                        }
+                    }
+                    return Ok(Type::Result(Box::new(Type::Memory), Box::new(Type::String)));
+                }
+                if let Expression::FieldAccess { object, field, .. } = &callee.node
                     && matches!(&object.node, Expression::Identifier(name) if name == "List")
                 {
                     match field.as_str() {
@@ -2059,6 +2089,142 @@ impl TypeChecker {
                                 if arguments.is_empty() && matches!(receiver, Type::CString) =>
                             {
                                 return Ok(Type::CStr);
+                            }
+                            _ => {}
+                        }
+                    }
+                    if matches!(receiver, Type::Memory) {
+                        match field.as_str() {
+                            "len" | "alignment" if arguments.is_empty() => {
+                                return Ok(Type::UInt);
+                            }
+                            "is_empty" if arguments.is_empty() => return Ok(Type::Bool),
+                            "as_ptr" if arguments.is_empty() => {
+                                return Ok(Type::RawPointer(Box::new(Type::Unsigned(8)), false));
+                            }
+                            "as_mut_ptr" if arguments.is_empty() => {
+                                return Ok(Type::RawPointer(Box::new(Type::Unsigned(8)), true));
+                            }
+                            "read" if arguments.len() == 1 => {
+                                let index = self.check_expression(&arguments[0])?;
+                                if !is_integer(&index) {
+                                    return Err(Diagnostic::new(
+                                        DiagnosticKind::Type,
+                                        "Memory index must be an integer",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                return Ok(Type::Unsigned(8));
+                            }
+                            "write" if arguments.len() == 2 => {
+                                let index = self.check_expression(&arguments[0])?;
+                                if !is_integer(&index) {
+                                    return Err(Diagnostic::new(
+                                        DiagnosticKind::Type,
+                                        "Memory index must be an integer",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                let byte = self.check_expression(&arguments[1])?;
+                                self.require_same(
+                                    &Type::Unsigned(8),
+                                    &byte,
+                                    arguments[1].span,
+                                    "Memory byte",
+                                )?;
+                                return Ok(Type::Unit);
+                            }
+                            "fill" if arguments.len() == 1 => {
+                                let byte = self.check_expression(&arguments[0])?;
+                                self.require_same(
+                                    &Type::Unsigned(8),
+                                    &byte,
+                                    arguments[0].span,
+                                    "Memory byte",
+                                )?;
+                                return Ok(Type::Unit);
+                            }
+                            "copy_from" if arguments.len() == 4 => {
+                                let destination = self.check_expression(&arguments[0])?;
+                                if !is_integer(&destination) {
+                                    return Err(Diagnostic::new(
+                                        DiagnosticKind::Type,
+                                        "Memory destination offset must be an integer",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                let source = self.check_expression(&arguments[1])?;
+                                self.require_same(
+                                    &Type::Memory,
+                                    &source,
+                                    arguments[1].span,
+                                    "Memory copy source",
+                                )?;
+                                for argument in &arguments[2..] {
+                                    let actual = self.check_expression(argument)?;
+                                    if !is_integer(&actual) {
+                                        return Err(Diagnostic::new(
+                                            DiagnosticKind::Type,
+                                            "Memory source offset and count must be integers",
+                                            argument.span,
+                                        ));
+                                    }
+                                }
+                                return Ok(Type::Unit);
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Type::RawPointer(inner, mutable) = &receiver
+                        && matches!(field.as_str(), "offset" | "read" | "write")
+                    {
+                        if self.unsafe_depth == 0 {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Type,
+                                format!(
+                                    "raw pointer operation `{field}` requires an `unsafe` block"
+                                ),
+                                expression.span,
+                            )
+                            .with_help(
+                                "prove the pointer is live, aligned, and in bounds before using it",
+                            ));
+                        }
+                        if !self.type_is_copy(inner) {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Type,
+                                "raw pointer read/write currently requires a Copy element type",
+                                object.span,
+                            ));
+                        }
+                        match field.as_str() {
+                            "offset" if arguments.len() == 1 => {
+                                let offset = self.check_expression(&arguments[0])?;
+                                self.require_same(
+                                    &Type::Int,
+                                    &offset,
+                                    arguments[0].span,
+                                    "pointer offset",
+                                )?;
+                                return Ok(receiver);
+                            }
+                            "read" if arguments.is_empty() => return Ok((**inner).clone()),
+                            "write" if arguments.len() == 1 && *mutable => {
+                                let value = self.check_expression(&arguments[0])?;
+                                self.require_same(
+                                    inner,
+                                    &value,
+                                    arguments[0].span,
+                                    "pointer write value",
+                                )?;
+                                return Ok(Type::Unit);
+                            }
+                            "write" if !*mutable => {
+                                return Err(Diagnostic::new(
+                                    DiagnosticKind::Type,
+                                    "cannot write through a const raw pointer",
+                                    object.span,
+                                ));
                             }
                             _ => {}
                         }
@@ -2802,6 +2968,7 @@ impl TypeChecker {
             "str" if ty.arguments.is_empty() => Type::Str,
             "CString" if ty.arguments.is_empty() => Type::CString,
             "CStr" if ty.arguments.is_empty() => Type::CStr,
+            "Memory" if ty.arguments.is_empty() => Type::Memory,
             "CInt" if ty.arguments.is_empty() => Type::Signed(32),
             "CUInt" if ty.arguments.is_empty() => Type::Unsigned(32),
             "CSize" if ty.arguments.is_empty() => Type::UInt,
@@ -3122,6 +3289,7 @@ impl TypeChecker {
             Type::String => "String".into(),
             Type::CString => "CString".into(),
             Type::CStr => "CStr".into(),
+            Type::Memory => "Memory".into(),
             Type::Path => "Path".into(),
             Type::Instant => "Instant".into(),
             Type::Duration => "Duration".into(),

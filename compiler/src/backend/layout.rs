@@ -60,11 +60,13 @@ impl<'a> LayoutEngine<'a> {
             hir::Type::Unit => scalar(0, 1),
             hir::Type::Bool => scalar(1, 1),
             hir::Type::Char => scalar(4, 4),
-            hir::Type::String | hir::Type::CString | hir::Type::Path => aggregate(&[
-                self.target.pointer_alignment,
-                self.target.pointer_alignment,
-                self.target.pointer_alignment,
-            ]),
+            hir::Type::String | hir::Type::CString | hir::Type::Memory | hir::Type::Path => {
+                aggregate(&[
+                    self.target.pointer_alignment,
+                    self.target.pointer_alignment,
+                    self.target.pointer_alignment,
+                ])
+            }
             hir::Type::Str => {
                 aggregate(&[self.target.pointer_alignment, self.target.pointer_alignment])
             }

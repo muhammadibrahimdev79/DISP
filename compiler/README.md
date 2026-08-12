@@ -18,6 +18,7 @@ Implemented executable subset:
 - typed native threads with owned `spawn`, consuming `join`, Send-style boundary checks, and deterministic joining
 - explicitly shared `Mutex<T>`, owning lock guards, and checked sequentially consistent `AtomicInt`
 - defined `extern C` declarations, fixed C ABI aliases, checked `CString`, borrowed `CStr`, and native library linking
+- owned aligned `Memory`, bounds-checked byte operations, raw pointer views, and explicit unsafe pointer arithmetic/read/write
 - CFG predecessor/successor, reachability, reverse-postorder, and back-edge analysis
 - checked integer arithmetic and an explicit `disp interpret` semantic oracle
 - deterministic monomorphization, target-aware layouts, ABI classification, and native MIR lowering
@@ -39,6 +40,7 @@ cargo run -- check examples/control_flow.disp
 cargo run -- check --dump-hir examples/control_flow.disp
 cargo run -- check --dump-mir examples/control_flow.disp
 cargo run -- run examples/c_interop.disp
+cargo run -- run examples/system_memory.disp
 ```
 
 Fuzz targets for the lexer and complete frontend live under `fuzz/` and can be run with `cargo fuzz run lexer` and `cargo fuzz run frontend` when `cargo-fuzz` and its required Rust toolchain are installed.

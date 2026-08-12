@@ -1,0 +1,25 @@
+fn exercise() -> Result<int, String> {
+    memory = Memory.allocate(8, 16)?
+    memory.fill(u8(1))
+    memory.write(2, u8(42))
+
+    unsafe {
+        pointer = memory.as_mut_ptr()
+        pointer.write(u8(7))
+        pointer.offset(1).write(u8(8))
+    }
+
+    print(memory.len())
+    print(memory.alignment())
+    print(memory.read(0))
+    print(memory.read(1))
+    print(memory.read(2))
+    return Ok(0)
+}
+
+fn main() {
+    match exercise() {
+        Ok(_) => print("memory released deterministically"),
+        Err(error) => print(error),
+    }
+}

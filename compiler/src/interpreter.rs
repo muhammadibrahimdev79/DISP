@@ -277,6 +277,101 @@ impl RuntimeCString {
     }
 }
 
+#[derive(Debug)]
+struct RuntimeMemoryState {
+    bytes: Vec<u8>,
+    alignment: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeMemory(Arc<StdMutex<RuntimeMemoryState>>);
+
+impl PartialEq for RuntimeMemory {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl RuntimeMemory {
+    fn new(size: usize, alignment: usize) -> Result<Self, &'static str> {
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return Err("Memory alignment must be a non-zero power of two");
+        }
+        if alignment > 1 << 20 {
+            return Err("Memory alignment exceeds the supported maximum");
+        }
+        if size
+            .checked_add(3 * std::mem::size_of::<usize>())
+            .and_then(|value| value.checked_add(alignment - 1))
+            .is_none()
+        {
+            return Err("Memory size overflow");
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(size)
+            .map_err(|_| "Memory allocation failed")?;
+        bytes.resize(size, 0);
+        Ok(Self(Arc::new(StdMutex::new(RuntimeMemoryState {
+            bytes,
+            alignment,
+        }))))
+    }
+
+    fn len(&self) -> Option<usize> {
+        Some(self.0.lock().ok()?.bytes.len())
+    }
+
+    fn alignment(&self) -> Option<usize> {
+        Some(self.0.lock().ok()?.alignment)
+    }
+
+    fn read(&self, index: usize) -> Option<u8> {
+        self.0.lock().ok()?.bytes.get(index).copied()
+    }
+
+    fn write(&self, index: usize, value: u8) -> Option<()> {
+        *self.0.lock().ok()?.bytes.get_mut(index)? = value;
+        Some(())
+    }
+
+    fn fill(&self, value: u8) -> Option<()> {
+        self.0.lock().ok()?.bytes.fill(value);
+        Some(())
+    }
+
+    fn copy_from(
+        &self,
+        destination: usize,
+        source: &Self,
+        source_offset: usize,
+        count: usize,
+    ) -> Option<()> {
+        let destination_end = destination.checked_add(count)?;
+        let source_end = source_offset.checked_add(count)?;
+        if Arc::ptr_eq(&self.0, &source.0) {
+            let mut state = self.0.lock().ok()?;
+            if destination_end > state.bytes.len() || source_end > state.bytes.len() {
+                return None;
+            }
+            state
+                .bytes
+                .copy_within(source_offset..source_end, destination);
+            return Some(());
+        }
+        let copied = {
+            let state = source.0.lock().ok()?;
+            state.bytes.get(source_offset..source_end)?.to_vec()
+        };
+        let mut state = self.0.lock().ok()?;
+        state
+            .bytes
+            .get_mut(destination..destination_end)?
+            .copy_from_slice(&copied);
+        Some(())
+    }
+}
+
 fn grow_list_capacity(capacity: &mut usize, needed: usize) -> Result<(), &'static str> {
     if needed <= *capacity {
         return Ok(());
@@ -340,6 +435,7 @@ enum Value {
     String(RuntimeString),
     CString(RuntimeCString),
     CStr(RuntimeCString),
+    Memory(RuntimeMemory),
     Path(PathBuf),
     Instant(StdInstant),
     Duration(StdDuration),
@@ -1171,6 +1267,25 @@ impl Interpreter {
                     });
                 }
                 if let Expression::FieldAccess { object, field, .. } = &callee.node
+                    && matches!(&object.node, Expression::Identifier(name) if name == "Memory")
+                    && field == "allocate"
+                {
+                    let size = self.index_value(program, &arguments[0])?;
+                    let alignment = self.index_value(program, &arguments[1])?;
+                    return Ok(match RuntimeMemory::new(size, alignment) {
+                        Ok(memory) => Value::Enum {
+                            type_name: "Result".into(),
+                            variant: "Ok".into(),
+                            payload: vec![Value::Memory(memory)],
+                        },
+                        Err(message) => Value::Enum {
+                            type_name: "Result".into(),
+                            variant: "Err".into(),
+                            payload: vec![Value::String(RuntimeString::literal(message.into()))],
+                        },
+                    });
+                }
+                if let Expression::FieldAccess { object, field, .. } = &callee.node
                     && matches!(&object.node, Expression::Identifier(name) if name == "List")
                 {
                     if field == "of" {
@@ -1717,6 +1832,57 @@ impl Interpreter {
                             _ => unreachable!(),
                         };
                     }
+                    if matches!(field.as_str(), "offset" | "read" | "write")
+                        && let Value::Reference(mut place, mutable) =
+                            self.evaluate(program, object)?
+                    {
+                        return match field.as_str() {
+                            "offset" => {
+                                let offset = match self.evaluate(program, &arguments[0])? {
+                                    Value::Int(value) => value,
+                                    Value::Signed(value, _) => {
+                                        i64::try_from(value).map_err(|_| {
+                                            self.error(
+                                                "raw pointer offset is out of range",
+                                                arguments[0].span,
+                                            )
+                                        })?
+                                    }
+                                    _ => unreachable!("type checking validates pointer offset"),
+                                };
+                                let Some(PlaceSegment::Index(index)) = place.fields.last_mut()
+                                else {
+                                    return Err(self.error(
+                                        "interpreter raw pointer has no addressable element",
+                                        object.span,
+                                    ));
+                                };
+                                *index =
+                                    index.checked_add_signed(offset as isize).ok_or_else(|| {
+                                        self.error("raw pointer offset overflow", arguments[0].span)
+                                    })?;
+                                Ok(Value::Reference(place, mutable))
+                            }
+                            "read" => self.read_place(&place).ok_or_else(|| {
+                                self.error("raw pointer read is out of bounds", expression.span)
+                            }),
+                            "write" if mutable => {
+                                let value = self.evaluate(program, &arguments[0])?;
+                                self.write_place(&place, value).ok_or_else(|| {
+                                    self.error(
+                                        "raw pointer write is out of bounds",
+                                        expression.span,
+                                    )
+                                })?;
+                                Ok(Value::Unit)
+                            }
+                            "write" => Err(self.error(
+                                "cannot write through a const raw pointer",
+                                expression.span,
+                            )),
+                            _ => unreachable!(),
+                        };
+                    }
                     if field == "join" && arguments.is_empty() {
                         let Value::Thread(handle) = self.consume(program, object)? else {
                             return Err(
@@ -2058,6 +2224,95 @@ impl Interpreter {
                             self.evaluate(program, object)?
                     {
                         return Ok(Value::Slice(values));
+                    }
+                    if matches!(field.as_str(), "as_ptr" | "as_mut_ptr")
+                        && arguments.is_empty()
+                        && self
+                            .dynamic_place(program, object)?
+                            .and_then(|place| self.read_place(&place))
+                            .is_some_and(|value| matches!(value, Value::Memory(_)))
+                    {
+                        let mut place = self.dynamic_place(program, object)?.ok_or_else(|| {
+                            self.error("Memory pointer source is not a place", object.span)
+                        })?;
+                        place.fields.push(PlaceSegment::Index(0));
+                        return Ok(Value::Reference(place, field == "as_mut_ptr"));
+                    }
+                    if matches!(
+                        field.as_str(),
+                        "len" | "alignment" | "is_empty" | "read" | "write" | "fill" | "copy_from"
+                    ) && let Value::Memory(memory) = self.evaluate(program, object)?
+                    {
+                        let length = memory.len().ok_or_else(|| {
+                            self.error("Memory state lock is poisoned", object.span)
+                        })?;
+                        return match field.as_str() {
+                            "len" => Ok(Value::UInt(length as u64)),
+                            "alignment" => Ok(Value::UInt(memory.alignment().ok_or_else(|| {
+                                self.error("Memory state lock is poisoned", object.span)
+                            })? as u64)),
+                            "is_empty" => Ok(Value::Bool(length == 0)),
+                            "read" => {
+                                let index = self.index_value(program, &arguments[0])?;
+                                memory
+                                    .read(index)
+                                    .map(|value| Value::Unsigned(value.into(), 8))
+                                    .ok_or_else(|| {
+                                        self.error(
+                                            format!(
+                                                "Memory index {index} is out of bounds for length {length}"
+                                            ),
+                                            arguments[0].span,
+                                        )
+                                    })
+                            }
+                            "write" => {
+                                let index = self.index_value(program, &arguments[0])?;
+                                let byte = runtime_byte(self.evaluate(program, &arguments[1])?)
+                                    .ok_or_else(|| {
+                                        self.error("Memory value must be a u8", arguments[1].span)
+                                    })?;
+                                memory.write(index, byte).ok_or_else(|| {
+                                    self.error(
+                                        format!(
+                                            "Memory index {index} is out of bounds for length {length}"
+                                        ),
+                                        arguments[0].span,
+                                    )
+                                })?;
+                                Ok(Value::Unit)
+                            }
+                            "fill" => {
+                                let byte = runtime_byte(self.evaluate(program, &arguments[0])?)
+                                    .ok_or_else(|| {
+                                        self.error("Memory value must be a u8", arguments[0].span)
+                                    })?;
+                                memory.fill(byte).ok_or_else(|| {
+                                    self.error("Memory state lock is poisoned", object.span)
+                                })?;
+                                Ok(Value::Unit)
+                            }
+                            "copy_from" => {
+                                let destination = self.index_value(program, &arguments[0])?;
+                                let Value::Memory(source) =
+                                    self.evaluate(program, &arguments[1])?
+                                else {
+                                    unreachable!("type checking validates Memory copy source")
+                                };
+                                let source_offset = self.index_value(program, &arguments[2])?;
+                                let count = self.index_value(program, &arguments[3])?;
+                                memory
+                                    .copy_from(destination, &source, source_offset, count)
+                                    .ok_or_else(|| {
+                                        self.error(
+                                            "Memory copy range is out of bounds",
+                                            expression.span,
+                                        )
+                                    })?;
+                                Ok(Value::Unit)
+                            }
+                            _ => unreachable!(),
+                        };
                     }
                     if arguments.is_empty()
                         && matches!(
@@ -2680,6 +2935,12 @@ fn write_value_path(target: &mut Value, fields: &[PlaceSegment], value: Value) -
             write_value_path(members.get_mut(field)?, &fields[1..], value)
         }
         PlaceSegment::Index(index) => {
+            if let Value::Memory(memory) = target {
+                if fields.len() != 1 {
+                    return None;
+                }
+                return memory.write(*index, runtime_byte(value)?);
+            }
             let values = match target {
                 Value::Array(values) | Value::Slice(values) => values,
                 Value::List { values, .. } => values,
@@ -2739,6 +3000,14 @@ fn read_value_path(target: &Value, fields: &[PlaceSegment]) -> Option<Value> {
             read_value_path(members.get(field)?, &fields[1..])
         }
         PlaceSegment::Index(index) => {
+            if let Value::Memory(memory) = target {
+                if fields.len() != 1 {
+                    return None;
+                }
+                return memory
+                    .read(*index)
+                    .map(|value| Value::Unsigned(value.into(), 8));
+            }
             let values = match target {
                 Value::Array(values) | Value::Slice(values) => values,
                 Value::List { values, .. } => values,
@@ -2925,6 +3194,7 @@ fn value_type_name(value: &Value) -> &str {
         Value::String(_) => "String",
         Value::CString(_) => "CString",
         Value::CStr(_) => "CStr",
+        Value::Memory(_) => "Memory",
         Value::Path(_) => "Path",
         Value::Instant(_) => "Instant",
         Value::Duration(_) => "Duration",
@@ -2989,6 +3259,7 @@ fn value_is_copy(program: &Program, value: &Value) -> bool {
         | Value::Path(_)
         | Value::String(_)
         | Value::CString(_)
+        | Value::Memory(_)
         | Value::Uninitialized => false,
     }
 }
@@ -3080,6 +3351,15 @@ fn numeric_as_f64(value: &Value) -> Option<f64> {
         Value::Float32(v) => *v as f64,
         _ => return None,
     })
+}
+
+fn runtime_byte(value: Value) -> Option<u8> {
+    match value {
+        Value::Unsigned(value, 8) => u8::try_from(value).ok(),
+        Value::UInt(value) => u8::try_from(value).ok(),
+        Value::Int(value) => u8::try_from(value).ok(),
+        _ => None,
+    }
 }
 
 fn coerce_like(value: Value, target: &Value) -> Result<Value, String> {
@@ -3335,6 +3615,7 @@ fn display_value(value: Value) -> String {
         Value::Reference(_, true) => "<mutable reference>".into(),
         Value::String(value) => value.text,
         Value::CString(value) | Value::CStr(value) => value.text(),
+        Value::Memory(_) => "<Memory>".into(),
         Value::Path(value) => value.to_string_lossy().into_owned(),
         Value::Instant(_) => "<Instant>".into(),
         Value::Duration(value) => format!("{}ns", value.as_nanos()),

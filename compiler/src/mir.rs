@@ -888,6 +888,8 @@ impl<'a> Builder<'a> {
                 call.receiver
             } else if (index == 1
                 && matches!(&call.target, hir::CallTarget::Intrinsic(name) if matches!(name.as_str(), "String.push_str" | "String.contains" | "String.starts_with" | "String.ends_with" | "Map.has" | "Map.get" | "Map.get_mut" | "Map.remove" | "Set.has" | "Set.remove")))
+                || (index == 2
+                    && matches!(&call.target, hir::CallTarget::Intrinsic(name) if name == "Memory.copy_from"))
                 || matches!(&call.target, hir::CallTarget::Intrinsic(name) if name == "Path.new" || name == "Path.join" || name.starts_with("File.") || name.starts_with("Directory."))
             {
                 Some(hir::ReceiverMode::Shared)
