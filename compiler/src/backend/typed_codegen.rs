@@ -181,6 +181,10 @@ fn async_operations(
                         | "TcpStream.read_async_timeout"
                         | "TcpStream.write_async"
                         | "TcpStream.write_async_timeout"
+                        | "UdpSocket.receive_from_async"
+                        | "UdpSocket.receive_from_async_timeout"
+                        | "UdpSocket.send_to_async"
+                        | "UdpSocket.send_to_async_timeout"
                 )
             {
                 let hir::Type::Future(result) =
@@ -230,6 +234,22 @@ fn async_poll_wrapper(operation: &str, result: &hir::Type, output: &mut String) 
         writeln!(
             output,
             "static bool {poll}(void *raw,void *output){{disp_socket_io_state *state=(disp_socket_io_state*)raw;if(!disp_socket_io_poll(state))return false;bool ok=false;size_t written=0;disp_native_string bytes={{0}},error={{0}};disp_socket_io_take(state,&ok,&bytes,&written,&error);disp_string_drop(&bytes);{result_c} *result=({result_c}*)output;*result=({result_c}){{0}};if(ok){{result->tag=0;result->payload.v0.f0=(uint64_t)written;}}else{{result->tag=1;result->payload.v1.f0=error;}}return true;}}"
+        )
+        .unwrap();
+        return;
+    }
+    if operation.starts_with("UdpSocket.receive_from_async") {
+        writeln!(
+            output,
+            "static bool {poll}(void *raw,void *output){{disp_udp_io_state *state=(disp_udp_io_state*)raw;if(!disp_udp_io_poll(state))return false;bool ok=false;size_t sent=0;disp_native_udp_datagram datagram={{0}};disp_native_string error={{0}};disp_udp_io_take(state,&ok,&datagram,&sent,&error);{result_c} *result=({result_c}*)output;*result=({result_c}){{0}};if(ok){{result->tag=0;result->payload.v0.f0=datagram;}}else{{result->tag=1;result->payload.v1.f0=error;}}return true;}}"
+        )
+        .unwrap();
+        return;
+    }
+    if operation.starts_with("UdpSocket.send_to_async") {
+        writeln!(
+            output,
+            "static bool {poll}(void *raw,void *output){{disp_udp_io_state *state=(disp_udp_io_state*)raw;if(!disp_udp_io_poll(state))return false;bool ok=false;size_t sent=0;disp_native_udp_datagram datagram={{0}};disp_native_string error={{0}};disp_udp_io_take(state,&ok,&datagram,&sent,&error);disp_udp_datagram_drop(&datagram);{result_c} *result=({result_c}*)output;*result=({result_c}){{0}};if(ok){{result->tag=0;result->payload.v0.f0=(uint64_t)sent;}}else{{result->tag=1;result->payload.v1.f0=error;}}return true;}}"
         )
         .unwrap();
         return;
@@ -484,6 +504,8 @@ pub fn supported(program: &mir::Program, ty: &hir::Type) -> bool {
         | hir::Type::SocketAddress
         | hir::Type::TcpStream
         | hir::Type::TcpListener
+        | hir::Type::UdpSocket
+        | hir::Type::UdpDatagram
         | hir::Type::Instant
         | hir::Type::Duration
         | hir::Type::Int { .. }
@@ -1303,6 +1325,15 @@ fn terminator(
                         "({{{result_c} _r={{0}};disp_native_tcp_listener _listener={{0}};disp_native_string _error={{0}};if(disp_tcp_listener_bind({address},&_listener,&_error)){{_r.tag=0;_r.payload.v0.f0=_listener;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
                     )
                 }
+                hir::CallTarget::Intrinsic(name) if name == "UdpSocket.bind" => {
+                    let address_ty = operand_ty(program, function, &arguments[0], substitutions);
+                    let address =
+                        operand(program, function, &arguments[0], &address_ty, substitutions);
+                    let result_c = native_types::c_type(&destination_ty);
+                    format!(
+                        "({{{result_c} _r={{0}};disp_native_udp_socket _socket={{0}};disp_native_string _error={{0}};if(disp_udp_socket_bind({address},&_socket,&_error)){{_r.tag=0;_r.payload.v0.f0=_socket;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                    )
+                }
                 hir::CallTarget::Intrinsic(name) if name.starts_with("TcpStream.") => {
                     let (stream, _) =
                         system_argument(program, function, &arguments[0], substitutions);
@@ -1461,6 +1492,130 @@ fn terminator(
                         "TcpListener.close" => {
                             format!("(disp_tcp_listener_close({listener}),(disp_native_unit){{0}})")
                         }
+                        _ => unreachable!(),
+                    }
+                }
+                hir::CallTarget::Intrinsic(name) if name.starts_with("UdpSocket.") => {
+                    let (socket, _) =
+                        system_argument(program, function, &arguments[0], substitutions);
+                    match name.as_str() {
+                        "UdpSocket.receive_from"
+                        | "UdpSocket.receive_from_async"
+                        | "UdpSocket.receive_from_async_timeout" => {
+                            let limit_ty =
+                                operand_ty(program, function, &arguments[1], substitutions);
+                            let limit =
+                                operand(program, function, &arguments[1], &limit_ty, substitutions);
+                            let (limit_c, invalid) =
+                                if matches!(limit_ty, hir::Type::Int { signed: true, .. }) {
+                                    ("__int128", "_limit<0||_limit>65535")
+                                } else {
+                                    ("unsigned __int128", "_limit>65535")
+                                };
+                            if name == "UdpSocket.receive_from" {
+                                let result_c = native_types::c_type(&destination_ty);
+                                format!(
+                                    "({{{limit_c} _limit=({limit_c})({limit});if({invalid})dv_panic(\"UDP receive limit exceeds 65535 bytes\",{},{});{result_c} _r={{0}};disp_native_udp_datagram _datagram={{0}};disp_native_string _error={{0}};if(disp_udp_socket_receive({socket},(size_t)_limit,&_datagram,&_error,{},{})){{_r.tag=0;_r.payload.v0.f0=_datagram;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})",
+                                    span.start.line,
+                                    span.start.column,
+                                    span.start.line,
+                                    span.start.column
+                                )
+                            } else {
+                                let hir::Type::Future(result) = &destination_ty else {
+                                    unreachable!("UDP async receive must return Future")
+                                };
+                                let (has_timeout, timeout) = if arguments.len() == 3 {
+                                    let timeout_ty =
+                                        operand_ty(program, function, &arguments[2], substitutions);
+                                    let timeout = operand(
+                                        program,
+                                        function,
+                                        &arguments[2],
+                                        &timeout_ty,
+                                        substitutions,
+                                    );
+                                    ("true", format!("({timeout}).nanos"))
+                                } else {
+                                    ("false", "0".into())
+                                };
+                                let poll = async_poll_name(name, result);
+                                format!(
+                                    "({{{limit_c} _limit=({limit_c})({limit});if({invalid})dv_panic(\"UDP receive limit exceeds 65535 bytes\",{},{});disp_udp_io_state *_state=disp_udp_io_create(({socket})->state,DISP_UDP_RECEIVE,NULL,(size_t)_limit,NULL,{has_timeout},{timeout},{},{});(disp_native_future){{.context=_state,.poll={poll},.drop=disp_udp_io_drop}};}})",
+                                    span.start.line,
+                                    span.start.column,
+                                    span.start.line,
+                                    span.start.column
+                                )
+                            }
+                        }
+                        "UdpSocket.send_to"
+                        | "UdpSocket.send_to_async"
+                        | "UdpSocket.send_to_async_timeout" => {
+                            let bytes_ty =
+                                operand_ty(program, function, &arguments[1], substitutions);
+                            let bytes =
+                                operand(program, function, &arguments[1], &bytes_ty, substitutions);
+                            let bytes_c = native_types::c_type(&bytes_ty);
+                            let (address, _) =
+                                system_argument(program, function, &arguments[2], substitutions);
+                            if name == "UdpSocket.send_to" {
+                                let result_c = native_types::c_type(&destination_ty);
+                                format!(
+                                    "({{{bytes_c} _bytes={bytes};{result_c} _r={{0}};size_t _sent=0;disp_native_string _error={{0}};if(disp_udp_socket_send({socket},(const char*)_bytes.data,_bytes.len,{address},&_sent,&_error)){{_r.tag=0;_r.payload.v0.f0=(uint64_t)_sent;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                                )
+                            } else {
+                                let hir::Type::Future(result) = &destination_ty else {
+                                    unreachable!("UDP async send must return Future")
+                                };
+                                let (has_timeout, timeout) = if arguments.len() == 4 {
+                                    let timeout_ty =
+                                        operand_ty(program, function, &arguments[3], substitutions);
+                                    let timeout = operand(
+                                        program,
+                                        function,
+                                        &arguments[3],
+                                        &timeout_ty,
+                                        substitutions,
+                                    );
+                                    ("true", format!("({timeout}).nanos"))
+                                } else {
+                                    ("false", "0".into())
+                                };
+                                let poll = async_poll_name(name, result);
+                                format!(
+                                    "({{{bytes_c} _bytes={bytes};disp_udp_io_state *_state=disp_udp_io_create(({socket})->state,DISP_UDP_SEND,(const char*)_bytes.data,_bytes.len,{address},{has_timeout},{timeout},{},{});(disp_native_future){{.context=_state,.poll={poll},.drop=disp_udp_io_drop}};}})",
+                                    span.start.line, span.start.column
+                                )
+                            }
+                        }
+                        "UdpSocket.local_port" => {
+                            let result_c = native_types::c_type(&destination_ty);
+                            format!(
+                                "({{{result_c} _r={{0}};size_t _port=0;disp_native_string _error={{0}};if(disp_udp_socket_local_port({socket},&_port,&_error)){{_r.tag=0;_r.payload.v0.f0=(uint64_t)_port;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                            )
+                        }
+                        "UdpSocket.close" => {
+                            format!("(disp_udp_socket_close({socket}),(disp_native_unit){{0}})")
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                hir::CallTarget::Intrinsic(name) if name.starts_with("UdpDatagram.") => {
+                    let (datagram, _) =
+                        system_argument(program, function, &arguments[0], substitutions);
+                    match name.as_str() {
+                        "UdpDatagram.bytes" => {
+                            let list_c = native_types::c_type(&destination_ty);
+                            format!(
+                                "({{{list_c} _bytes={{.data=NULL,.len=({datagram})->len,.cap=({datagram})->len}};if(_bytes.len){{_bytes.data=(uint8_t*)disp_alloc(_bytes.len,1);memcpy(_bytes.data,({datagram})->data,_bytes.len);}}_bytes;}})"
+                            )
+                        }
+                        "UdpDatagram.source" => {
+                            format!("disp_socket_address_clone(&({datagram})->source)")
+                        }
+                        "UdpDatagram.len" => format!("({datagram})->len"),
+                        "UdpDatagram.is_empty" => format!("({datagram})->len==0"),
                         _ => unreachable!(),
                     }
                 }
@@ -2876,6 +3031,8 @@ fn to_dv(value: &str, ty: &hir::Type) -> String {
         hir::Type::SocketAddress => "dv_string(\"<SocketAddress>\",15)".into(),
         hir::Type::TcpStream => "dv_string(\"<TcpStream>\",11)".into(),
         hir::Type::TcpListener => "dv_string(\"<TcpListener>\",13)".into(),
+        hir::Type::UdpSocket => "dv_string(\"<UdpSocket>\",11)".into(),
+        hir::Type::UdpDatagram => "dv_string(\"<UdpDatagram>\",13)".into(),
         hir::Type::Instant | hir::Type::Duration => {
             format!("dv_u((unsigned __int128)({value}).nanos,64)")
         }
@@ -3112,6 +3269,8 @@ fn drop_value_depth(program: &mir::Program, value: &str, ty: &hir::Type, depth: 
         hir::Type::SocketAddress => format!("disp_socket_address_drop(&({value}));"),
         hir::Type::TcpStream => format!("disp_tcp_stream_drop(&({value}));"),
         hir::Type::TcpListener => format!("disp_tcp_listener_drop(&({value}));"),
+        hir::Type::UdpSocket => format!("disp_udp_socket_drop(&({value}));"),
+        hir::Type::UdpDatagram => format!("disp_udp_datagram_drop(&({value}));"),
         hir::Type::Thread(result) => {
             let result_c = native_types::c_type(result);
             let result_drop = drop_value_depth(

@@ -25,6 +25,8 @@ pub enum Type {
     SocketAddress,
     TcpStream,
     TcpListener,
+    UdpSocket,
+    UdpDatagram,
     Instant,
     Duration,
     Array(Box<Type>, usize),
@@ -1755,6 +1757,23 @@ impl TypeChecker {
                     return Ok(Type::SocketAddress);
                 }
                 if let Expression::FieldAccess { object, field, .. } = &callee.node
+                    && matches!(&object.node, Expression::Identifier(name) if name == "UdpSocket")
+                    && field == "bind"
+                    && arguments.len() == 1
+                {
+                    let address = self.check_expression(&arguments[0])?;
+                    self.require_same(
+                        &Type::SocketAddress,
+                        &address,
+                        arguments[0].span,
+                        "UDP bind address",
+                    )?;
+                    return Ok(Type::Result(
+                        Box::new(Type::UdpSocket),
+                        Box::new(Type::NetworkError),
+                    ));
+                }
+                if let Expression::FieldAccess { object, field, .. } = &callee.node
                     && matches!(&object.node, Expression::Identifier(name) if name == "TcpListener")
                     && field == "bind"
                     && arguments.len() == 1
@@ -2753,6 +2772,83 @@ impl TypeChecker {
                             _ => {}
                         }
                     }
+                    if matches!(receiver, Type::UdpSocket) {
+                        let datagram = || {
+                            Type::Result(Box::new(Type::UdpDatagram), Box::new(Type::NetworkError))
+                        };
+                        let sent =
+                            || Type::Result(Box::new(Type::UInt), Box::new(Type::NetworkError));
+                        match field.as_str() {
+                            "receive_from" | "receive_from_async" if arguments.len() == 1 => {
+                                let limit = self.check_expression(&arguments[0])?;
+                                if !is_integer(&limit) {
+                                    return Err(Diagnostic::new(
+                                        DiagnosticKind::Type,
+                                        "UDP receive limit must be an integer",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                let result = datagram();
+                                return Ok(if field == "receive_from_async" {
+                                    Type::Future(Box::new(result))
+                                } else {
+                                    result
+                                });
+                            }
+                            "receive_from_async_timeout" if arguments.len() == 2 => {
+                                let limit = self.check_expression(&arguments[0])?;
+                                if !is_integer(&limit) {
+                                    return Err(Diagnostic::new(
+                                        DiagnosticKind::Type,
+                                        "UDP receive limit must be an integer",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                let timeout = self.check_expression(&arguments[1])?;
+                                self.require_same(
+                                    &Type::Duration,
+                                    &timeout,
+                                    arguments[1].span,
+                                    "UDP receive timeout",
+                                )?;
+                                return Ok(Type::Future(Box::new(datagram())));
+                            }
+                            "send_to" | "send_to_async" if arguments.len() == 2 => {
+                                self.require_udp_send_arguments(arguments)?;
+                                let result = sent();
+                                return Ok(if field == "send_to_async" {
+                                    Type::Future(Box::new(result))
+                                } else {
+                                    result
+                                });
+                            }
+                            "send_to_async_timeout" if arguments.len() == 3 => {
+                                self.require_udp_send_arguments(&arguments[..2])?;
+                                let timeout = self.check_expression(&arguments[2])?;
+                                self.require_same(
+                                    &Type::Duration,
+                                    &timeout,
+                                    arguments[2].span,
+                                    "UDP send timeout",
+                                )?;
+                                return Ok(Type::Future(Box::new(sent())));
+                            }
+                            "local_port" if arguments.is_empty() => return Ok(sent()),
+                            "close" if arguments.is_empty() => return Ok(Type::Unit),
+                            _ => {}
+                        }
+                    }
+                    if matches!(receiver, Type::UdpDatagram) {
+                        match field.as_str() {
+                            "bytes" if arguments.is_empty() => {
+                                return Ok(Type::List(Box::new(Type::Unsigned(8))));
+                            }
+                            "source" if arguments.is_empty() => return Ok(Type::SocketAddress),
+                            "len" if arguments.is_empty() => return Ok(Type::UInt),
+                            "is_empty" if arguments.is_empty() => return Ok(Type::Bool),
+                            _ => {}
+                        }
+                    }
                     if matches!(receiver, Type::Instant)
                         && field == "elapsed"
                         && arguments.is_empty()
@@ -3501,6 +3597,8 @@ impl TypeChecker {
             "SocketAddress" if ty.arguments.is_empty() => Type::SocketAddress,
             "TcpStream" if ty.arguments.is_empty() => Type::TcpStream,
             "TcpListener" if ty.arguments.is_empty() => Type::TcpListener,
+            "UdpSocket" if ty.arguments.is_empty() => Type::UdpSocket,
+            "UdpDatagram" if ty.arguments.is_empty() => Type::UdpDatagram,
             "Instant" if ty.arguments.is_empty() => Type::Instant,
             "Duration" if ty.arguments.is_empty() => Type::Duration,
             "IoError" if ty.arguments.is_empty() => Type::IoError,
@@ -3801,6 +3899,25 @@ impl TypeChecker {
         }
     }
 
+    fn require_udp_send_arguments(&mut self, arguments: &[Expr]) -> Result<(), Diagnostic> {
+        let bytes = self.check_expression(&arguments[0])?;
+        if !matches!(bytes, Type::List(ref element) | Type::Slice(ref element) if matches!(**element, Type::Unsigned(8)))
+        {
+            return Err(Diagnostic::new(
+                DiagnosticKind::Type,
+                "UDP send expects List<u8> or a u8 slice",
+                arguments[0].span,
+            ));
+        }
+        let address = self.check_expression(&arguments[1])?;
+        self.require_same(
+            &Type::SocketAddress,
+            &address,
+            arguments[1].span,
+            "UDP destination address",
+        )
+    }
+
     fn format_type(&self, ty: &Type) -> String {
         match ty {
             Type::Int => "Int".into(),
@@ -3820,6 +3937,8 @@ impl TypeChecker {
             Type::SocketAddress => "SocketAddress".into(),
             Type::TcpStream => "TcpStream".into(),
             Type::TcpListener => "TcpListener".into(),
+            Type::UdpSocket => "UdpSocket".into(),
+            Type::UdpDatagram => "UdpDatagram".into(),
             Type::Instant => "Instant".into(),
             Type::Duration => "Duration".into(),
             Type::Str => "str".into(),

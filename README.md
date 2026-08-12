@@ -28,7 +28,9 @@ reads/writes, operation deadlines, explicit read/write half-close, explicit clos
 drop cleanup. Asynchronous writes copy their byte input into the future, so later caller mutation
 cannot change pending network output. `TcpListener.bind` provides owned server sockets with lazy readiness-polled
 `accept` futures, optional deadlines, local-port discovery, and cancellation-safe listener
-cleanup. Cancelling an unpolled I/O future has no side effects. Once native I/O has started,
+cleanup. `UdpSocket` adds owned datagram sockets with synchronous or lazy deadline-aware
+send/receive operations, sender-address metadata, explicit truncation errors, zero-length
+datagrams, and cancellation-safe reference-counted native state. Cancelling an unpolled I/O future has no side effects. Once native I/O has started,
 cancellation discards its result but lets the operating-system operation finish, and shutdown
 drains that work so owned resources are released deterministically. The implementation
 remains under active development and should not

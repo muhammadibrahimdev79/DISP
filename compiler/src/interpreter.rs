@@ -8,7 +8,10 @@ use std::{
     collections::HashMap,
     fs,
     io::{Read, Write},
-    net::{Shutdown, TcpListener as StdTcpListener, TcpStream as StdTcpStream, ToSocketAddrs},
+    net::{
+        Shutdown, TcpListener as StdTcpListener, TcpStream as StdTcpStream, ToSocketAddrs,
+        UdpSocket as StdUdpSocket,
+    },
     path::PathBuf,
     sync::{
         Arc, Mutex as StdMutex, Weak,
@@ -104,6 +107,13 @@ enum FutureWork {
     Accept(RuntimeTcpListener, Option<StdDuration>),
     SocketRead(RuntimeTcpStream, usize, Option<StdDuration>),
     SocketWrite(RuntimeTcpStream, Vec<u8>, Option<StdDuration>),
+    UdpReceive(RuntimeUdpSocket, usize, Option<StdDuration>),
+    UdpSend(
+        RuntimeUdpSocket,
+        Vec<u8>,
+        RuntimeSocketAddress,
+        Option<StdDuration>,
+    ),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +144,15 @@ impl RuntimeTcpStream {
 #[derive(Clone)]
 struct RuntimeTcpListener(Arc<StdMutex<Option<StdTcpListener>>>);
 
+#[derive(Clone)]
+struct RuntimeUdpSocket(Arc<StdMutex<Option<StdUdpSocket>>>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeUdpDatagram {
+    source: RuntimeSocketAddress,
+    bytes: Vec<u8>,
+}
+
 impl std::fmt::Debug for RuntimeTcpStream {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -159,6 +178,21 @@ impl std::fmt::Debug for RuntimeTcpListener {
 }
 
 impl PartialEq for RuntimeTcpListener {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl std::fmt::Debug for RuntimeUdpSocket {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("UdpSocket")
+            .field(&Arc::as_ptr(&self.0))
+            .finish()
+    }
+}
+
+impl PartialEq for RuntimeUdpSocket {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
@@ -580,6 +614,8 @@ enum Value {
     SocketAddress(RuntimeSocketAddress),
     TcpStream(RuntimeTcpStream),
     TcpListener(RuntimeTcpListener),
+    UdpSocket(RuntimeUdpSocket),
+    UdpDatagram(RuntimeUdpDatagram),
     Instant(StdInstant),
     Duration(StdDuration),
     Thread(RuntimeThread),
@@ -989,6 +1025,67 @@ impl Interpreter {
                     Err(std::io::Error::new(
                         std::io::ErrorKind::NotConnected,
                         "TCP stream is closed",
+                    ))
+                };
+                Ok(runtime_result(result))
+            }
+            FutureWork::UdpReceive(socket, limit, timeout) => {
+                let mut guard = socket
+                    .0
+                    .lock()
+                    .map_err(|_| self.error("UDP socket state is poisoned", span))?;
+                let result = if let Some(socket) = guard.as_mut() {
+                    socket.set_read_timeout(timeout).and_then(|()| {
+                        let mut bytes = vec![0; limit.saturating_add(1)];
+                        let result = socket.recv_from(&mut bytes).and_then(|(count, source)| {
+                            if count > limit {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "UDP datagram exceeds receive limit",
+                                ));
+                            }
+                            bytes.truncate(count);
+                            Ok(Value::UdpDatagram(RuntimeUdpDatagram {
+                                source: RuntimeSocketAddress {
+                                    host: source.ip().to_string(),
+                                    port: source.port(),
+                                },
+                                bytes,
+                            }))
+                        });
+                        let _ = socket.set_read_timeout(None);
+                        result
+                    })
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "UDP socket is closed",
+                    ))
+                };
+                Ok(runtime_result(result))
+            }
+            FutureWork::UdpSend(socket, bytes, address, timeout) => {
+                let mut guard = socket
+                    .0
+                    .lock()
+                    .map_err(|_| self.error("UDP socket state is poisoned", span))?;
+                let result = if bytes.len() > 65_507 {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "UDP datagram exceeds the 65507-byte payload limit",
+                    ))
+                } else if let Some(socket) = guard.as_mut() {
+                    socket.set_write_timeout(timeout).and_then(|()| {
+                        let result = socket
+                            .send_to(&bytes, (address.host.as_str(), address.port))
+                            .map(|count| Value::UInt(count as u64));
+                        let _ = socket.set_write_timeout(None);
+                        result
+                    })
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "UDP socket is closed",
                     ))
                 };
                 Ok(runtime_result(result))
@@ -1753,6 +1850,24 @@ impl Interpreter {
                             Ok(Value::TcpListener(RuntimeTcpListener(Arc::new(
                                 StdMutex::new(Some(listener)),
                             ))))
+                        });
+                    return Ok(runtime_result(bound));
+                }
+                if let Expression::FieldAccess { object, field, .. } = &callee.node
+                    && matches!(&object.node, Expression::Identifier(name) if name == "UdpSocket")
+                    && field == "bind"
+                {
+                    let address = self.consume(program, &arguments[0])?;
+                    let Value::SocketAddress(address) = address else {
+                        return Err(
+                            self.error("UdpSocket.bind expects SocketAddress", arguments[0].span)
+                        );
+                    };
+                    let bound =
+                        StdUdpSocket::bind((address.host.as_str(), address.port)).map(|socket| {
+                            Value::UdpSocket(RuntimeUdpSocket(Arc::new(StdMutex::new(Some(
+                                socket,
+                            )))))
                         });
                     return Ok(runtime_result(bound));
                 }
@@ -2759,6 +2874,115 @@ impl Interpreter {
                                 Ok(runtime_result(result))
                             }
                             _ => Err(self.error("unknown TcpStream operation", expression.span)),
+                        };
+                    }
+                    if let Value::UdpSocket(socket) = self.evaluate(program, object)? {
+                        return match field.as_str() {
+                            "receive_from"
+                            | "receive_from_async"
+                            | "receive_from_async_timeout" => {
+                                let limit = self.index_value(program, &arguments[0])?;
+                                if limit > 65_535 {
+                                    return Err(self.error(
+                                        "UDP receive limit exceeds 65535 bytes",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                let timeout = if field == "receive_from_async_timeout" {
+                                    let Value::Duration(duration) =
+                                        self.evaluate(program, &arguments[1])?
+                                    else {
+                                        unreachable!("type checking validates UDP timeout")
+                                    };
+                                    Some(duration)
+                                } else {
+                                    None
+                                };
+                                let future = RuntimeFuture::operation(FutureWork::UdpReceive(
+                                    socket, limit, timeout,
+                                ));
+                                if field == "receive_from" {
+                                    self.await_future(program, future, expression.span)
+                                } else {
+                                    Ok(Value::Future(future))
+                                }
+                            }
+                            "send_to" | "send_to_async" | "send_to_async_timeout" => {
+                                let value = self.evaluate(program, &arguments[0])?;
+                                let values = match value {
+                                    Value::List { values, .. } | Value::Slice(values) => values,
+                                    _ => unreachable!("type checking validates UDP bytes"),
+                                };
+                                let bytes = values
+                                    .into_iter()
+                                    .map(|value| match value {
+                                        Value::Unsigned(byte, 8) => byte as u8,
+                                        _ => unreachable!("type checking validates u8 elements"),
+                                    })
+                                    .collect::<Vec<_>>();
+                                let Value::SocketAddress(address) =
+                                    self.evaluate(program, &arguments[1])?
+                                else {
+                                    unreachable!("type checking validates UDP address")
+                                };
+                                let timeout = if field == "send_to_async_timeout" {
+                                    let Value::Duration(duration) =
+                                        self.evaluate(program, &arguments[2])?
+                                    else {
+                                        unreachable!("type checking validates UDP timeout")
+                                    };
+                                    Some(duration)
+                                } else {
+                                    None
+                                };
+                                let future = RuntimeFuture::operation(FutureWork::UdpSend(
+                                    socket, bytes, address, timeout,
+                                ));
+                                if field == "send_to" {
+                                    self.await_future(program, future, expression.span)
+                                } else {
+                                    Ok(Value::Future(future))
+                                }
+                            }
+                            "local_port" => {
+                                let guard = socket.0.lock().map_err(|_| {
+                                    self.error("UDP socket state is poisoned", object.span)
+                                })?;
+                                let port = match guard.as_ref() {
+                                    Some(socket) => socket
+                                        .local_addr()
+                                        .map(|address| Value::UInt(address.port() as u64)),
+                                    None => Err(std::io::Error::new(
+                                        std::io::ErrorKind::NotConnected,
+                                        "UDP socket is closed",
+                                    )),
+                                };
+                                Ok(runtime_result(port))
+                            }
+                            "close" => {
+                                let mut guard = socket.0.lock().map_err(|_| {
+                                    self.error("UDP socket state is poisoned", object.span)
+                                })?;
+                                guard.take();
+                                Ok(Value::Unit)
+                            }
+                            _ => Err(self.error("unknown UdpSocket operation", expression.span)),
+                        };
+                    }
+                    if let Value::UdpDatagram(datagram) = self.evaluate(program, object)? {
+                        return match field.as_str() {
+                            "bytes" => Ok(Value::List {
+                                capacity: datagram.bytes.len(),
+                                values: datagram
+                                    .bytes
+                                    .into_iter()
+                                    .map(|byte| Value::Unsigned(byte as u128, 8))
+                                    .collect(),
+                            }),
+                            "source" => Ok(Value::SocketAddress(datagram.source)),
+                            "len" => Ok(Value::UInt(datagram.bytes.len() as u64)),
+                            "is_empty" => Ok(Value::Bool(datagram.bytes.is_empty())),
+                            _ => Err(self.error("unknown UdpDatagram operation", expression.span)),
                         };
                     }
                     if let Value::Path(path) = self.evaluate(program, object)? {
@@ -4120,6 +4344,8 @@ fn value_type_name(value: &Value) -> &str {
         Value::SocketAddress(_) => "SocketAddress",
         Value::TcpStream(_) => "TcpStream",
         Value::TcpListener(_) => "TcpListener",
+        Value::UdpSocket(_) => "UdpSocket",
+        Value::UdpDatagram(_) => "UdpDatagram",
         Value::Instant(_) => "Instant",
         Value::Duration(_) => "Duration",
         Value::Thread(_) => "Thread",
@@ -4189,6 +4415,8 @@ fn value_is_copy(program: &Program, value: &Value) -> bool {
         | Value::SocketAddress(_)
         | Value::TcpStream(_)
         | Value::TcpListener(_)
+        | Value::UdpSocket(_)
+        | Value::UdpDatagram(_)
         | Value::String(_)
         | Value::CString(_)
         | Value::Memory(_)
@@ -4557,6 +4785,8 @@ fn display_value(value: Value) -> String {
         Value::SocketAddress(value) => format!("{}:{}", value.host, value.port),
         Value::TcpStream(_) => "<TcpStream>".into(),
         Value::TcpListener(_) => "<TcpListener>".into(),
+        Value::UdpSocket(_) => "<UdpSocket>".into(),
+        Value::UdpDatagram(value) => format!("<UdpDatagram:{} bytes>", value.bytes.len()),
         Value::Instant(_) => "<Instant>".into(),
         Value::Duration(value) => format!("{}ns", value.as_nanos()),
         Value::Thread(_) => "<Thread>".into(),

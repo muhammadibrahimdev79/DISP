@@ -684,11 +684,28 @@ clients remain design work.
 
 # 35. UDP
 
+The implemented UDP foundation preserves message boundaries and sender identity:
+
 ```disp
-let socket = UdpSocket.bind("0.0.0.0:9000")?
+bound = UdpSocket.bind(SocketAddress("0.0.0.0", 9000))
+var socket = bound?
+packet = await socket.receive_from_async_timeout(65535, Duration.from_seconds(30))
+datagram = packet?
+socket.send_to(datagram.bytes(), datagram.source())?
 ```
 
-Packet-size and truncation behavior must be defined.
+`bind` and `local_port` use the same validated owned address model as TCP. `send_to` and
+`receive_from` are synchronous; `send_to_async`, `receive_from_async`, and their `_timeout`
+variants are lazy readiness-polled futures. Outgoing futures copy both the byte sequence and
+destination address, so caller mutation or drop cannot change pending output. One send and one
+receive may progress independently, while operations in the same direction are serialized.
+
+`UdpDatagram` owns its bytes and source address. `bytes()` and `source()` return independent owned
+copies; `len()` and `is_empty()` do not allocate. UDP payloads are limited to 65,507 bytes and
+receive limits to 65,535 bytes. If a packet is larger than the requested receive limit, that packet
+is consumed and the operation returns `Err(NetworkError)` instead of silently exposing truncated
+data. Zero-length datagrams remain successful, distinct messages. Closing or dropping a socket
+invalidates pending operations through retained reference-counted state without dangling access.
 
 ---
 

@@ -72,10 +72,25 @@ impl<'a> LayoutEngine<'a> {
                 self.target.pointer_alignment,
                 2,
             ]),
-            hir::Type::TcpStream | hir::Type::TcpListener => scalar(
+            hir::Type::TcpStream | hir::Type::TcpListener | hir::Type::UdpSocket => scalar(
                 u64::from(self.target.pointer_width) / 8,
                 self.target.pointer_alignment,
             ),
+            hir::Type::UdpDatagram => aggregate_layout(&[
+                self.layout(&hir::Type::SocketAddress)?,
+                scalar(
+                    u64::from(self.target.pointer_width) / 8,
+                    self.target.pointer_alignment,
+                ),
+                scalar(
+                    u64::from(self.target.pointer_width) / 8,
+                    self.target.pointer_alignment,
+                ),
+                scalar(
+                    u64::from(self.target.pointer_width) / 8,
+                    self.target.pointer_alignment,
+                ),
+            ]),
             hir::Type::Str => {
                 aggregate(&[self.target.pointer_alignment, self.target.pointer_alignment])
             }

@@ -1,0 +1,31 @@
+async fn exchange() -> Result<uint, NetworkError> {
+    server_bound = UdpSocket.bind(SocketAddress("127.0.0.1", 0))
+    var server = server_bound?
+    client_bound = UdpSocket.bind(SocketAddress("127.0.0.1", 0))
+    var client = client_bound?
+
+    server_address = SocketAddress("127.0.0.1", server.local_port()?)
+    sent = await client.send_to_async_timeout(
+        List.of(u8(68), u8(73), u8(83), u8(80)),
+        server_address,
+        Duration.from_seconds(1)
+    )
+    print(sent?)
+
+    received = await server.receive_from_async_timeout(64, Duration.from_seconds(1))
+    request = received?
+    print(request.len())
+    reply = await server.send_to_async(request.bytes(), request.source())
+    reply?
+
+    response = await client.receive_from_async_timeout(64, Duration.from_seconds(1))
+    packet = response?
+    bytes = packet.bytes()
+    server.close()
+    client.close()
+    return Ok(uint(bytes[0]))
+}
+
+async fn main() {
+    print(await exchange())
+}

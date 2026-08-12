@@ -33,6 +33,8 @@ enum Ty {
     SocketAddress,
     TcpStream,
     TcpListener,
+    UdpSocket,
+    UdpDatagram,
     Instant,
     Duration,
     Function,
@@ -1301,6 +1303,15 @@ impl<'a> Analyzer<'a> {
                     Box::new(Ty::Owned("NetworkError".into())),
                 ));
             }
+            if matches!(&object.node, Expression::Identifier(name) if name == "UdpSocket")
+                && field == "bind"
+            {
+                self.check_expr(&arguments[0], UseMode::Consume)?;
+                return Ok(Ty::Result(
+                    Box::new(Ty::UdpSocket),
+                    Box::new(Ty::Owned("NetworkError".into())),
+                ));
+            }
             if let Expression::Identifier(owner) = &object.node
                 && matches!(
                     owner.as_str(),
@@ -1492,6 +1503,44 @@ impl<'a> Analyzer<'a> {
                         Box::new(Ty::Copy),
                         Box::new(Ty::Owned("NetworkError".into())),
                     ),
+                    _ => Ty::Unit,
+                });
+            }
+            if matches!(self.expr_ty(object), Ok(Ty::UdpSocket)) {
+                let place = self.place(object)?;
+                self.check_borrow(&place, true, object.span)?;
+                self.use_place(&place, UseMode::Read, object.span)?;
+                for argument in arguments {
+                    self.check_expr(argument, UseMode::Read)?;
+                }
+                return Ok(match field.as_str() {
+                    "receive_from" => Ty::Result(
+                        Box::new(Ty::UdpDatagram),
+                        Box::new(Ty::Owned("NetworkError".into())),
+                    ),
+                    "receive_from_async" | "receive_from_async_timeout" => {
+                        Ty::Future(Box::new(Ty::Result(
+                            Box::new(Ty::UdpDatagram),
+                            Box::new(Ty::Owned("NetworkError".into())),
+                        )))
+                    }
+                    "send_to" | "local_port" => Ty::Result(
+                        Box::new(Ty::Copy),
+                        Box::new(Ty::Owned("NetworkError".into())),
+                    ),
+                    "send_to_async" | "send_to_async_timeout" => Ty::Future(Box::new(Ty::Result(
+                        Box::new(Ty::Copy),
+                        Box::new(Ty::Owned("NetworkError".into())),
+                    ))),
+                    _ => Ty::Unit,
+                });
+            }
+            if matches!(self.expr_ty(object), Ok(Ty::UdpDatagram)) {
+                self.check_expr(object, UseMode::Read)?;
+                return Ok(match field.as_str() {
+                    "bytes" => Ty::List(Box::new(Ty::Copy)),
+                    "source" => Ty::SocketAddress,
+                    "len" | "is_empty" => Ty::Copy,
                     _ => Ty::Unit,
                 });
             }
@@ -2598,6 +2647,8 @@ impl<'a> Analyzer<'a> {
             "SocketAddress" => Ty::SocketAddress,
             "TcpStream" => Ty::TcpStream,
             "TcpListener" => Ty::TcpListener,
+            "UdpSocket" => Ty::UdpSocket,
+            "UdpDatagram" => Ty::UdpDatagram,
             "Instant" => Ty::Instant,
             "Duration" => Ty::Duration,
             "Self" if self.self_type.is_some() => {
@@ -2643,6 +2694,8 @@ impl<'a> Analyzer<'a> {
             | Ty::SocketAddress
             | Ty::TcpStream
             | Ty::TcpListener
+            | Ty::UdpSocket
+            | Ty::UdpDatagram
             | Ty::CString
             | Ty::Memory
             | Ty::List(_)

@@ -35,6 +35,8 @@ pub enum Type {
     SocketAddress,
     TcpStream,
     TcpListener,
+    UdpSocket,
+    UdpDatagram,
     Instant,
     Duration,
     Array(Box<Type>, usize),
@@ -88,6 +90,8 @@ impl Type {
             | Self::SocketAddress
             | Self::TcpStream
             | Self::TcpListener
+            | Self::UdpSocket
+            | Self::UdpDatagram
             | Self::List(_)
             | Self::Map(_, _)
             | Self::Set(_)
@@ -764,6 +768,8 @@ impl<'a> Lowering<'a> {
             "SocketAddress" => Type::SocketAddress,
             "TcpStream" => Type::TcpStream,
             "TcpListener" => Type::TcpListener,
+            "UdpSocket" => Type::UdpSocket,
+            "UdpDatagram" => Type::UdpDatagram,
             "Instant" => Type::Instant,
             "Duration" => Type::Duration,
             "IoError" => Type::Generic("IoError".into()),
@@ -1761,6 +1767,25 @@ impl FunctionLowering<'_, '_> {
                         span,
                     });
                 }
+                if owner == "UdpSocket" && field == "bind" {
+                    let args = arguments
+                        .iter()
+                        .map(|x| self.lower_expr(x))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    return Ok(Expr {
+                        kind: ExprKind::Call(Call {
+                            target: CallTarget::Intrinsic("UdpSocket.bind".into()),
+                            arguments: args,
+                            receiver: None,
+                            substitutions: vec![],
+                        }),
+                        ty: Type::Result(
+                            Box::new(Type::UdpSocket),
+                            Box::new(Type::Generic("NetworkError".into())),
+                        ),
+                        span,
+                    });
+                }
                 if owner == "String" {
                     let args = arguments
                         .iter()
@@ -2352,6 +2377,81 @@ impl FunctionLowering<'_, '_> {
                         } else {
                             ReceiverMode::Shared
                         }),
+                        substitutions: vec![],
+                    }),
+                    ty,
+                    span,
+                });
+            }
+            if matches!(receiver.ty, Type::UdpSocket) {
+                let mut args = vec![receiver];
+                args.extend(
+                    arguments
+                        .iter()
+                        .map(|x| self.lower_expr(x))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+                let datagram = || {
+                    Type::Result(
+                        Box::new(Type::UdpDatagram),
+                        Box::new(Type::Generic("NetworkError".into())),
+                    )
+                };
+                let sent = || {
+                    Type::Result(
+                        Box::new(Type::Int {
+                            signed: false,
+                            width: None,
+                        }),
+                        Box::new(Type::Generic("NetworkError".into())),
+                    )
+                };
+                let ty = match field.as_str() {
+                    "receive_from" => datagram(),
+                    "receive_from_async" | "receive_from_async_timeout" => {
+                        Type::Future(Box::new(datagram()))
+                    }
+                    "send_to" | "local_port" => sent(),
+                    "send_to_async" | "send_to_async_timeout" => Type::Future(Box::new(sent())),
+                    _ => Type::Unit,
+                };
+                return Ok(Expr {
+                    kind: ExprKind::Call(Call {
+                        target: CallTarget::Intrinsic(format!("UdpSocket.{field}")),
+                        arguments: args,
+                        receiver: Some(ReceiverMode::Mutable),
+                        substitutions: vec![],
+                    }),
+                    ty,
+                    span,
+                });
+            }
+            if matches!(receiver.ty, Type::UdpDatagram) {
+                let mut args = vec![receiver];
+                args.extend(
+                    arguments
+                        .iter()
+                        .map(|x| self.lower_expr(x))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+                let ty = match field.as_str() {
+                    "bytes" => Type::List(Box::new(Type::Int {
+                        signed: false,
+                        width: Some(8),
+                    })),
+                    "source" => Type::SocketAddress,
+                    "len" => Type::Int {
+                        signed: false,
+                        width: None,
+                    },
+                    "is_empty" => Type::Bool,
+                    _ => Type::Unknown,
+                };
+                return Ok(Expr {
+                    kind: ExprKind::Call(Call {
+                        target: CallTarget::Intrinsic(format!("UdpDatagram.{field}")),
+                        arguments: args,
+                        receiver: Some(ReceiverMode::Shared),
                         substitutions: vec![],
                     }),
                     ty,
@@ -3358,6 +3458,8 @@ fn surface_type_is_copy(ty: &Type) -> bool {
         | Type::SocketAddress
         | Type::TcpStream
         | Type::TcpListener
+        | Type::UdpSocket
+        | Type::UdpDatagram
         | Type::List(_)
         | Type::Map(_, _)
         | Type::Set(_)
