@@ -12,7 +12,8 @@ examples, fuzz targets, test suites, and the evolving design material.
 The current compiler includes static typing, ownership and borrowing, native
 code generation, algebraic data types, generics and traits, strings, slices,
 lists, maps, sets, iteration, paths, filesystem operations, and time
-foundations. The implementation remains under active development and should not
+foundations, native concurrency, and checked C interoperability. The implementation
+remains under active development and should not
 yet be treated as a stable production language.
 
 The compiler and its tests are the authority for currently implemented

@@ -14,6 +14,7 @@ use crate::{
     hir, mir,
 };
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -67,7 +68,25 @@ pub fn build(
     let executable_path = parent.join("build").join(format!("{safe_stem}.exe"));
     fs::write(&c_path, generated.source)
         .map_err(|cause| error(&format!("could not write backend C: {cause}")))?;
-    linker::compile_and_link(&c_path, &object_path, &executable_path, options.optimized)?;
+    let libraries = mono
+        .instances
+        .iter()
+        .filter_map(|instance| {
+            hir.functions[instance.function.0]
+                .external
+                .as_ref()
+                .and_then(|external| external.library.clone())
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    linker::compile_and_link(
+        &c_path,
+        &object_path,
+        &executable_path,
+        options.optimized,
+        &libraries,
+    )?;
     if !options.emit_c {
         let _ = fs::remove_file(&c_path);
     }

@@ -60,7 +60,7 @@ impl<'a> LayoutEngine<'a> {
             hir::Type::Unit => scalar(0, 1),
             hir::Type::Bool => scalar(1, 1),
             hir::Type::Char => scalar(4, 4),
-            hir::Type::String | hir::Type::Path => aggregate(&[
+            hir::Type::String | hir::Type::CString | hir::Type::Path => aggregate(&[
                 self.target.pointer_alignment,
                 self.target.pointer_alignment,
                 self.target.pointer_alignment,
@@ -68,6 +68,10 @@ impl<'a> LayoutEngine<'a> {
             hir::Type::Str => {
                 aggregate(&[self.target.pointer_alignment, self.target.pointer_alignment])
             }
+            hir::Type::CStr => scalar(
+                u64::from(self.target.pointer_width) / 8,
+                self.target.pointer_alignment,
+            ),
             hir::Type::Array(element, length) => {
                 let element = self.layout(element)?;
                 Layout {

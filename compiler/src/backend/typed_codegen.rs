@@ -145,6 +145,8 @@ pub fn supported(program: &mir::Program, ty: &hir::Type) -> bool {
         | hir::Type::Char
         | hir::Type::String
         | hir::Type::Str
+        | hir::Type::CString
+        | hir::Type::CStr
         | hir::Type::Path
         | hir::Type::Instant
         | hir::Type::Duration
@@ -198,13 +200,28 @@ pub fn supported(program: &mir::Program, ty: &hir::Type) -> bool {
 fn prototype(program: &mir::Program, instance: &mono::FunctionInstance, output: &mut String) {
     let function = &program.functions[instance.function.0];
     let substitutions = mono::mapping(function, instance);
+    let result = if function.external.is_some()
+        && matches!(function.locals[function.return_local.0].ty, hir::Type::Unit)
+    {
+        "void".into()
+    } else {
+        c_local_type(function, function.return_local, &substitutions)
+    };
     write!(
         output,
-        "static {} {}(",
-        c_local_type(function, function.return_local, &substitutions),
+        "{}{} {}(",
+        if function.external.is_some() {
+            "extern "
+        } else {
+            "static "
+        },
+        result,
         mono::mangle(program, instance)
     )
     .unwrap();
+    if function.argument_count == 0 && function.external.is_some() {
+        output.push_str("void");
+    }
     for index in 0..function.argument_count {
         if index > 0 {
             output.push(',');
@@ -227,6 +244,9 @@ fn function(
     output: &mut String,
 ) -> Result<(), Diagnostic> {
     let function = &program.functions[instance.function.0];
+    if function.external.is_some() {
+        return Ok(());
+    }
     let substitutions = mono::mapping(function, instance);
     write!(
         output,
@@ -586,6 +606,27 @@ fn terminator(
                     let ty = operand_ty(program, function, &arguments[0], substitutions);
                     let value = operand(program, function, &arguments[0], &ty, substitutions);
                     format!("disp_string_with_capacity((size_t)({value}))")
+                }
+                hir::CallTarget::Intrinsic(name) if name == "CString.new" => {
+                    let source_ty = operand_ty(program, function, &arguments[0], substitutions);
+                    let source =
+                        operand(program, function, &arguments[0], &source_ty, substitutions);
+                    let hir::Type::Reference { inner, .. } = source_ty else {
+                        unreachable!("CString.new source must be borrowed")
+                    };
+                    let (data, len) = match *inner {
+                        hir::Type::String | hir::Type::Str => {
+                            (format!("({source})->data"), format!("({source})->len"))
+                        }
+                        hir::Type::CStr => (format!("*({source})"), format!("strlen(*({source}))")),
+                        _ => unreachable!("type checking validates CString source"),
+                    };
+                    let result_c = native_types::c_type(&destination_ty);
+                    let message = "CString source contains an interior NUL byte";
+                    format!(
+                        "({{const char *_data={data};size_t _len={len};{result_c} _result={{0}};if(_len&&memchr(_data,0,_len)){{_result.tag=1;_result.payload.v1.f0=disp_owned_bytes(\"{message}\",{});}}else{{_result.tag=0;_result.payload.v0.f0=disp_cstring_from_bytes(_data,_len);}}_result;}})",
+                        message.len()
+                    )
                 }
                 hir::CallTarget::Intrinsic(name) if name == "Path.new" => {
                     let (source, _) =
@@ -958,6 +999,43 @@ fn terminator(
                 hir::CallTarget::Intrinsic(name)
                     if matches!(
                         name.as_str(),
+                        "CString.len"
+                            | "CString.is_empty"
+                            | "CString.to_string"
+                            | "CString.as_c_str"
+                    ) =>
+                {
+                    let receiver_ty = operand_ty(program, function, &arguments[0], substitutions);
+                    let receiver = operand(
+                        program,
+                        function,
+                        &arguments[0],
+                        &receiver_ty,
+                        substitutions,
+                    );
+                    let hir::Type::Reference { inner, .. } = receiver_ty else {
+                        unreachable!("CString method receiver must be borrowed")
+                    };
+                    let (data, len) = match *inner {
+                        hir::Type::CString => {
+                            (format!("({receiver})->data"), format!("({receiver})->len"))
+                        }
+                        hir::Type::CStr => {
+                            (format!("*({receiver})"), format!("strlen(*({receiver}))"))
+                        }
+                        _ => unreachable!("type checking validates CString methods"),
+                    };
+                    match name.as_str() {
+                        "CString.len" => len,
+                        "CString.is_empty" => format!("({len}==0)"),
+                        "CString.to_string" => format!("disp_owned_bytes({data},{len})"),
+                        "CString.as_c_str" => data,
+                        _ => unreachable!(),
+                    }
+                }
+                hir::CallTarget::Intrinsic(name)
+                    if matches!(
+                        name.as_str(),
                         "String.len" | "String.capacity" | "String.is_empty"
                     ) =>
                 {
@@ -1072,7 +1150,14 @@ fn terminator(
                         })
                         .collect::<Vec<_>>()
                         .join(",");
-                    format!("{}({arguments})", mono::mangle(program, &target))
+                    let call = format!("{}({arguments})", mono::mangle(program, &target));
+                    if target_function.external.is_some()
+                        && matches!(destination_ty, hir::Type::Unit)
+                    {
+                        format!("({call},(disp_native_unit){{0}})")
+                    } else {
+                        call
+                    }
                 }
             };
             writeln!(
@@ -1729,6 +1814,8 @@ fn to_dv(value: &str, ty: &hir::Type) -> String {
         hir::Type::Bool => format!("dv_bool({value})"),
         hir::Type::Char => format!("dv_char({value})"),
         hir::Type::String => format!("dv_string(({value}).data,({value}).len)"),
+        hir::Type::CString => format!("dv_string(({value}).data,({value}).len)"),
+        hir::Type::CStr => format!("dv_string(({value}),strlen({value}))"),
         hir::Type::Path => format!("dv_string(({value}).data,({value}).len)"),
         hir::Type::Instant | hir::Type::Duration => {
             format!("dv_u((unsigned __int128)({value}).nanos,64)")
@@ -1960,6 +2047,7 @@ fn drop_value(program: &mir::Program, value: &str, ty: &hir::Type) -> String {
 fn drop_value_depth(program: &mir::Program, value: &str, ty: &hir::Type, depth: usize) -> String {
     match ty {
         hir::Type::String => format!("disp_string_drop(&({value}));"),
+        hir::Type::CString => format!("disp_cstring_drop(&({value}));"),
         hir::Type::Path => format!("disp_path_drop(&({value}));"),
         hir::Type::Thread(result) => {
             let result_c = native_types::c_type(result);

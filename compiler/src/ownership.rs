@@ -24,6 +24,8 @@ enum Ty {
     MutexGuard(Box<Ty>),
     AtomicInt,
     Str,
+    CString,
+    CStr,
     Path,
     Instant,
     Duration,
@@ -235,16 +237,47 @@ impl<'a> Analyzer<'a> {
             })
             .collect();
         self.push_scope();
+        let return_ty = function
+            .return_type
+            .as_ref()
+            .map(|ty| self.ty_from_name(ty))
+            .unwrap_or(Ty::Unit);
+        if ty_contains_reference(&return_ty)
+            && function
+                .parameters
+                .iter()
+                .filter(|parameter| ty_is_borrowed_view(&self.ty_from_name(&parameter.ty)))
+                .count()
+                > 1
+        {
+            return Err(Diagnostic::new(
+                DiagnosticKind::Type,
+                "a borrowed return requires exactly one borrowed input lifetime",
+                function
+                    .return_type
+                    .as_ref()
+                    .map_or(function.name_span, |ty| ty.span),
+            )
+            .with_help("return owned data, or redesign the function with one borrowed input until explicit lifetime parameters are available"));
+        }
         for parameter in &function.parameters {
+            let ty = self.ty_from_name(&parameter.ty);
             let id = self.declare(
                 &parameter.name,
-                self.ty_from_name(&parameter.ty),
+                ty.clone(),
                 parameter.name_span,
                 false,
                 true,
                 None,
             )?;
-            self.slots.get_mut(&id).unwrap().parameter = true;
+            let slot = self.slots.get_mut(&id).unwrap();
+            slot.parameter = true;
+            if matches!(ty, Ty::Slice(_) | Ty::Str | Ty::CStr) {
+                slot.reference_origin = Some(Place {
+                    root: id,
+                    fields: vec![],
+                });
+            }
         }
         self.check_block_contents(&function.body)?;
         self.pop_scope(function.body.span, DropReason::ScopeEnd);
@@ -362,6 +395,41 @@ impl<'a> Analyzer<'a> {
                     }
                     return Ok(());
                 }
+                if let Some(Expr {
+                    node: Expression::Call { callee, arguments },
+                    ..
+                }) = value
+                    && let Expression::FieldAccess { object, field, .. } = &callee.node
+                    && field == "as_c_str"
+                    && arguments.is_empty()
+                    && matches!(self.expr_ty(object), Ok(Ty::CString))
+                {
+                    let place = self.place(object)?;
+                    self.use_place(&place, UseMode::Read, object.span)?;
+                    self.check_borrow(&place, false, object.span)?;
+                    let ty = annotation
+                        .as_ref()
+                        .map(|annotation| self.ty_from_name(annotation))
+                        .unwrap_or(Ty::CStr);
+                    let id = self.declare(
+                        name,
+                        ty,
+                        *name_span,
+                        *kind == BindingKind::Var,
+                        true,
+                        Some(place.clone()),
+                    )?;
+                    self.loans.push(Loan {
+                        place,
+                        mutable: false,
+                        borrower: Some(id),
+                        at: object.span,
+                    });
+                    if last_uses.get(name).copied().unwrap_or(index) == index {
+                        self.loans.retain(|loan| loan.borrower != Some(id));
+                    }
+                    return Ok(());
+                }
                 let (ty, origin) = if let Some(value) = value {
                     let ty = self.check_expr(value, UseMode::Consume)?;
                     (
@@ -377,14 +445,29 @@ impl<'a> Analyzer<'a> {
                         None,
                     )
                 };
-                self.declare(
+                let id = self.declare(
                     name,
-                    ty,
+                    ty.clone(),
                     *name_span,
                     *kind == BindingKind::Var,
                     value.is_some(),
-                    origin,
+                    origin.clone(),
                 )?;
+                if let Some(origin) = origin
+                    && ty_contains_reference(&ty)
+                {
+                    let mutable = ty_contains_mutable_reference(&ty);
+                    self.check_borrow(&origin, mutable, *name_span)?;
+                    self.loans.push(Loan {
+                        place: origin,
+                        mutable,
+                        borrower: Some(id),
+                        at: *name_span,
+                    });
+                    if last_uses.get(name).copied().unwrap_or(index) == index {
+                        self.loans.retain(|loan| loan.borrower != Some(id));
+                    }
+                }
             }
             Statement::Assignment {
                 name,
@@ -396,9 +479,53 @@ impl<'a> Analyzer<'a> {
                     if *operator != crate::ast::AssignmentOperator::Assign {
                         return Err(self.error_unknown(name, *name_span));
                     }
+                    if let Expression::Call { callee, arguments } = &value.node
+                        && let Expression::FieldAccess { object, field, .. } = &callee.node
+                        && field == "as_c_str"
+                        && arguments.is_empty()
+                        && matches!(self.expr_ty(object), Ok(Ty::CString))
+                    {
+                        let place = self.place(object)?;
+                        self.use_place(&place, UseMode::Read, object.span)?;
+                        self.check_borrow(&place, false, object.span)?;
+                        let id = self.declare(
+                            name,
+                            Ty::CStr,
+                            *name_span,
+                            true,
+                            true,
+                            Some(place.clone()),
+                        )?;
+                        self.loans.push(Loan {
+                            place,
+                            mutable: false,
+                            borrower: Some(id),
+                            at: object.span,
+                        });
+                        if last_uses.get(name).copied().unwrap_or(index) == index {
+                            self.loans.retain(|loan| loan.borrower != Some(id));
+                        }
+                        return Ok(());
+                    }
                     let ty = self.check_expr(value, UseMode::Consume)?;
                     let origin = self.reference_origin(value);
-                    self.declare(name, ty, *name_span, true, true, origin)?;
+                    let id =
+                        self.declare(name, ty.clone(), *name_span, true, true, origin.clone())?;
+                    if let Some(origin) = origin
+                        && ty_contains_reference(&ty)
+                    {
+                        let mutable = ty_contains_mutable_reference(&ty);
+                        self.check_borrow(&origin, mutable, *name_span)?;
+                        self.loans.push(Loan {
+                            place: origin,
+                            mutable,
+                            borrower: Some(id),
+                            at: *name_span,
+                        });
+                        if last_uses.get(name).copied().unwrap_or(index) == index {
+                            self.loans.retain(|loan| loan.borrower != Some(id));
+                        }
+                    }
                     return Ok(());
                 };
                 let place = Place {
@@ -421,14 +548,14 @@ impl<'a> Analyzer<'a> {
                         let direct_reference_parameter = match &value.node {
                             Expression::Identifier(name) => self.lookup(name).is_some_and(|id| {
                                 self.slots[&id].parameter
-                                    && matches!(self.slots[&id].ty, Ty::Reference(_, _))
+                                    && ty_is_borrowed_view(&self.slots[&id].ty)
                             }),
                             _ => false,
                         };
                         let origin = self.reference_origin(value);
                         let borrowed_reference_parameter = origin.as_ref().is_some_and(|origin| {
                             self.slots[&origin.root].parameter
-                                && matches!(self.slots[&origin.root].ty, Ty::Reference(_, _))
+                                && ty_is_borrowed_view(&self.slots[&origin.root].ty)
                         });
                         if !direct_reference_parameter && !borrowed_reference_parameter {
                             let local = origin.map(|origin| self.slots[&origin.root].name.clone());
@@ -901,13 +1028,18 @@ impl<'a> Analyzer<'a> {
                     .unwrap_or(Ty::Unit));
             }
             if matches!(name.as_str(), "Some" | "Ok" | "Err") {
-                for argument in arguments {
-                    self.check_expr(argument, UseMode::Consume)?;
-                }
+                let payload = arguments
+                    .first()
+                    .map(|argument| self.check_expr(argument, UseMode::Consume))
+                    .transpose()?
+                    .unwrap_or_else(|| Ty::Owned("inferred".into()));
                 self.loans.truncate(temporary_start);
-                return Ok(Ty::Owned(
-                    if name == "Some" { "Option" } else { "Result" }.into(),
-                ));
+                return Ok(match name.as_str() {
+                    "Some" => Ty::Option(Box::new(payload)),
+                    "Ok" => Ty::Result(Box::new(payload), Box::new(Ty::Owned("inferred".into()))),
+                    "Err" => Ty::Result(Box::new(Ty::Owned("inferred".into())), Box::new(payload)),
+                    _ => unreachable!(),
+                });
             }
         }
         if let Expression::FieldAccess { object, field, .. } = &callee.node {
@@ -953,6 +1085,16 @@ impl<'a> Analyzer<'a> {
                     self.check_expr(argument, UseMode::Read)?;
                 }
                 return Ok(Ty::Owned("String".into()));
+            }
+            if matches!(&object.node, Expression::Identifier(name) if name == "CString")
+                && field == "new"
+                && arguments.len() == 1
+            {
+                self.check_expr(&arguments[0], UseMode::Read)?;
+                return Ok(Ty::Result(
+                    Box::new(Ty::CString),
+                    Box::new(Ty::Owned("String".into())),
+                ));
             }
             if matches!(&object.node, Expression::Identifier(name) if name == "List") {
                 for argument in arguments {
@@ -1063,6 +1205,32 @@ impl<'a> Analyzer<'a> {
                     "share" => Ty::AtomicInt,
                     "store" => Ty::Unit,
                     _ => Ty::Copy,
+                });
+            }
+            if matches!(self.expr_ty(object), Ok(Ty::CString)) {
+                let place = self.place(object)?;
+                self.use_place(&place, UseMode::Read, object.span)?;
+                if field == "as_c_str" && arguments.is_empty() {
+                    self.check_borrow(&place, false, object.span)?;
+                    self.loans.push(Loan {
+                        place,
+                        mutable: false,
+                        borrower: None,
+                        at: object.span,
+                    });
+                    return Ok(Ty::CStr);
+                }
+                return Ok(match field.as_str() {
+                    "to_string" => Ty::Owned("String".into()),
+                    _ => Ty::Copy,
+                });
+            }
+            if matches!(self.expr_ty(object), Ok(Ty::CStr)) {
+                self.check_expr(object, UseMode::Read)?;
+                return Ok(if field == "to_string" {
+                    Ty::Owned("String".into())
+                } else {
+                    Ty::Copy
                 });
             }
             if let Ok(Ty::Map(key, value)) = self.expr_ty(object) {
@@ -1648,9 +1816,16 @@ impl<'a> Analyzer<'a> {
     fn reference_origin(&self, expression: &Expr) -> Option<Place> {
         match &expression.node {
             Expression::Borrow { target, .. } => self.place(target).ok(),
+            Expression::Try(operand) => self.reference_origin(operand),
             Expression::Identifier(name) => self
                 .lookup(name)
                 .and_then(|id| self.slots[&id].reference_origin.clone()),
+            Expression::Call { callee, arguments }
+                if matches!(&callee.node, Expression::Identifier(name) if matches!(name.as_str(), "Some" | "Ok" | "Err"))
+                    && arguments.len() == 1 =>
+            {
+                self.reference_origin(&arguments[0])
+            }
             Expression::Call { callee, arguments }
                 if matches!(
                     &callee.node,
@@ -1667,6 +1842,46 @@ impl<'a> Analyzer<'a> {
                     _ => "@i:*".into(),
                 });
                 Some(place)
+            }
+            Expression::Call { callee, arguments }
+                if matches!(
+                    &callee.node,
+                    Expression::FieldAccess { field, .. } if field == "as_c_str"
+                ) && arguments.is_empty() =>
+            {
+                let Expression::FieldAccess { object, .. } = &callee.node else {
+                    unreachable!()
+                };
+                self.place(object).ok()
+            }
+            Expression::Call { callee, arguments } => {
+                let Expression::Identifier(name) = &callee.node else {
+                    return None;
+                };
+                let function = self
+                    .program
+                    .functions
+                    .iter()
+                    .find(|function| function.name == *name)?;
+                let return_ty = function
+                    .return_type
+                    .as_ref()
+                    .map(|ty| self.ty_from_name(ty))
+                    .unwrap_or(Ty::Unit);
+                if !ty_contains_reference(&return_ty) {
+                    return None;
+                }
+                let (index, _) =
+                    function
+                        .parameters
+                        .iter()
+                        .enumerate()
+                        .find(|(_, parameter)| {
+                            ty_is_borrowed_view(&self.ty_from_name(&parameter.ty))
+                        })?;
+                let argument = arguments.get(index)?;
+                self.reference_origin(argument)
+                    .or_else(|| self.place(argument).ok())
             }
             _ => None,
         }
@@ -1808,6 +2023,10 @@ impl<'a> Analyzer<'a> {
             }
             "AtomicInt" => Ty::AtomicInt,
             "str" => Ty::Str,
+            "CString" => Ty::CString,
+            "CStr" => Ty::CStr,
+            "CInt" | "CUInt" | "CSize" | "CSSize" | "CChar" | "CUChar" | "CShort" | "CUShort"
+            | "CLongLong" | "CULongLong" | "CFloat" | "CDouble" => Ty::Copy,
             "Path" => Ty::Path,
             "Instant" => Ty::Instant,
             "Duration" => Ty::Duration,
@@ -1849,8 +2068,9 @@ impl<'a> Analyzer<'a> {
             Ty::Option(value) => self.ty_is_copy(value),
             Ty::Result(ok, error) => self.ty_is_copy(ok) && self.ty_is_copy(error),
             Ty::Array(element) => self.ty_is_copy(element),
-            Ty::Slice(_) | Ty::Str | Ty::Instant | Ty::Duration => true,
+            Ty::Slice(_) | Ty::Str | Ty::CStr | Ty::Instant | Ty::Duration => true,
             Ty::Path
+            | Ty::CString
             | Ty::List(_)
             | Ty::Map(_, _)
             | Ty::Set(_)
@@ -1870,7 +2090,9 @@ impl<'a> Analyzer<'a> {
         }
         match ty.name.as_str() {
             "i8" | "i16" | "i32" | "i64" | "i128" | "u8" | "u16" | "u32" | "u64" | "u128"
-            | "int" | "uint" | "f32" | "f64" | "bool" | "char" | "Unit" => true,
+            | "int" | "uint" | "f32" | "f64" | "bool" | "char" | "Unit" | "CStr" | "CInt"
+            | "CUInt" | "CSize" | "CSSize" | "CChar" | "CUChar" | "CShort" | "CUShort"
+            | "CLongLong" | "CULongLong" | "CFloat" | "CDouble" => true,
             "Option" => ty
                 .arguments
                 .first()
@@ -2064,10 +2286,9 @@ fn is_numeric_type_name(name: &str) -> bool {
 
 fn ty_contains_reference(ty: &Ty) -> bool {
     match ty {
-        Ty::Reference(_, _) => true,
+        Ty::Reference(_, _) | Ty::Slice(_) | Ty::Str | Ty::CStr => true,
         Ty::Option(inner)
         | Ty::Array(inner)
-        | Ty::Slice(inner)
         | Ty::List(inner)
         | Ty::Set(inner)
         | Ty::Thread(inner)
@@ -2075,6 +2296,26 @@ fn ty_contains_reference(ty: &Ty) -> bool {
         Ty::MutexGuard(_) => false,
         Ty::Map(key, value) => ty_contains_reference(key) || ty_contains_reference(value),
         Ty::Result(ok, error) => ty_contains_reference(ok) || ty_contains_reference(error),
+        _ => false,
+    }
+}
+
+fn ty_is_borrowed_view(ty: &Ty) -> bool {
+    matches!(ty, Ty::Reference(_, _) | Ty::Slice(_) | Ty::Str | Ty::CStr)
+}
+
+fn ty_contains_mutable_reference(ty: &Ty) -> bool {
+    match ty {
+        Ty::Reference(_, true) => true,
+        Ty::Option(inner)
+        | Ty::Array(inner)
+        | Ty::List(inner)
+        | Ty::Set(inner)
+        | Ty::Thread(inner)
+        | Ty::Mutex(inner) => ty_contains_mutable_reference(inner),
+        Ty::Map(key, value) | Ty::Result(key, value) => {
+            ty_contains_mutable_reference(key) || ty_contains_mutable_reference(value)
+        }
         _ => false,
     }
 }

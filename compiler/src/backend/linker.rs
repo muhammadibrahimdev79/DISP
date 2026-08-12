@@ -6,28 +6,37 @@ pub fn compile_and_link(
     object: &Path,
     executable: &Path,
     optimized: bool,
+    libraries: &[String],
 ) -> Result<(), Diagnostic> {
     let mut compile = vec![
-        "-std=c11",
-        if optimized { "-O2" } else { "-O0" },
-        "-g",
-        "-ffunction-sections",
-        "-fdata-sections",
+        "-std=c11".to_string(),
+        if optimized { "-O2" } else { "-O0" }.to_string(),
+        "-g".to_string(),
+        "-ffunction-sections".to_string(),
+        "-fdata-sections".to_string(),
     ];
     if !cfg!(windows) {
-        compile.push("-pthread");
+        compile.push("-pthread".into());
     }
-    compile.extend(["-c", path(c_source)?, "-o", path(object)?]);
+    compile.extend([
+        "-c".into(),
+        path(c_source)?.into(),
+        "-o".into(),
+        path(object)?.into(),
+    ]);
     run_gcc(&compile, "C compilation")?;
     let mut link = vec![
-        path(object)?,
-        "-o",
-        path(executable)?,
-        "-Wl,--gc-sections",
-        "-lm",
+        path(object)?.into(),
+        "-o".into(),
+        path(executable)?.into(),
+        "-Wl,--gc-sections".into(),
+        "-lm".into(),
     ];
     if !cfg!(windows) {
-        link.push("-pthread");
+        link.push("-pthread".into());
+    }
+    for library in libraries {
+        link.push(format!("-l{library}"));
     }
     run_gcc(&link, "native linking")
 }
@@ -36,7 +45,7 @@ fn path(path: &Path) -> Result<&str, Diagnostic> {
     path.to_str()
         .ok_or_else(|| error("native toolchain cannot represent a non-UTF-8 path"))
 }
-fn run_gcc(arguments: &[&str], phase: &str) -> Result<(), Diagnostic> {
+fn run_gcc(arguments: &[String], phase: &str) -> Result<(), Diagnostic> {
     let output = Command::new("gcc")
         .args(arguments)
         .output()

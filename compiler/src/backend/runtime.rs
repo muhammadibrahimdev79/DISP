@@ -90,6 +90,8 @@ static bool disp_string_ends_with(const char *value,size_t value_len,const char 
 static bool disp_string_contains(const char *value,size_t value_len,const char *needle,size_t needle_len){if(!needle_len)return true;if(needle_len>value_len)return false;for(size_t i=0;i<=value_len-needle_len;i++)if(memcmp(value+i,needle,needle_len)==0)return true;return false;}
 
 static disp_native_string disp_owned_bytes(const char *bytes,size_t len){disp_native_string value={0};if(len){value.data=(char*)disp_alloc(len,1);memcpy(value.data,bytes,len);value.len=len;value.cap=len;}return value;}
+static disp_native_cstring disp_cstring_from_bytes(const char *bytes,size_t len){disp_native_cstring value={0};size_t capacity;if(__builtin_add_overflow(len,(size_t)1,&capacity))disp_allocation_failure("CString length overflow");value.data=(char*)disp_alloc(capacity,1);if(len)memcpy(value.data,bytes,len);value.data[len]=0;value.len=len;value.cap=capacity;return value;}
+static void disp_cstring_drop(disp_native_cstring *value){if(value->cap)disp_dealloc(value->data);value->data=NULL;value->len=0;value->cap=0;}
 static disp_native_string disp_io_error(void){const char *message=strerror(errno);return disp_owned_bytes(message,strlen(message));}
 static disp_native_path disp_path_from_bytes(const char *bytes,size_t len,int line,int column){if(len&&memchr(bytes,0,len))dv_panic("Path cannot contain a NUL byte",line,column);disp_native_path path={0};path.data=(char*)disp_alloc(len+1,1);if(len)memcpy(path.data,bytes,len);path.data[len]=0;path.len=len;path.cap=len+1;return path;}
 static void disp_path_drop(disp_native_path *path){disp_dealloc(path->data);path->data=NULL;path->len=0;path->cap=0;}

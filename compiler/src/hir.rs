@@ -25,6 +25,8 @@ pub enum Type {
     Char,
     String,
     Str,
+    CString,
+    CStr,
     Path,
     Instant,
     Duration,
@@ -69,8 +71,9 @@ impl Type {
             Self::Option(inner) => inner.is_copy(program),
             Self::Result(ok, error) => ok.is_copy(program) && error.is_copy(program),
             Self::Array(element, _) => element.is_copy(program),
-            Self::Slice(_) | Self::Str => true,
+            Self::Slice(_) | Self::Str | Self::CStr => true,
             Self::String
+            | Self::CString
             | Self::Path
             | Self::List(_)
             | Self::Map(_, _)
@@ -160,7 +163,19 @@ pub struct Function {
     pub body: Block,
     pub generic_parameters: Vec<String>,
     pub owner_impl: Option<ImplId>,
+    pub external: Option<ExternalFunction>,
     pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalFunction {
+    pub abi: ExternalAbi,
+    pub library: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalAbi {
+    C,
 }
 
 #[derive(Debug, Clone)]
@@ -612,6 +627,12 @@ impl<'a> Lowering<'a> {
                 .chain(function.generics.iter().map(|x| x.name.clone()))
                 .collect(),
             owner_impl,
+            external: function.external.as_ref().map(|external| ExternalFunction {
+                abi: match external.abi {
+                    ast::ExternalAbi::C => ExternalAbi::C,
+                },
+                library: external.library.clone(),
+            }),
             span: function.span,
         })
     }
@@ -638,6 +659,50 @@ impl<'a> Lowering<'a> {
             "char" => Type::Char,
             "String" => Type::String,
             "str" => Type::Str,
+            "CString" => Type::CString,
+            "CStr" => Type::CStr,
+            "CInt" => Type::Int {
+                signed: true,
+                width: Some(32),
+            },
+            "CUInt" => Type::Int {
+                signed: false,
+                width: Some(32),
+            },
+            "CSize" => Type::Int {
+                signed: false,
+                width: None,
+            },
+            "CSSize" => Type::Int {
+                signed: true,
+                width: None,
+            },
+            "CChar" => Type::Int {
+                signed: true,
+                width: Some(8),
+            },
+            "CUChar" => Type::Int {
+                signed: false,
+                width: Some(8),
+            },
+            "CShort" => Type::Int {
+                signed: true,
+                width: Some(16),
+            },
+            "CUShort" => Type::Int {
+                signed: false,
+                width: Some(16),
+            },
+            "CLongLong" => Type::Int {
+                signed: true,
+                width: Some(64),
+            },
+            "CULongLong" => Type::Int {
+                signed: false,
+                width: Some(64),
+            },
+            "CFloat" => Type::Float { width: 32 },
+            "CDouble" => Type::Float { width: 64 },
             "Path" => Type::Path,
             "Instant" => Type::Instant,
             "Duration" => Type::Duration,
@@ -1383,6 +1448,22 @@ impl FunctionLowering<'_, '_> {
                         span,
                     });
                 }
+                if owner == "CString" {
+                    let args = arguments
+                        .iter()
+                        .map(|x| self.lower_expr(x))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    return Ok(Expr {
+                        kind: ExprKind::Call(Call {
+                            target: CallTarget::Intrinsic(format!("CString.{field}")),
+                            arguments: args,
+                            receiver: None,
+                            substitutions: vec![],
+                        }),
+                        ty: Type::Result(Box::new(Type::CString), Box::new(Type::String)),
+                        span,
+                    });
+                }
                 if owner == "List" {
                     let args = arguments
                         .iter()
@@ -1900,6 +1981,33 @@ impl FunctionLowering<'_, '_> {
                             signed: true,
                             width: None,
                         },
+                    },
+                    span,
+                });
+            }
+            if matches!(receiver.ty, Type::CString | Type::CStr)
+                && matches!(
+                    field.as_str(),
+                    "len" | "is_empty" | "to_string" | "as_c_str"
+                )
+            {
+                let receiver_ty = receiver.ty.clone();
+                return Ok(Expr {
+                    kind: ExprKind::Call(Call {
+                        target: CallTarget::Intrinsic(format!("CString.{field}")),
+                        arguments: vec![receiver],
+                        receiver: Some(ReceiverMode::Shared),
+                        substitutions: vec![],
+                    }),
+                    ty: match field.as_str() {
+                        "len" => Type::Int {
+                            signed: false,
+                            width: None,
+                        },
+                        "is_empty" => Type::Bool,
+                        "to_string" => Type::String,
+                        "as_c_str" if matches!(receiver_ty, Type::CString) => Type::CStr,
+                        _ => Type::Unknown,
                     },
                     span,
                 });
@@ -2619,10 +2727,12 @@ fn surface_type_is_copy(ty: &Type) -> bool {
         | Type::Reference { .. }
         | Type::RawPointer { .. }
         | Type::Str
+        | Type::CStr
         | Type::Slice(_) => true,
         Type::Array(element, _) | Type::Option(element) => surface_type_is_copy(element),
         Type::Result(ok, error) => surface_type_is_copy(ok) && surface_type_is_copy(error),
         Type::String
+        | Type::CString
         | Type::Path
         | Type::List(_)
         | Type::Map(_, _)
@@ -2816,7 +2926,7 @@ fn infer_hir_type(pattern: &Type, concrete: &Type, inferred: &mut HashMap<String
     }
 }
 
-fn substitute_type(ty: &Type, substitutions: &HashMap<String, Type>) -> Type {
+pub(crate) fn substitute_type(ty: &Type, substitutions: &HashMap<String, Type>) -> Type {
     match ty {
         Type::Generic(name) => substitutions
             .get(name)

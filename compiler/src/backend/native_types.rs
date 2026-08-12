@@ -12,6 +12,7 @@ pub fn generate(
          typedef struct { unsigned char _zero[0]; } disp_native_unit;\n\
          typedef struct { char *data; size_t len; size_t cap; } disp_native_string;\n\
          typedef struct { const char *data; size_t len; } disp_native_str;\n\
+         typedef struct { char *data; size_t len; size_t cap; } disp_native_cstring;\n\
          typedef struct { char *data; size_t len; size_t cap; } disp_native_path;\n\
          typedef struct { uint64_t nanos; } disp_native_instant;\n\
          typedef struct { uint64_t nanos; } disp_native_duration;\n\
@@ -296,6 +297,8 @@ pub fn c_type(ty: &hir::Type) -> String {
         hir::Type::Bool => "bool".into(),
         hir::Type::Char => "uint32_t".into(),
         hir::Type::String => "disp_native_string".into(),
+        hir::Type::CString => "disp_native_cstring".into(),
+        hir::Type::CStr => "const char *".into(),
         hir::Type::Path => "disp_native_path".into(),
         hir::Type::Instant => "disp_native_instant".into(),
         hir::Type::Duration => "disp_native_duration".into(),

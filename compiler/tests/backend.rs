@@ -320,6 +320,23 @@ fn native_checked_overflow_has_controlled_failure() {
 }
 
 #[test]
+fn native_match_payload_moves_drop_remaining_fields_exactly_once() {
+    let source = r#"
+enum Pair<T> { Both(T, T) }
+enum Wrapped<T> { Value(Pair<T>, T) }
+fn take(value: Wrapped<String>) -> String {
+    return match value {
+        Wrapped.Value(Pair.Both(first, _), _) => first
+        Wrapped.Value(_, fallback) => fallback
+    }
+}
+fn main() { print(take(Wrapped.Value(Pair.Both("kept", "inner drop"), "outer drop"))) }
+"#;
+    assert_eq!(run_source(source).unwrap(), ["kept"]);
+    differential("variant-payload-cleanup", source);
+}
+
+#[test]
 fn backend_rejects_unresolved_concrete_types_with_a_diagnostic() {
     let source = "fn main() {}";
     let (hir, _) = lower_source(source).unwrap();
@@ -352,6 +369,10 @@ fn representative_examples_match_the_interpreter_natively() {
         (
             "concurrency_example",
             include_str!("../examples/concurrency.disp"),
+        ),
+        (
+            "c_interop_example",
+            include_str!("../examples/c_interop.disp"),
         ),
         ("hello_example", include_str!("../hello.disp")),
     ] {

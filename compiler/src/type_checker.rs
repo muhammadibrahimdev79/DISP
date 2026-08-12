@@ -18,6 +18,8 @@ pub enum Type {
     FloatLiteral,
     String,
     Str,
+    CString,
+    CStr,
     Path,
     Instant,
     Duration,
@@ -110,6 +112,7 @@ pub struct TypeChecker {
     generic_types: HashMap<String, Vec<String>>,
     traits: HashMap<String, TraitInfo>,
     implementations: Vec<ImplInfo>,
+    external_functions: HashSet<String>,
     unsafe_depth: usize,
 }
 
@@ -126,6 +129,7 @@ impl TypeChecker {
             generic_types: HashMap::new(),
             traits: HashMap::new(),
             implementations: Vec::new(),
+            external_functions: HashSet::new(),
             unsafe_depth: 0,
         }
     }
@@ -138,6 +142,7 @@ impl TypeChecker {
         self.variants.clear();
         self.traits.clear();
         self.implementations.clear();
+        self.external_functions.clear();
         self.traits.insert(
             "Copy".into(),
             TraitInfo {
@@ -388,6 +393,10 @@ impl TypeChecker {
                 .map(|ty| self.resolve_type(ty))
                 .transpose()?
                 .unwrap_or(Type::Unit);
+            if function.external.is_some() {
+                self.validate_external_signature(function, &parameters, &result)?;
+                self.external_functions.insert(function.name.clone());
+            }
             self.functions.insert(
                 function.name.clone(),
                 Signature {
@@ -489,7 +498,88 @@ impl TypeChecker {
         }
 
         for function in &program.functions {
-            self.check_function(function)?;
+            if function.external.is_none() {
+                self.check_function(function)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_external_signature(
+        &self,
+        function: &Function,
+        parameters: &[Type],
+        result: &Type,
+    ) -> Result<(), Diagnostic> {
+        if function.name == "main" {
+            return Err(Diagnostic::new(
+                DiagnosticKind::Type,
+                "`main` must be implemented in DISP and cannot be external",
+                function.name_span,
+            ));
+        }
+        if !function.generics.is_empty() {
+            return Err(Diagnostic::new(
+                DiagnosticKind::Type,
+                "external C functions cannot be generic",
+                function.span,
+            ));
+        }
+        if !is_c_identifier(&function.name) {
+            return Err(Diagnostic::new(
+                DiagnosticKind::Type,
+                "an external C symbol must use a safe, non-reserved ASCII C identifier",
+                function.name_span,
+            )
+            .with_help(
+                "C keywords and DISP runtime-reserved symbol prefixes cannot be imported directly",
+            ));
+        }
+        if let Some(library) = function
+            .external
+            .as_ref()
+            .and_then(|external| external.library.as_deref())
+            && (library.is_empty()
+                || !library.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+                }))
+        {
+            return Err(Diagnostic::new(
+                DiagnosticKind::Type,
+                "external library names may only contain ASCII letters, digits, `_`, and `-`",
+                function.span,
+            ));
+        }
+        for (parameter, ty) in function.parameters.iter().zip(parameters) {
+            if !ffi_parameter_type(ty) {
+                return Err(Diagnostic::new(
+                    DiagnosticKind::Type,
+                    format!(
+                        "{} is not safe to pass through the defined C ABI",
+                        self.format_type(ty)
+                    ),
+                    parameter.ty.span,
+                )
+                .with_help(
+                    "use fixed-width numbers, CSize/CSSize, CStr, or an explicit raw pointer",
+                ));
+            }
+        }
+        if !ffi_result_type(result) {
+            return Err(Diagnostic::new(
+                DiagnosticKind::Type,
+                format!(
+                    "{} is not safe to return through the defined C ABI",
+                    self.format_type(result)
+                ),
+                function
+                    .return_type
+                    .as_ref()
+                    .map_or(function.name_span, |ty| ty.span),
+            )
+            .with_help(
+                "return a scalar or explicit raw pointer; borrowed CStr results are rejected",
+            ));
         }
         Ok(())
     }
@@ -979,6 +1069,14 @@ impl TypeChecker {
                         callee.span,
                     ));
                 };
+                if self.external_functions.contains(name) {
+                    return Err(Diagnostic::new(
+                        DiagnosticKind::Type,
+                        "external C calls cannot be spawned directly",
+                        callee.span,
+                    )
+                    .with_help("wrap the unsafe C call in a checked DISP function, then spawn that function"));
+                }
                 if signature
                     .parameters
                     .iter()
@@ -986,7 +1084,7 @@ impl TypeChecker {
                 {
                     return Err(Diagnostic::new(
                         DiagnosticKind::Type,
-                        "spawned functions cannot accept references, borrowed views, or raw pointers",
+                        "spawned functions cannot accept references, borrowed views, or raw pointers across a thread boundary",
                         callee.span,
                     )
                     .with_help("pass owned data to the spawned function"));
@@ -1259,6 +1357,17 @@ impl TypeChecker {
                 self.check_binary(*operator, left_type, right_type, expression.span)
             }
             Expression::Call { callee, arguments } => {
+                if let Expression::Identifier(name) = &callee.node
+                    && self.external_functions.contains(name)
+                    && self.unsafe_depth == 0
+                {
+                    return Err(Diagnostic::new(
+                        DiagnosticKind::Type,
+                        format!("external call `{name}` requires an `unsafe` block"),
+                        expression.span,
+                    )
+                    .with_help("validate the foreign function's contract, then place only the call inside `unsafe { ... }`"));
+                }
                 if matches!(&callee.node, Expression::Identifier(name) if name == "String") {
                     if !arguments.is_empty() {
                         return Err(Diagnostic::new(
@@ -1436,6 +1545,32 @@ impl TypeChecker {
                             ));
                         }
                     }
+                }
+                if let Expression::FieldAccess { object, field, .. } = &callee.node
+                    && matches!(&object.node, Expression::Identifier(name) if name == "CString")
+                {
+                    if field != "new" || arguments.len() != 1 {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            format!(
+                                "no CString constructor `{field}` with {} arguments",
+                                arguments.len()
+                            ),
+                            expression.span,
+                        ));
+                    }
+                    let source = self.check_expression(&arguments[0])?;
+                    if !matches!(source, Type::String | Type::Str | Type::CStr) {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            "CString.new expects String, str, or CStr",
+                            arguments[0].span,
+                        ));
+                    }
+                    return Ok(Type::Result(
+                        Box::new(Type::CString),
+                        Box::new(Type::String),
+                    ));
                 }
                 if let Expression::FieldAccess { object, field, .. } = &callee.node
                     && matches!(&object.node, Expression::Identifier(name) if name == "List")
@@ -1911,6 +2046,19 @@ impl TypeChecker {
                                 } else {
                                     Type::Int
                                 });
+                            }
+                            _ => {}
+                        }
+                    }
+                    if matches!(receiver, Type::CString | Type::CStr) {
+                        match field.as_str() {
+                            "len" if arguments.is_empty() => return Ok(Type::UInt),
+                            "is_empty" if arguments.is_empty() => return Ok(Type::Bool),
+                            "to_string" if arguments.is_empty() => return Ok(Type::String),
+                            "as_c_str"
+                                if arguments.is_empty() && matches!(receiver, Type::CString) =>
+                            {
+                                return Ok(Type::CStr);
                             }
                             _ => {}
                         }
@@ -2652,6 +2800,20 @@ impl TypeChecker {
             "u128" if ty.arguments.is_empty() => Type::Unsigned(128),
             "String" if ty.arguments.is_empty() => Type::String,
             "str" if ty.arguments.is_empty() => Type::Str,
+            "CString" if ty.arguments.is_empty() => Type::CString,
+            "CStr" if ty.arguments.is_empty() => Type::CStr,
+            "CInt" if ty.arguments.is_empty() => Type::Signed(32),
+            "CUInt" if ty.arguments.is_empty() => Type::Unsigned(32),
+            "CSize" if ty.arguments.is_empty() => Type::UInt,
+            "CSSize" if ty.arguments.is_empty() => Type::Int,
+            "CChar" if ty.arguments.is_empty() => Type::Signed(8),
+            "CUChar" if ty.arguments.is_empty() => Type::Unsigned(8),
+            "CShort" if ty.arguments.is_empty() => Type::Signed(16),
+            "CUShort" if ty.arguments.is_empty() => Type::Unsigned(16),
+            "CLongLong" if ty.arguments.is_empty() => Type::Signed(64),
+            "CULongLong" if ty.arguments.is_empty() => Type::Unsigned(64),
+            "CFloat" if ty.arguments.is_empty() => Type::Float32,
+            "CDouble" if ty.arguments.is_empty() => Type::Float,
             "Path" if ty.arguments.is_empty() => Type::Path,
             "Instant" if ty.arguments.is_empty() => Type::Instant,
             "Duration" if ty.arguments.is_empty() => Type::Duration,
@@ -2823,6 +2985,7 @@ impl TypeChecker {
             | Type::Bool
             | Type::Instant
             | Type::Duration
+            | Type::CStr
             | Type::Unit
             | Type::Reference(_, false)
             | Type::RawPointer(_, _) => true,
@@ -2847,6 +3010,7 @@ impl TypeChecker {
             | Type::MutexGuard(_)
             | Type::Slice(_)
             | Type::Str
+            | Type::CStr
             | Type::Function(_, _) => false,
             Type::Generic(_) | Type::Infer => false,
             Type::Array(element, _)
@@ -2956,6 +3120,8 @@ impl TypeChecker {
             Type::Float32 => "f32".into(),
             Type::FloatLiteral => "floating-point literal".into(),
             Type::String => "String".into(),
+            Type::CString => "CString".into(),
+            Type::CStr => "CStr".into(),
             Type::Path => "Path".into(),
             Type::Instant => "Instant".into(),
             Type::Duration => "Duration".into(),
@@ -3406,12 +3572,94 @@ fn contains_infer(ty: &Type) -> bool {
     }
 }
 
+fn is_c_identifier(name: &str) -> bool {
+    let mut characters = name.chars();
+    let syntax_valid = characters
+        .next()
+        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric());
+    syntax_valid
+        && !name.starts_with("__")
+        && !name.starts_with("disp_")
+        && !name.starts_with("dv_")
+        && !matches!(
+            name,
+            "alignas"
+                | "alignof"
+                | "auto"
+                | "break"
+                | "case"
+                | "char"
+                | "const"
+                | "continue"
+                | "default"
+                | "do"
+                | "double"
+                | "else"
+                | "enum"
+                | "extern"
+                | "float"
+                | "for"
+                | "goto"
+                | "if"
+                | "inline"
+                | "int"
+                | "long"
+                | "register"
+                | "restrict"
+                | "return"
+                | "short"
+                | "signed"
+                | "sizeof"
+                | "static"
+                | "struct"
+                | "switch"
+                | "thread_local"
+                | "typedef"
+                | "union"
+                | "unsigned"
+                | "void"
+                | "volatile"
+                | "while"
+                | "_Alignas"
+                | "_Alignof"
+                | "_Atomic"
+                | "_Bool"
+                | "_Complex"
+                | "_Generic"
+                | "_Imaginary"
+                | "_Noreturn"
+                | "_Static_assert"
+                | "_Thread_local"
+        )
+}
+
+fn ffi_parameter_type(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Bool
+            | Type::Int
+            | Type::UInt
+            | Type::Signed(_)
+            | Type::Unsigned(_)
+            | Type::Float
+            | Type::Float32
+            | Type::CStr
+            | Type::RawPointer(_, _)
+    )
+}
+
+fn ffi_result_type(ty: &Type) -> bool {
+    *ty == Type::Unit || (ffi_parameter_type(ty) && *ty != Type::CStr)
+}
+
 fn type_crosses_thread_by_borrow(ty: &Type) -> bool {
     match ty {
         Type::Reference(_, _)
         | Type::RawPointer(_, _)
         | Type::Slice(_)
         | Type::Str
+        | Type::CStr
         | Type::MutexGuard(_) => true,
         Type::Array(inner, _)
         | Type::List(inner)

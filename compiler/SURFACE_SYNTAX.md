@@ -110,6 +110,55 @@ A leading dereference assignment on the line after another expression is treated
 new statement. This resolves the otherwise ambiguous `call()\n*guard += 1` spelling
 without requiring a semicolon.
 
+## C interoperability
+
+Foreign functions are declarations inside an `extern C` block. A library name is
+optional; when present, the native linker receives it as one validated library argument:
+
+```disp
+extern C {
+    fn strlen(value: CStr) -> CSize
+}
+
+extern C("m") {
+    fn sqrt(value: CDouble) -> CDouble
+}
+```
+
+Calls require a narrowly scoped `unsafe` block because DISP can validate the ABI shape,
+but cannot prove the contract implemented by foreign code:
+
+```disp
+owned = CString.new("checked UTF-8")?
+view = owned.as_c_str()
+unsafe {
+    print(strlen(view))
+    print(sqrt(81.0))
+}
+```
+
+`CString.new` returns `Result<CString, String>` and rejects interior NUL bytes. The owned
+value uses allocator-backed, deterministically released storage. `as_c_str()` is a
+zero-copy `CStr` loan, so moving its owner, returning a view of a local owner, or sending
+the view to another thread is rejected. `CStr` is accepted only as a parameter in the
+defined ABI; borrowed C-string returns are rejected because an external declaration
+cannot express a lifetime contract.
+
+A checked DISP function may return a borrowed view when exactly one borrowed input
+defines its elided lifetime. Returning a borrowed value from a function with multiple
+possible borrowed origins is rejected until the source language has explicit lifetime
+parameters.
+
+The portable aliases are `CInt`, `CUInt`, `CSize`, `CSSize`, `CChar`, `CUChar`, `CShort`,
+`CUShort`, `CLongLong`, `CULongLong`, `CFloat`, and `CDouble`. Fixed-width DISP numeric
+types and explicit raw pointers are also ABI-safe. Owned DISP aggregates such as
+`String`, `CString`, `List`, and user structs never cross the C boundary implicitly.
+
+Native compilation can call any correctly declared linked symbol. The interpreter has
+deterministic semantic-oracle support for `abs`, `strlen`, and `sqrt`; other foreign
+functions produce a controlled diagnostic requiring native execution rather than
+inventing foreign behavior.
+
 ## Collection loops
 
 ```disp

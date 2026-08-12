@@ -1,8 +1,8 @@
 use crate::ast::{
     AssignmentOperator, BinaryOperator, BindingKind, Block, EnumDeclaration, Expr, Expression,
-    FieldDeclaration, Function, FunctionSignature, GenericParameter, Implementation, MatchArm,
-    Parameter, Pattern, Program, Spanned, Statement, StructDeclaration, StructFieldValue,
-    TraitDeclaration, TypeName, TypeQualifier, UnaryOperator, VariantDeclaration,
+    ExternalAbi, ExternalFunction, FieldDeclaration, Function, FunctionSignature, GenericParameter,
+    Implementation, MatchArm, Parameter, Pattern, Program, Spanned, Statement, StructDeclaration,
+    StructFieldValue, TraitDeclaration, TypeName, TypeQualifier, UnaryOperator, VariantDeclaration,
 };
 use crate::diagnostics::{Diagnostic, DiagnosticKind, Position, Span};
 use crate::lexer::{Token, TokenKind};
@@ -43,6 +43,8 @@ impl Parser {
                 enums.push(self.parse_enum()?);
             } else if self.check(&TokenKind::Fn) {
                 functions.push(self.parse_function()?);
+            } else if self.check(&TokenKind::Extern) {
+                functions.extend(self.parse_extern_block()?);
             } else if self.check(&TokenKind::Trait) {
                 traits.push(self.parse_trait()?);
             } else if self.check(&TokenKind::Impl) {
@@ -50,7 +52,7 @@ impl Parser {
             } else {
                 return Err(Diagnostic::new(
                     DiagnosticKind::Parse,
-                    "expected a top-level `struct`, `enum`, or `fn` declaration",
+                    "expected a top-level `struct`, `enum`, `fn`, or `extern` declaration",
                     self.peek().span,
                 ));
             }
@@ -333,8 +335,97 @@ impl Parser {
             parameters,
             return_type,
             body,
+            external: None,
             span,
         })
+    }
+
+    fn parse_extern_block(&mut self) -> Result<Vec<Function>, Diagnostic> {
+        let start = self.expect(TokenKind::Extern, "expected `extern`")?.span;
+        let (abi, abi_span) = self.expect_identifier("expected ABI name after `extern`")?;
+        if abi != "C" {
+            return Err(Diagnostic::new(
+                DiagnosticKind::Parse,
+                format!("unsupported external ABI `{abi}`"),
+                abi_span,
+            )
+            .with_help("the defined foreign ABI is written as `extern C { ... }`"));
+        }
+        let library = if self.match_token(&TokenKind::LeftParen) {
+            let token = self.advance();
+            let TokenKind::String(library) = token.kind else {
+                return Err(Diagnostic::new(
+                    DiagnosticKind::Parse,
+                    "expected a library name string",
+                    token.span,
+                ));
+            };
+            self.expect(
+                TokenKind::RightParen,
+                "expected `)` after external library name",
+            )?;
+            Some(library)
+        } else {
+            None
+        };
+        self.expect(
+            TokenKind::LeftBrace,
+            "expected `{` after external ABI declaration",
+        )?;
+        let mut functions = Vec::new();
+        while !self.check(&TokenKind::RightBrace) && !self.check(&TokenKind::Eof) {
+            let function_start = self
+                .expect(TokenKind::Fn, "expected an external function declaration")?
+                .span;
+            let (name, name_span) = self.expect_identifier("expected external function name")?;
+            let generics = self.parse_generic_parameters()?;
+            let parameters = self.parse_parameters()?;
+            let return_type = if self.match_token(&TokenKind::Arrow) {
+                Some(self.parse_type_name()?)
+            } else {
+                None
+            };
+            let end = return_type
+                .as_ref()
+                .map_or_else(|| self.previous().span, |ty| ty.span);
+            if self.check(&TokenKind::LeftBrace) || self.check(&TokenKind::Equal) {
+                return Err(Diagnostic::new(
+                    DiagnosticKind::Parse,
+                    "an external function is a declaration and cannot have a DISP body",
+                    self.peek().span,
+                ));
+            }
+            self.match_token(&TokenKind::Semicolon);
+            self.match_token(&TokenKind::Comma);
+            functions.push(Function {
+                name,
+                name_span,
+                generics,
+                parameters,
+                return_type,
+                body: Block {
+                    statements: vec![],
+                    span: end,
+                },
+                external: Some(ExternalFunction {
+                    abi: ExternalAbi::C,
+                    library: library.clone(),
+                }),
+                span: function_start.through(end),
+            });
+        }
+        self.expect(
+            TokenKind::RightBrace,
+            "expected `}` after external declarations",
+        )?;
+        if functions.is_empty() {
+            return Err(Diagnostic::new(
+                DiagnosticKind::Parse,
+                "an external block must declare at least one function",
+                start.through(abi_span),
+            ));
+        }
+        Ok(functions)
     }
 
     fn parse_generic_parameters(&mut self) -> Result<Vec<GenericParameter>, Diagnostic> {

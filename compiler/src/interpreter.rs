@@ -253,6 +253,30 @@ impl RuntimeString {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct RuntimeCString(Arc<Vec<u8>>);
+
+impl RuntimeCString {
+    fn new(bytes: &[u8]) -> Result<Self, &'static str> {
+        if bytes.contains(&0) {
+            return Err("CString source contains an interior NUL byte");
+        }
+        let mut terminated = Vec::with_capacity(bytes.len() + 1);
+        terminated.extend_from_slice(bytes);
+        terminated.push(0);
+        Ok(Self(Arc::new(terminated)))
+    }
+
+    fn len(&self) -> usize {
+        self.0.len().saturating_sub(1)
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8(self.0[..self.len()].to_vec())
+            .expect("CString is created only from valid DISP UTF-8")
+    }
+}
+
 fn grow_list_capacity(capacity: &mut usize, needed: usize) -> Result<(), &'static str> {
     if needed <= *capacity {
         return Ok(());
@@ -314,6 +338,8 @@ enum Value {
     Float32(f32),
     Reference(Place, bool),
     String(RuntimeString),
+    CString(RuntimeCString),
+    CStr(RuntimeCString),
     Path(PathBuf),
     Instant(StdInstant),
     Duration(StdDuration),
@@ -457,6 +483,9 @@ impl Interpreter {
         arguments: Vec<Value>,
         call_span: Span,
     ) -> RuntimeResult<Value> {
+        if function.external.is_some() {
+            return self.call_external(function, arguments, call_span);
+        }
         // Keep the semantic oracle below the smallest supported test-thread stack.
         // Native DISP programs use the platform stack and are not capped here.
         const MAX_CALL_DEPTH: usize = 32;
@@ -509,6 +538,56 @@ impl Interpreter {
             Ok(Flow::Break | Flow::Continue) => {
                 Err(self.error("loop control escaped a function body", function.body.span))
             }
+        }
+    }
+
+    fn call_external(
+        &mut self,
+        function: &Function,
+        arguments: Vec<Value>,
+        call_span: Span,
+    ) -> RuntimeResult<Value> {
+        if function.parameters.len() != arguments.len() {
+            return Err(self.error(
+                format!(
+                    "external function `{}` expects {} arguments, found {}",
+                    function.name,
+                    function.parameters.len(),
+                    arguments.len()
+                ),
+                call_span,
+            ));
+        }
+        match function.name.as_str() {
+            "abs" => {
+                let value = match arguments.into_iter().next().unwrap() {
+                    Value::Signed(value, 32) => i32::try_from(value).ok(),
+                    Value::Int(value) => i32::try_from(value).ok(),
+                    _ => None,
+                }
+                .ok_or_else(|| self.error("C abs expects CInt", call_span))?;
+                let value = value
+                    .checked_abs()
+                    .ok_or_else(|| self.error("C abs overflow", call_span))?;
+                Ok(Value::Signed(value.into(), 32))
+            }
+            "strlen" => {
+                let value = match arguments.into_iter().next().unwrap() {
+                    Value::CStr(value) | Value::CString(value) => value,
+                    _ => return Err(self.error("C strlen expects CStr", call_span)),
+                };
+                Ok(Value::UInt(value.len() as u64))
+            }
+            "sqrt" => {
+                let value = arguments.into_iter().next().unwrap();
+                let value = numeric_as_f64(&value)
+                    .ok_or_else(|| self.error("C sqrt expects CDouble", call_span))?;
+                Ok(Value::Float(value.sqrt()))
+            }
+            name => Err(self.error(
+                format!("external C function `{name}` requires native execution"),
+                call_span,
+            )),
         }
     }
 
@@ -1067,6 +1146,29 @@ impl Interpreter {
                         }
                         _ => Err(self.error("unknown String constructor", expression.span)),
                     };
+                }
+                if let Expression::FieldAccess { object, field, .. } = &callee.node
+                    && matches!(&object.node, Expression::Identifier(name) if name == "CString")
+                    && field == "new"
+                {
+                    let source = self.evaluate(program, &arguments[0])?;
+                    let bytes = match source {
+                        Value::String(value) => value.text.into_bytes(),
+                        Value::CStr(value) | Value::CString(value) => value.text().into_bytes(),
+                        _ => unreachable!("type checking validates CString source"),
+                    };
+                    return Ok(match RuntimeCString::new(&bytes) {
+                        Ok(value) => Value::Enum {
+                            type_name: "Result".into(),
+                            variant: "Ok".into(),
+                            payload: vec![Value::CString(value)],
+                        },
+                        Err(message) => Value::Enum {
+                            type_name: "Result".into(),
+                            variant: "Err".into(),
+                            payload: vec![Value::String(RuntimeString::literal(message.into()))],
+                        },
+                    });
                 }
                 if let Expression::FieldAccess { object, field, .. } = &callee.node
                     && matches!(&object.node, Expression::Identifier(name) if name == "List")
@@ -1958,6 +2060,27 @@ impl Interpreter {
                         return Ok(Value::Slice(values));
                     }
                     if arguments.is_empty()
+                        && matches!(
+                            field.as_str(),
+                            "len" | "is_empty" | "to_string" | "as_c_str"
+                        )
+                        && let value @ (Value::CString(_) | Value::CStr(_)) =
+                            self.evaluate(program, object)?
+                    {
+                        let (value, owned) = match value {
+                            Value::CString(value) => (value, true),
+                            Value::CStr(value) => (value, false),
+                            _ => unreachable!(),
+                        };
+                        return Ok(match field.as_str() {
+                            "len" => Value::UInt(value.len() as u64),
+                            "is_empty" => Value::Bool(value.len() == 0),
+                            "to_string" => Value::String(RuntimeString::literal(value.text())),
+                            "as_c_str" if owned => Value::CStr(value),
+                            _ => unreachable!("type checking validates CString methods"),
+                        });
+                    }
+                    if arguments.is_empty()
                         && matches!(field.as_str(), "len" | "capacity" | "is_empty")
                         && let Value::String(value) = self.evaluate(program, object)?
                     {
@@ -2800,6 +2923,8 @@ fn value_type_name(value: &Value) -> &str {
         Value::Reference(_, false) => "&",
         Value::Reference(_, true) => "&mut",
         Value::String(_) => "String",
+        Value::CString(_) => "CString",
+        Value::CStr(_) => "CStr",
         Value::Path(_) => "Path",
         Value::Instant(_) => "Instant",
         Value::Duration(_) => "Duration",
@@ -2834,6 +2959,7 @@ fn value_is_copy(program: &Program, value: &Value) -> bool {
         | Value::Char(_)
         | Value::Bool(_)
         | Value::Reference(_, _)
+        | Value::CStr(_)
         | Value::Function(_)
         | Value::Constructor { .. }
         | Value::Unit => true,
@@ -2862,24 +2988,25 @@ fn value_is_copy(program: &Program, value: &Value) -> bool {
         | Value::AtomicInt(_)
         | Value::Path(_)
         | Value::String(_)
+        | Value::CString(_)
         | Value::Uninitialized => false,
     }
 }
 
 fn coerce_value(value: Value, ty: &crate::ast::TypeName) -> Result<Value, String> {
     let signed_width = match ty.name.as_str() {
-        "i8" => Some(8),
-        "i16" => Some(16),
-        "i32" => Some(32),
-        "i64" => Some(64),
+        "i8" | "CChar" => Some(8),
+        "i16" | "CShort" => Some(16),
+        "i32" | "CInt" => Some(32),
+        "i64" | "CLongLong" => Some(64),
         "i128" => Some(128),
         _ => None,
     };
     let unsigned_width = match ty.name.as_str() {
-        "u8" => Some(8),
-        "u16" => Some(16),
-        "u32" => Some(32),
-        "u64" => Some(64),
+        "u8" | "CUChar" => Some(8),
+        "u16" | "CUShort" => Some(16),
+        "u32" | "CUInt" => Some(32),
+        "u64" | "CULongLong" => Some(64),
         "u128" => Some(128),
         _ => None,
     };
@@ -2933,10 +3060,10 @@ fn coerce_value(value: Value, ty: &crate::ast::TypeName) -> Result<Value, String
     match (ty.name.as_str(), value) {
         ("uint", Value::Int(value)) if value >= 0 => Ok(Value::UInt(value as u64)),
         ("int", Value::UInt(value)) if value <= i64::MAX as u64 => Ok(Value::Int(value as i64)),
-        ("f32", value) => numeric_as_f64(&value)
+        ("f32" | "CFloat", value) => numeric_as_f64(&value)
             .map(|number| Value::Float32(number as f32))
             .ok_or_else(|| "value is not numeric".into()),
-        ("f64", value) => numeric_as_f64(&value)
+        ("f64" | "CDouble", value) => numeric_as_f64(&value)
             .map(Value::Float)
             .ok_or_else(|| "value is not numeric".into()),
         (_, value) => Ok(value),
@@ -3207,6 +3334,7 @@ fn display_value(value: Value) -> String {
         Value::Reference(_, false) => "<shared reference>".into(),
         Value::Reference(_, true) => "<mutable reference>".into(),
         Value::String(value) => value.text,
+        Value::CString(value) | Value::CStr(value) => value.text(),
         Value::Path(value) => value.to_string_lossy().into_owned(),
         Value::Instant(_) => "<Instant>".into(),
         Value::Duration(value) => format!("{}ns", value.as_nanos()),

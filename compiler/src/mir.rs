@@ -27,6 +27,7 @@ pub struct Function {
     pub blocks: Vec<BasicBlock>,
     pub span: Span,
     pub generic_parameters: Vec<String>,
+    pub external: Option<hir::ExternalFunction>,
 }
 
 #[derive(Debug, Clone)]
@@ -273,6 +274,7 @@ impl<'a> Builder<'a> {
             blocks: self.blocks,
             span: self.function.span,
             generic_parameters: self.function.generic_parameters.clone(),
+            external: self.function.external.clone(),
         })
     }
 
@@ -878,7 +880,11 @@ impl<'a> Builder<'a> {
     ) -> Result<Operand, Diagnostic> {
         let mut arguments = Vec::new();
         for (index, argument) in call.arguments.iter().enumerate() {
-            let borrow = if index == 0 {
+            let borrow = if index == 0
+                && matches!(&call.target, hir::CallTarget::Intrinsic(name) if name == "CString.new")
+            {
+                Some(hir::ReceiverMode::Shared)
+            } else if index == 0 {
                 call.receiver
             } else if (index == 1
                 && matches!(&call.target, hir::CallTarget::Intrinsic(name) if matches!(name.as_str(), "String.push_str" | "String.contains" | "String.starts_with" | "String.ends_with" | "Map.has" | "Map.get" | "Map.get_mut" | "Map.remove" | "Set.has" | "Set.remove")))
@@ -1073,9 +1079,10 @@ impl<'a> Builder<'a> {
             self.bind_pattern(&arm.pattern, value_local, arm.span);
             let result = self.lower_expr(&arm.value)?;
             self.push(
-                StatementKind::Assign(self.place(destination), Rvalue::Use(result)),
+                StatementKind::Assign(self.place(destination), Rvalue::Use(result.clone())),
                 arm.span,
             );
+            self.consume_operand(&result, arm.span);
             self.emit_drops_to(arm_depth, arm.span);
             self.live.truncate(arm_depth);
             if self.open(self.current) {
@@ -1164,52 +1171,114 @@ impl<'a> Builder<'a> {
     }
 
     fn bind_pattern(&mut self, pattern: &hir::Pattern, source: LocalId, span: Span) {
+        let place = self.place(source);
+        let ty = self.locals[source.0].ty.clone();
+        if self.bind_pattern_place(pattern, &place, &ty, span) {
+            self.set_initialized(source, false, span);
+        }
+    }
+
+    fn bind_pattern_place(
+        &mut self,
+        pattern: &hir::Pattern,
+        source: &Place,
+        source_ty: &hir::Type,
+        span: Span,
+    ) -> bool {
         match pattern {
             hir::Pattern::Binding(local) => {
                 let target = self.source_locals[local];
+                let copied = self.locals[target.0].ty.is_copy(self.program);
                 self.push(StatementKind::StorageLive(target), span);
                 self.live.push(target);
                 self.ensure_drop_flag(target);
                 self.push(
                     StatementKind::Assign(
                         self.place(target),
-                        Rvalue::Use(Operand::Move(self.place(source))),
+                        Rvalue::Use(if copied {
+                            Operand::Copy(source.clone())
+                        } else {
+                            Operand::Move(source.clone())
+                        }),
                     ),
                     span,
                 );
                 self.set_initialized(target, true, span);
+                !copied
             }
             hir::Pattern::Variant {
                 variant_id,
                 arguments,
                 ..
             } => {
+                let payload_types = self.variant_payload_types(source_ty, *variant_id);
+                let mut moved = HashSet::new();
                 for (index, argument) in arguments.iter().enumerate() {
-                    if let hir::Pattern::Binding(local) = argument {
-                        let target = self.source_locals[local];
-                        let mut payload = self.place(source);
+                    let mut payload = source.clone();
+                    payload
+                        .projections
+                        .push(Projection::VariantField(*variant_id, index));
+                    if self.bind_pattern_place(argument, &payload, &payload_types[index], span) {
+                        moved.insert(index);
+                    }
+                }
+                if !moved.is_empty() {
+                    for (index, payload_ty) in payload_types.iter().enumerate() {
+                        if moved.contains(&index) || payload_ty.is_copy(self.program) {
+                            continue;
+                        }
+                        let mut payload = source.clone();
                         payload
                             .projections
                             .push(Projection::VariantField(*variant_id, index));
-                        self.push(StatementKind::StorageLive(target), span);
-                        self.live.push(target);
-                        self.ensure_drop_flag(target);
                         self.push(
-                            StatementKind::Assign(
-                                self.place(target),
-                                Rvalue::Use(if self.locals[target.0].ty.is_copy(self.program) {
-                                    Operand::Copy(payload)
-                                } else {
-                                    Operand::Move(payload)
-                                }),
-                            ),
+                            StatementKind::Drop {
+                                place: payload,
+                                flag: None,
+                            },
                             span,
                         );
-                        self.set_initialized(target, true, span);
                     }
                 }
+                !moved.is_empty()
             }
-            _ => {}
+            _ => false,
+        }
+    }
+
+    fn variant_payload_types(&self, source: &hir::Type, variant: hir::VariantId) -> Vec<hir::Type> {
+        match source {
+            hir::Type::Option(inner) if variant == hir::builtin_variant("Some") => {
+                vec![(**inner).clone()]
+            }
+            hir::Type::Result(ok, _) if variant == hir::builtin_variant("Ok") => {
+                vec![(**ok).clone()]
+            }
+            hir::Type::Result(_, error) if variant == hir::builtin_variant("Err") => {
+                vec![(**error).clone()]
+            }
+            hir::Type::Enum(id, arguments) => {
+                let declaration = &self.program.enums[id.0];
+                let substitutions = declaration
+                    .generic_parameters
+                    .iter()
+                    .cloned()
+                    .zip(arguments.iter().cloned())
+                    .collect::<HashMap<_, _>>();
+                declaration
+                    .variants
+                    .iter()
+                    .find(|candidate| candidate.id == variant)
+                    .map(|candidate| {
+                        candidate
+                            .payload
+                            .iter()
+                            .map(|payload| hir::substitute_type(payload, &substitutions))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
+            _ => vec![],
         }
     }
     fn temp(&mut self, ty: hir::Type, span: Span) -> LocalId {
@@ -1649,22 +1718,43 @@ fn check_place(
             (Projection::SafeDereference, hir::Type::Reference { inner, .. })
             | (Projection::SafeDereference, hir::Type::MutexGuard(inner))
             | (Projection::RawDereference, hir::Type::RawPointer { inner, .. }) => *inner,
-            (Projection::Field(index), hir::Type::Struct(id, _)) => program
-                .structs
-                .get(id.0)
-                .and_then(|declaration| declaration.fields.get(*index))
-                .map(|field| field.ty.clone())
-                .ok_or_else(|| {
+            (Projection::Field(index), hir::Type::Struct(id, arguments)) => {
+                let declaration = program.structs.get(id.0).ok_or_else(|| {
                     Diagnostic::new(
                         DiagnosticKind::Internal,
-                        "MIR field projection is out of range",
+                        "MIR struct projection uses an invalid type identity",
                         span,
                     )
-                })?,
+                })?;
+                let substitutions = declaration
+                    .generic_parameters
+                    .iter()
+                    .cloned()
+                    .zip(arguments)
+                    .collect::<HashMap<_, _>>();
+                declaration
+                    .fields
+                    .get(*index)
+                    .map(|field| hir::substitute_type(&field.ty, &substitutions))
+                    .ok_or_else(|| {
+                        Diagnostic::new(
+                            DiagnosticKind::Internal,
+                            "MIR field projection is out of range",
+                            span,
+                        )
+                    })?
+            }
             (
-                Projection::VariantField(_, _),
-                hir::Type::Enum(_, _) | hir::Type::Option(_) | hir::Type::Result(_, _),
-            ) => hir::Type::Unknown,
+                Projection::VariantField(variant, index),
+                aggregate
+                @ (hir::Type::Enum(_, _) | hir::Type::Option(_) | hir::Type::Result(_, _)),
+            ) => variant_field_ty(program, &aggregate, *variant, *index).ok_or_else(|| {
+                Diagnostic::new(
+                    DiagnosticKind::Internal,
+                    "MIR variant payload projection is invalid",
+                    span,
+                )
+            })?,
             (
                 Projection::Index { index, .. },
                 hir::Type::Array(element, _)
@@ -1723,6 +1813,42 @@ fn check_place(
         };
     }
     Ok(ty)
+}
+
+fn variant_field_ty(
+    program: &Program,
+    aggregate: &hir::Type,
+    variant: hir::VariantId,
+    index: usize,
+) -> Option<hir::Type> {
+    match aggregate {
+        hir::Type::Option(inner) if variant == hir::builtin_variant("Some") && index == 0 => {
+            Some((**inner).clone())
+        }
+        hir::Type::Result(ok, _) if variant == hir::builtin_variant("Ok") && index == 0 => {
+            Some((**ok).clone())
+        }
+        hir::Type::Result(_, error) if variant == hir::builtin_variant("Err") && index == 0 => {
+            Some((**error).clone())
+        }
+        hir::Type::Enum(id, arguments) => {
+            let declaration = program.enums.get(id.0)?;
+            let substitutions = declaration
+                .generic_parameters
+                .iter()
+                .cloned()
+                .zip(arguments.iter().cloned())
+                .collect::<HashMap<_, _>>();
+            declaration
+                .variants
+                .iter()
+                .find(|candidate| candidate.id == variant)?
+                .payload
+                .get(index)
+                .map(|payload| hir::substitute_type(payload, &substitutions))
+        }
+        _ => None,
+    }
 }
 fn validate_operand(
     program: &Program,

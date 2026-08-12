@@ -458,7 +458,11 @@ fn error(message: &str) -> Diagnostic {
 }
 
 pub fn mangle(program: &mir::Program, instance: &FunctionInstance) -> String {
-    let name = &program.functions[instance.function.0].name;
+    let function = &program.functions[instance.function.0];
+    if function.external.is_some() {
+        return function.name.clone();
+    }
+    let name = &function.name;
     let mut symbol = format!("disp_f{}_{}", instance.function.0, sanitize(name));
     for ty in &instance.substitutions {
         symbol.push('_');
@@ -483,6 +487,8 @@ pub fn type_code(ty: &hir::Type) -> String {
         hir::Type::Bool => "b".into(),
         hir::Type::Char => "c".into(),
         hir::Type::String => "s".into(),
+        hir::Type::CString => "cs".into(),
+        hir::Type::CStr => "cz".into(),
         hir::Type::Path => "p".into(),
         hir::Type::Instant => "ti".into(),
         hir::Type::Duration => "td".into(),

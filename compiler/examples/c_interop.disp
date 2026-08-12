@@ -1,0 +1,33 @@
+extern C {
+    fn abs(value: CInt) -> CInt
+    fn strlen(value: CStr) -> CSize
+}
+
+extern C("m") {
+    fn sqrt(value: CDouble) -> CDouble
+}
+
+fn identity(value: CStr) -> CStr {
+    return value
+}
+
+fn inspect(text: &str) -> Result<CSize, String> {
+    owned = CString.new(*text)?
+    view = owned.as_c_str()
+    unsafe {
+        return Ok(strlen(identity(view)))
+    }
+}
+
+fn main() {
+    text = "Hello from C"
+    print(text)
+    match inspect(&text) {
+        Ok(length) => print(length),
+        Err(message) => print(message),
+    }
+    unsafe {
+        print(abs(-7))
+        print(sqrt(81.0))
+    }
+}

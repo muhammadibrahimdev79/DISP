@@ -56,7 +56,19 @@ pub struct Function {
     pub parameters: Vec<Parameter>,
     pub return_type: Option<TypeName>,
     pub body: Block,
+    pub external: Option<ExternalFunction>,
     pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalFunction {
+    pub abi: ExternalAbi,
+    pub library: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalAbi {
+    C,
 }
 
 #[derive(Debug, Clone, PartialEq)]
