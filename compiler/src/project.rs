@@ -3,6 +3,7 @@ use crate::{
     ast::{self, Block, Expr, Expression, GenericParameter, Pattern, Program, Statement, TypeName},
     diagnostics::{Diagnostic, DiagnosticKind, SourceFile, SourceMap, Span},
     lexer::Lexer,
+    package::{self, PackageGraph},
     parser::Parser,
 };
 use std::{
@@ -22,6 +23,13 @@ pub struct PackageManifest {
     pub version: String,
     pub edition: String,
     pub entry: PathBuf,
+    pub dependencies: BTreeMap<String, DependencySpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencySpec {
+    pub path: PathBuf,
+    pub line: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -33,7 +41,27 @@ pub struct Project {
 }
 
 pub fn load(input: &Path) -> Result<Project, Diagnostic> {
-    let (entry, package) = resolve_input(input)?;
+    let input_metadata = fs::metadata(input).map_err(|cause| {
+        Diagnostic::new(
+            DiagnosticKind::Resolve,
+            format!("could not inspect `{}`: {cause}", input.display()),
+            Span::point(1, 1),
+        )
+        .with_file(input.display().to_string())
+    })?;
+    let graph = input_metadata
+        .is_dir()
+        .then(|| package::verify(input))
+        .transpose()?;
+    let (entry, package) = if let Some(graph) = &graph {
+        let root = graph.root();
+        (
+            root.root.join(&root.manifest.entry),
+            Some(root.manifest.clone()),
+        )
+    } else {
+        resolve_input(input)?
+    };
     let entry = fs::canonicalize(&entry).map_err(|cause| {
         Diagnostic::new(
             DiagnosticKind::Resolve,
@@ -49,7 +77,11 @@ pub fn load(input: &Path) -> Result<Project, Diagnostic> {
         .parent()
         .ok_or_else(|| project_error("project entry has no parent directory", Span::point(1, 1)))?
         .to_path_buf();
-    let mut loader = Loader::new(root, entry.clone());
+    let mut loader = if let Some(graph) = graph {
+        Loader::for_packages(graph, entry.clone())
+    } else {
+        Loader::new(root, entry.clone())
+    };
     match loader.load_all() {
         Ok(program) => Ok(Project {
             program,
@@ -147,12 +179,19 @@ pub fn create(path: &Path) -> Result<(), Diagnostic> {
     let manifest = format!(
         "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"1\"\nentry = \"src/main.disp\"\n"
     );
-    let write_result = fs::write(path.join("DISP.toml"), manifest).and_then(|_| {
-        fs::write(
-            source_directory.join("main.disp"),
-            "fn main() {\n    print(\"Hello from DISP\")\n}\n",
-        )
-    });
+    let write_result = fs::write(path.join("DISP.toml"), manifest)
+        .and_then(|_| {
+            fs::write(
+                source_directory.join("main.disp"),
+                "fn main() {\n    print(\"Hello from DISP\")\n}\n",
+            )
+        })
+        .and_then(|_| {
+            fs::write(
+                path.join(".gitattributes"),
+                "*.disp text eol=lf\nDISP.toml text eol=lf\nDISP.lock text eol=lf\n",
+            )
+        });
     if let Err(cause) = write_result {
         let _ = fs::remove_dir_all(path);
         return Err(project_error(
@@ -163,7 +202,7 @@ pub fn create(path: &Path) -> Result<(), Diagnostic> {
     Ok(())
 }
 
-fn parse_manifest(path: &Path) -> Result<PackageManifest, Diagnostic> {
+pub(crate) fn parse_manifest(path: &Path) -> Result<PackageManifest, Diagnostic> {
     let metadata = fs::metadata(path).map_err(|cause| {
         manifest_error(
             path,
@@ -183,7 +222,9 @@ fn parse_manifest(path: &Path) -> Result<PackageManifest, Diagnostic> {
     })?;
     let mut section = None::<String>;
     let mut saw_package_section = false;
+    let mut saw_dependencies_section = false;
     let mut values = BTreeMap::<String, (String, usize)>::new();
+    let mut dependencies = BTreeMap::<String, DependencySpec>::new();
     for (index, raw) in source.lines().enumerate() {
         let line_number = index + 1;
         let line = raw.trim();
@@ -202,25 +243,33 @@ fn parse_manifest(path: &Path) -> Result<PackageManifest, Diagnostic> {
                 ));
             }
             let name = line[1..line.len() - 1].trim();
-            if name != "package" {
+            if !matches!(name, "package" | "dependencies") {
                 return Err(manifest_error(
                     path,
                     line_number,
                     format!("unsupported manifest section `[{name}]`"),
                 ));
             }
-            if saw_package_section {
+            if name == "package" && saw_package_section {
                 return Err(manifest_error(
                     path,
                     line_number,
                     "duplicate `[package]` section",
                 ));
             }
-            saw_package_section = true;
+            if name == "dependencies" && saw_dependencies_section {
+                return Err(manifest_error(
+                    path,
+                    line_number,
+                    "duplicate `[dependencies]` section",
+                ));
+            }
+            saw_package_section |= name == "package";
+            saw_dependencies_section |= name == "dependencies";
             section = Some(name.to_owned());
             continue;
         }
-        if section.as_deref() != Some("package") {
+        if section.is_none() {
             return Err(manifest_error(
                 path,
                 line_number,
@@ -235,6 +284,39 @@ fn parse_manifest(path: &Path) -> Result<PackageManifest, Diagnostic> {
             ));
         };
         let key = key.trim();
+        if section.as_deref() == Some("dependencies") {
+            validate_dependency_alias(key, Span::point(line_number, 1))
+                .map_err(|error| error.with_file(path.display().to_string()))?;
+            if dependencies.contains_key(key) {
+                return Err(manifest_error(
+                    path,
+                    line_number,
+                    format!("duplicate dependency `{key}`"),
+                ));
+            }
+            let dependency_path = parse_path_dependency(raw_value.trim()).ok_or_else(|| {
+                manifest_error(
+                    path,
+                    line_number,
+                    "a local dependency must use `{ path = \"relative/path\" }`",
+                )
+            })?;
+            dependencies.insert(
+                key.to_owned(),
+                DependencySpec {
+                    path: dependency_path,
+                    line: line_number,
+                },
+            );
+            continue;
+        }
+        if section.as_deref() != Some("package") {
+            return Err(manifest_error(
+                path,
+                line_number,
+                "manifest values must appear under `[package]` or `[dependencies]`",
+            ));
+        }
         if !matches!(key, "name" | "version" | "edition" | "entry") {
             return Err(manifest_error(
                 path,
@@ -299,7 +381,30 @@ fn parse_manifest(path: &Path) -> Result<PackageManifest, Diagnostic> {
         version,
         edition,
         entry: entry_path,
+        dependencies,
     })
+}
+
+fn parse_path_dependency(value: &str) -> Option<PathBuf> {
+    let inner = value.strip_prefix('{')?.strip_suffix('}')?.trim();
+    let (key, value) = inner.split_once('=')?;
+    if key.trim() != "path" {
+        return None;
+    }
+    let value = parse_manifest_string(value.trim())?;
+    let path = PathBuf::from(value);
+    if path.is_absolute()
+        || path.as_os_str().is_empty()
+        || path.components().any(|part| {
+            matches!(
+                part,
+                std::path::Component::Prefix(_) | std::path::Component::RootDir
+            )
+        })
+    {
+        return None;
+    }
+    Some(path)
 }
 
 fn parse_manifest_string(value: &str) -> Option<String> {
@@ -346,6 +451,25 @@ fn validate_package_name(name: &str, span: Span) -> Result<(), Diagnostic> {
     Ok(())
 }
 
+fn validate_dependency_alias(name: &str, span: Span) -> Result<(), Diagnostic> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase())
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(project_error(
+            "dependency aliases must be valid lowercase DISP identifiers",
+            span,
+        ));
+    }
+    Ok(())
+}
+
 fn validate_version(version: &str) -> Result<(), &'static str> {
     let parts = version.split('.').collect::<Vec<_>>();
     if parts.len() != 3
@@ -369,6 +493,7 @@ fn manifest_error(path: &Path, line: usize, message: impl Into<String>) -> Diagn
 #[derive(Debug, Clone)]
 struct Unit {
     path: Vec<String>,
+    import_targets: Vec<String>,
     program: Program,
     root: bool,
 }
@@ -382,6 +507,7 @@ enum Visit {
 struct Loader {
     root: PathBuf,
     entry: PathBuf,
+    graph: Option<PackageGraph>,
     units: BTreeMap<String, Unit>,
     visits: HashMap<String, Visit>,
     stack: Vec<String>,
@@ -397,6 +523,24 @@ impl Loader {
         Self {
             root,
             entry,
+            graph: None,
+            units: BTreeMap::new(),
+            visits: HashMap::new(),
+            stack: Vec::new(),
+            order: Vec::new(),
+            files: HashMap::new(),
+            next_line: 1,
+            total_bytes: 0,
+            sources: SourceMap::default(),
+        }
+    }
+
+    fn for_packages(graph: PackageGraph, entry: PathBuf) -> Self {
+        let root = graph.root().source_root.clone();
+        Self {
+            root,
+            entry,
+            graph: Some(graph),
             units: BTreeMap::new(),
             visits: HashMap::new(),
             stack: Vec::new(),
@@ -409,7 +553,14 @@ impl Loader {
     }
 
     fn load_all(&mut self) -> Result<Program, Diagnostic> {
-        self.load_unit(vec![], self.entry.clone(), Span::point(1, 1), true)?;
+        let package_id = self.graph.as_ref().map(|graph| graph.root_id.clone());
+        self.load_unit(
+            package_id,
+            vec![],
+            self.entry.clone(),
+            Span::point(1, 1),
+            true,
+        )?;
         let mut program = link(std::mem::take(&mut self.units), &self.order)?;
         program.source_files = self.sources.files.clone();
         Ok(program)
@@ -417,11 +568,13 @@ impl Loader {
 
     fn load_unit(
         &mut self,
-        path: Vec<String>,
+        package_id: Option<String>,
+        local_path: Vec<String>,
         file: PathBuf,
         import_span: Span,
         root: bool,
     ) -> Result<(), Diagnostic> {
+        let path = self.identity_path(package_id.as_deref(), &local_path, root);
         let key = module_key(&path);
         match self.visits.get(&key) {
             Some(Visit::Complete) => return Ok(()),
@@ -454,17 +607,21 @@ impl Loader {
             ));
         }
 
+        let source_root = self.source_root(package_id.as_deref()).to_path_buf();
         let canonical = fs::canonicalize(&file).map_err(|cause| {
             project_error(
-                format!("could not load module `{}`: {cause}", display_module(&path)),
+                format!(
+                    "could not load module `{}`: {cause}",
+                    display_module(&local_path)
+                ),
                 import_span,
             )
         })?;
-        if !canonical.starts_with(&self.root) {
+        if !canonical.starts_with(&source_root) {
             return Err(project_error(
                 format!(
                     "module `{}` resolves outside the project source root",
-                    display_module(&path)
+                    display_module(&local_path)
                 ),
                 import_span,
             ));
@@ -518,16 +675,13 @@ impl Loader {
         let end_line = start_line + line_count;
         self.next_line = end_line + 2;
         self.sources.files.push(SourceFile {
-            path: canonical
-                .strip_prefix(&self.root)
-                .unwrap_or(&canonical)
-                .to_path_buf(),
+            path: self.diagnostic_path(package_id.as_deref(), &canonical),
             start_line,
             end_line,
         });
         let tokens = Lexer::with_start_line(&source, start_line).tokenize()?;
         let program = Parser::new(tokens).parse()?;
-        let expected = if root {
+        let expected = if local_path.is_empty() {
             vec![
                 canonical
                     .file_stem()
@@ -536,7 +690,7 @@ impl Loader {
                     .to_owned(),
             ]
         } else {
-            path.clone()
+            local_path.clone()
         };
         if let Some(declared) = &program.module {
             let actual = declared
@@ -560,31 +714,147 @@ impl Loader {
         self.visits.insert(key.clone(), Visit::Visiting);
         self.stack.push(key.clone());
         let imports = program.imports.clone();
+        let targets = imports
+            .iter()
+            .map(|import| {
+                let import_path = import
+                    .path
+                    .iter()
+                    .map(|part| part.node.clone())
+                    .collect::<Vec<_>>();
+                self.resolve_import(package_id.as_deref(), &import_path, import.span)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let import_targets = targets
+            .iter()
+            .map(|(target_package, target_path, _, target_root)| {
+                module_key(&self.identity_path(
+                    target_package.as_deref(),
+                    target_path,
+                    *target_root,
+                ))
+            })
+            .collect::<Vec<_>>();
         self.units.insert(
             key.clone(),
             Unit {
                 path,
+                import_targets,
                 program,
                 root,
             },
         );
-        for import in imports {
-            let module_path = import
-                .path
-                .iter()
-                .map(|part| part.node.clone())
-                .collect::<Vec<_>>();
-            let mut module_file = self.root.clone();
-            for part in &module_path {
-                module_file.push(part);
-            }
-            module_file.set_extension("disp");
-            self.load_unit(module_path, module_file, import.span, false)?;
+        for (import, (target_package, target_path, module_file, target_root)) in
+            imports.into_iter().zip(targets)
+        {
+            self.load_unit(
+                target_package,
+                target_path,
+                module_file,
+                import.span,
+                target_root,
+            )?;
         }
         self.stack.pop();
         self.visits.insert(key.clone(), Visit::Complete);
         self.order.push(key);
         Ok(())
+    }
+
+    fn identity_path(
+        &self,
+        package_id: Option<&str>,
+        local_path: &[String],
+        root: bool,
+    ) -> Vec<String> {
+        let Some(graph) = &self.graph else {
+            return local_path.to_vec();
+        };
+        if root || package_id == Some(graph.root_id.as_str()) {
+            return local_path.to_vec();
+        }
+        let mut identity = vec![format!(
+            "package:{package_id}",
+            package_id = package_id.unwrap()
+        )];
+        identity.extend_from_slice(local_path);
+        identity
+    }
+
+    fn source_root(&self, package_id: Option<&str>) -> &Path {
+        match (&self.graph, package_id) {
+            (Some(graph), Some(id)) => &graph.package(id).source_root,
+            _ => &self.root,
+        }
+    }
+
+    fn diagnostic_path(&self, package_id: Option<&str>, canonical: &Path) -> PathBuf {
+        let source_root = self.source_root(package_id);
+        let relative = canonical.strip_prefix(source_root).unwrap_or(canonical);
+        let Some(graph) = &self.graph else {
+            return relative.to_path_buf();
+        };
+        if package_id == Some(graph.root_id.as_str()) {
+            return relative.to_path_buf();
+        }
+        let package = graph.package(package_id.unwrap());
+        PathBuf::from("dependencies")
+            .join(&package.id)
+            .join(relative)
+    }
+
+    fn resolve_import(
+        &self,
+        package_id: Option<&str>,
+        import_path: &[String],
+        span: Span,
+    ) -> Result<(Option<String>, Vec<String>, PathBuf, bool), Diagnostic> {
+        let Some(graph) = &self.graph else {
+            let mut file = self.root.clone();
+            for part in import_path {
+                file.push(part);
+            }
+            file.set_extension("disp");
+            return Ok((None, import_path.to_vec(), file, false));
+        };
+        let package_id = package_id.unwrap_or(&graph.root_id);
+        let package = graph.package(package_id);
+        let dependency = import_path
+            .first()
+            .and_then(|alias| package.dependencies.get(alias));
+        let (target_id, local_path) = if let Some(target) = dependency {
+            let mut local_candidate = package.source_root.clone();
+            for part in import_path {
+                local_candidate.push(part);
+            }
+            local_candidate.set_extension("disp");
+            if local_candidate.exists() {
+                return Err(project_error(
+                    format!(
+                        "import `{}` is ambiguous between dependency alias `{}` and a local module",
+                        import_path.join("."),
+                        import_path[0]
+                    ),
+                    span,
+                )
+                .with_help("rename the dependency alias or the local module"));
+            }
+            (target.clone(), import_path[1..].to_vec())
+        } else {
+            (package_id.to_owned(), import_path.to_vec())
+        };
+        let target = graph.package(&target_id);
+        let (file, target_root) = if local_path.is_empty() {
+            (target.root.join(&target.manifest.entry), false)
+        } else {
+            let mut file = target.source_root.clone();
+            for part in &local_path {
+                file.push(part);
+            }
+            file.set_extension("disp");
+            (file, false)
+        };
+        Ok((Some(target_id), local_path, file, target_root))
     }
 }
 
@@ -713,15 +983,14 @@ fn link(mut units: BTreeMap<String, Unit>, order: &[String]) -> Result<Program, 
                 }
             }
         }
-        for import in unit.program.imports.iter().filter(|import| import.public) {
-            let dependency = module_key(
-                &import
-                    .path
-                    .iter()
-                    .map(|part| part.node.clone())
-                    .collect::<Vec<_>>(),
-            );
-            import_surface(&mut surface, &exports[&dependency], import)?;
+        for (import, dependency) in unit
+            .program
+            .imports
+            .iter()
+            .zip(&unit.import_targets)
+            .filter(|(import, _)| import.public)
+        {
+            import_surface(&mut surface, &exports[dependency], import)?;
         }
         exports.insert(key.clone(), surface);
     }
@@ -729,15 +998,8 @@ fn link(mut units: BTreeMap<String, Unit>, order: &[String]) -> Result<Program, 
     for key in order {
         let unit = units.get_mut(key).unwrap();
         let mut namespace = own[key].clone();
-        for import in &unit.program.imports {
-            let dependency = module_key(
-                &import
-                    .path
-                    .iter()
-                    .map(|part| part.node.clone())
-                    .collect::<Vec<_>>(),
-            );
-            import_surface(&mut namespace, &exports[&dependency], import)?;
+        for (import, dependency) in unit.program.imports.iter().zip(&unit.import_targets) {
+            import_surface(&mut namespace, &exports[dependency], import)?;
         }
         validate_public_api(unit, &namespace, &exports[key])?;
         rename_unit(unit, &namespace, &variants);

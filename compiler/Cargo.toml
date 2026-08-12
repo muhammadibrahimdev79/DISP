@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 unicode-ident = "1.0"
 unicode-normalization = "0.1"
+sha2 = "0.10"

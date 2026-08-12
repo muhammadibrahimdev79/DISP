@@ -1,0 +1,8 @@
+[package]
+name = "dependency-example"
+version = "0.1.0"
+edition = "1"
+entry = "src/main.disp"
+
+[dependencies]
+math = { path = "../math" }

@@ -150,3 +150,70 @@ fn new_creates_a_runnable_directory_project() {
             .contains("refusing to overwrite")
     );
 }
+
+#[test]
+fn lock_command_is_explicit_deterministic_and_enables_dependency_builds() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("disp-lock-cli-{}-{unique}", std::process::id()));
+    let app = root.join("app");
+    let library = root.join("library");
+    fs::create_dir_all(app.join("src")).unwrap();
+    fs::create_dir_all(library.join("src")).unwrap();
+    fs::write(
+        app.join("DISP.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[dependencies]\nanswer = { path = \"../library\" }\n",
+    )
+    .unwrap();
+    fs::write(
+        app.join("src/main.disp"),
+        "use answer\nfn main() { print(value()) }",
+    )
+    .unwrap();
+    fs::write(
+        library.join("DISP.toml"),
+        "[package]\nname = \"answer\"\nversion = \"1.0.0\"\nentry = \"src/lib.disp\"\n",
+    )
+    .unwrap();
+    fs::write(library.join("src/lib.disp"), "pub fn value() -> int = 42").unwrap();
+
+    let Some(before) = disp(&["check", app.to_str().unwrap()]) else {
+        return;
+    };
+    assert!(!before.status.success());
+    assert!(
+        String::from_utf8(before.stderr)
+            .unwrap()
+            .contains("DISP.lock")
+    );
+
+    let Some(locked) = disp(&["lock", app.to_str().unwrap()]) else {
+        return;
+    };
+    assert!(locked.status.success());
+    let first = fs::read(app.join("DISP.lock")).unwrap();
+    let Some(locked_again) = disp(&["lock", app.to_str().unwrap()]) else {
+        return;
+    };
+    assert!(locked_again.status.success());
+    assert_eq!(fs::read(app.join("DISP.lock")).unwrap(), first);
+
+    let Some(tree) = disp(&["tree", app.to_str().unwrap()]) else {
+        return;
+    };
+    assert!(tree.status.success());
+    let tree = String::from_utf8(tree.stdout).unwrap();
+    assert!(tree.contains("app@0.1.0"));
+    assert!(tree.contains("answer -> answer@1.0.0"));
+
+    let Some(run) = disp(&["run", app.to_str().unwrap()]) else {
+        return;
+    };
+    if !run.status.success() && String::from_utf8_lossy(&run.stderr).contains("os error 4551") {
+        return;
+    }
+    assert!(run.status.success());
+    assert_eq!(String::from_utf8(run.stdout).unwrap().trim(), "42");
+}

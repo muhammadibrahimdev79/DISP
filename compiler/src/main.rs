@@ -29,6 +29,29 @@ fn execute(arguments: Vec<String>) -> Result<(), String> {
         println!("created DISP project `{path}`");
         return Ok(());
     }
+    if let [command, path] = arguments.as_slice()
+        && command == "lock"
+    {
+        let lock = disp::package::write_lock(Path::new(path))
+            .map_err(|diagnostic| diagnostic.render(path))?;
+        println!("{}", lock.display());
+        return Ok(());
+    }
+    if let [command, path] = arguments.as_slice()
+        && command == "tree"
+    {
+        let graph =
+            disp::package::verify(Path::new(path)).map_err(|diagnostic| diagnostic.render(path))?;
+        for line in graph.tree() {
+            let indent = "  ".repeat(line.depth);
+            if let Some(alias) = line.alias {
+                println!("{indent}{alias} -> {}", line.id);
+            } else {
+                println!("{indent}{}", line.id);
+            }
+        }
+        return Ok(());
+    }
     let (command, path) = match arguments.as_slice() {
         [path] => (Command::Run, path.as_str()),
         [command, path] if command == "check" => (Command::Check, path.as_str()),
@@ -44,7 +67,7 @@ fn execute(arguments: Vec<String>) -> Result<(), String> {
         [command, flag, path] if command == "check" && flag == "--dump-mir" => {
             (Command::DumpMir, path.as_str())
         }
-        _ => return Err("usage: disp new <directory> | disp <check|build|run|interpret> [--dump-hir|--dump-mir|--release|--emit-c|--emit-obj] <file.disp|project-directory>".into()),
+        _ => return Err("usage: disp <new|lock|tree> <directory> | disp <check|build|run|interpret> [--dump-hir|--dump-mir|--release|--emit-c|--emit-obj] <file.disp|project-directory>".into()),
     };
     let source_path = Path::new(path);
 

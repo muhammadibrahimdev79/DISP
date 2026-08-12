@@ -7,6 +7,7 @@ pub mod interpreter;
 pub mod lexer;
 pub mod mir;
 pub mod ownership;
+pub mod package;
 pub mod parser;
 pub mod project;
 pub mod resolver;

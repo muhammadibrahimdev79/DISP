@@ -13,7 +13,7 @@ The current compiler includes static typing, ownership and borrowing, native
 code generation, algebraic data types, generics and traits, strings, slices,
 lists, maps, sets, iteration, paths, filesystem operations, and time
 foundations, native concurrency, checked C interoperability, explicit system-memory
-control, and deterministic multi-file modules with local package manifests. The implementation
+control, deterministic multi-file modules, and content-locked local package dependencies. The implementation
 remains under active development and should not
 yet be treated as a stable production language.
 

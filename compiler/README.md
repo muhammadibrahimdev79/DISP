@@ -21,6 +21,7 @@ Implemented executable subset:
 - owned aligned `Memory`, bounds-checked byte operations, raw pointer views, and explicit unsafe pointer arithmetic/read/write
 - deterministic file modules with `pub`, selective imports, aliases, re-exports, cycle checks, and source-aware diagnostics
 - strict local `DISP.toml` packages, directory builds, and `disp new`
+- bounded transitive local dependencies, SHA-256 source integrity, deterministic `DISP.lock`, `disp lock`, and `disp tree`
 - CFG predecessor/successor, reachability, reverse-postorder, and back-edge analysis
 - checked integer arithmetic and an explicit `disp interpret` semantic oracle
 - deterministic monomorphization, target-aware layouts, ABI classification, and native MIR lowering
@@ -45,12 +46,16 @@ cargo run -- run examples/c_interop.disp
 cargo run -- run examples/system_memory.disp
 cargo run -- run examples/modules/main.disp
 cargo run -- run examples/package
+cargo run -- lock examples/dependencies/app
+cargo run -- run examples/dependencies/app
+cargo run -- tree examples/dependencies/app
 cargo run -- new hello
 ```
 
 A directory project contains a strict `DISP.toml` and an entry source under `src/`.
-Current manifests cover local package identity and entry selection. External dependency
-resolution, registries, and lockfiles are not implemented yet and are not silently
-accepted as manifest fields.
+Current manifests cover package identity, entry selection, and explicitly declared local
+path dependencies. Applications require an exact generated `DISP.lock` before dependency
+code is compiled. Registry, Git, remote, version-range, and feature dependency forms are
+not implemented and are rejected instead of silently receiving guessed semantics.
 
 Fuzz targets for the lexer and complete frontend live under `fuzz/` and can be run with `cargo fuzz run lexer` and `cargo fuzz run frontend` when `cargo-fuzz` and its required Rust toolchain are installed.

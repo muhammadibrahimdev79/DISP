@@ -92,8 +92,56 @@ Run `disp new hello` to create this layout. `disp check hello`, `disp build hell
 `disp run hello`, and `disp interpret hello` accept the directory directly. Package
 names are bounded lowercase ASCII identifiers, versions use numeric
 `MAJOR.MINOR.PATCH`, and entries must remain inside the project. Unknown manifest
-sections and fields are errors; dependency and registry syntax will only be documented
-when the corresponding verified resolver exists.
+sections and fields are errors; only the verified local dependency form below is
+accepted.
+
+### Local dependencies and reproducible locks
+
+A local package dependency has one explicit source and one import alias:
+
+```toml
+[dependencies]
+math = { path = "../math" }
+```
+
+Ordinary source imports that package through its alias. An import of only the alias opens
+the dependency entry module; remaining path components select modules inside that
+dependency:
+
+```disp
+use math
+use tools.statistics.{average}
+```
+
+Dependency aliases are valid lowercase DISP identifiers. If an alias would also name a
+local module, compilation rejects the ambiguity rather than selecting one implicitly.
+Dependencies may publicly re-export their own declared dependencies, but packages cannot
+reach an undeclared transitive dependency directly.
+
+Run `disp lock project` after reviewing a dependency or manifest change. The generated
+`DISP.lock` records, in deterministic order:
+
+```text
+exact name and version identity
+canonical relative source location
+dependency alias edges
+root manifest SHA-256
+dependency source-tree SHA-256
+```
+
+The source digest covers the dependency manifest and all `.disp` files, normalizes CRLF
+to LF for cross-platform checkout stability, and excludes build/VCS caches. Lock updates
+use a temporary file, synchronization, and replace/rollback sequence. Normal `check`,
+`build`, `run`, and `interpret` commands never rewrite the lockfile. Missing, manually
+edited, stale, or content-mismatched lockfiles fail before dependency code enters the
+compiler. `disp tree project` displays the exact locked graph.
+
+Resolution rejects dependency cycles, duplicate name/version identities from different
+source trees, symbolic links inside dependency source, graph/depth/file/byte limit
+violations, malformed path specifications, and package import collisions. Git, registry,
+remote archive, version-range, feature, and build-script dependencies remain unsupported
+and fail closed; this pass implements verified local dependencies rather than pretending
+that the future network package system already exists.
 
 Shared function parameters also borrow named storage automatically:
 

@@ -1,0 +1,7 @@
+module main
+
+use math
+
+fn main() {
+    print(fibonacci(10))
+}

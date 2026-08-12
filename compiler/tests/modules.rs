@@ -276,7 +276,7 @@ fn malformed_manifest_forms_never_receive_guessed_meanings() {
         ),
         (
             "[dependencies]\nname = \"demo\"\n",
-            "unsupported manifest section",
+            "local dependency must use",
         ),
         (
             "[package]\nname = \"demo\"\n[package]\nversion = \"0.1.0\"\n",
