@@ -137,6 +137,48 @@ pub struct Program {
     pub implementations: Vec<Implementation>,
     pub functions: Vec<Function>,
     pub copy_types: HashSet<TypeId>,
+    pub data_plans: Vec<DataPlan>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DataPlanId(pub usize);
+
+#[derive(Debug, Clone)]
+pub struct DataPlan {
+    pub schema: StructId,
+    pub operation: DataOperation,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum DataOperation {
+    Add {
+        replace: bool,
+    },
+    Find {
+        predicate: Option<DataExpr>,
+        order: Option<(DataExpr, bool)>,
+        limit_argument: Option<usize>,
+    },
+    Remove {
+        predicate: DataExpr,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct DataExpr {
+    pub kind: DataExprKind,
+    pub ty: Type,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum DataExprKind {
+    Field(usize),
+    Parameter(usize),
+    Constant(Constant),
+    Unary(ast::UnaryOperator, Box<DataExpr>),
+    Binary(ast::BinaryOperator, Box<DataExpr>, Box<DataExpr>),
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +186,7 @@ pub struct Struct {
     pub id: StructId,
     pub type_id: TypeId,
     pub name: String,
+    pub data: bool,
     pub fields: Vec<Field>,
     pub span: Span,
     pub generic_parameters: Vec<String>,
@@ -154,6 +197,7 @@ pub struct Field {
     pub index: usize,
     pub name: String,
     pub ty: Type,
+    pub primary: bool,
     pub span: Span,
 }
 
@@ -365,6 +409,7 @@ pub enum CallTarget {
     TraitMethod { trait_id: TraitId, method: usize },
     Callable,
     Intrinsic(String),
+    Data(DataPlanId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -434,6 +479,7 @@ struct Lowering<'a> {
     next_variant: usize,
     next_function: Cell<usize>,
     generated_functions: RefCell<Vec<Function>>,
+    data_plans: RefCell<Vec<DataPlan>>,
 }
 
 impl<'a> Lowering<'a> {
@@ -478,6 +524,7 @@ impl<'a> Lowering<'a> {
             next_variant: 0,
             next_function: Cell::new(next),
             generated_functions: RefCell::new(Vec::new()),
+            data_plans: RefCell::new(Vec::new()),
         }
     }
 
@@ -489,6 +536,7 @@ impl<'a> Lowering<'a> {
                 id,
                 type_id: TypeId(index),
                 name: declaration.name.clone(),
+                data: declaration.data,
                 fields: declaration
                     .fields
                     .iter()
@@ -497,6 +545,7 @@ impl<'a> Lowering<'a> {
                         index: field_index,
                         name: field.name.clone(),
                         ty: self.lower_type(&field.ty),
+                        primary: field.primary,
                         span: field.name_span,
                     })
                     .collect(),
@@ -617,6 +666,7 @@ impl<'a> Lowering<'a> {
             implementations,
             functions,
             copy_types,
+            data_plans: self.data_plans.take(),
         };
         validate(&program)?;
         Ok(program)
@@ -1228,6 +1278,155 @@ impl FunctionLowering<'_, '_> {
 
     fn lower_expr(&mut self, expression: &ast::Expr) -> Result<Expr, Diagnostic> {
         let (kind, ty) = match &expression.node {
+            ast::Expression::DataStore { path } => {
+                let arguments = path
+                    .as_ref()
+                    .map(|path| self.lower_expr(path))
+                    .transpose()?
+                    .into_iter()
+                    .collect();
+                (
+                    ExprKind::Call(Call {
+                        target: CallTarget::Intrinsic(if path.is_some() {
+                            "DataStore.open".into()
+                        } else {
+                            "DataStore.memory".into()
+                        }),
+                        arguments,
+                        receiver: None,
+                        substitutions: vec![],
+                    }),
+                    Type::Result(
+                        Box::new(Type::Database),
+                        Box::new(Type::Generic("DataError".into())),
+                    ),
+                )
+            }
+            ast::Expression::DataWrite {
+                value,
+                store,
+                replace,
+            } => {
+                let store = self.lower_expr(store)?;
+                let value = self.lower_expr(value)?;
+                let Type::Struct(schema, arguments) = &value.ty else {
+                    return Err(Diagnostic::new(
+                        DiagnosticKind::Internal,
+                        "typed DISP Data write lost its schema type",
+                        value.span,
+                    ));
+                };
+                if !arguments.is_empty() {
+                    return Err(Diagnostic::new(
+                        DiagnosticKind::Internal,
+                        "generic schema reached DISP Data lowering",
+                        value.span,
+                    ));
+                }
+                let id = DataPlanId(self.root.data_plans.borrow().len());
+                self.root.data_plans.borrow_mut().push(DataPlan {
+                    schema: *schema,
+                    operation: DataOperation::Add { replace: *replace },
+                    span: expression.span,
+                });
+                (
+                    ExprKind::Call(Call {
+                        target: CallTarget::Data(id),
+                        arguments: vec![store, value],
+                        receiver: Some(ReceiverMode::Mutable),
+                        substitutions: vec![],
+                    }),
+                    Type::Result(
+                        Box::new(Type::Int {
+                            signed: false,
+                            width: None,
+                        }),
+                        Box::new(Type::Generic("DataError".into())),
+                    ),
+                )
+            }
+            ast::Expression::DataQuery {
+                schema,
+                store,
+                predicate,
+                order,
+                limit,
+                ..
+            } => {
+                let schema_id = self.root.struct_names[schema];
+                let mut arguments = vec![self.lower_expr(store)?];
+                let predicate = predicate
+                    .as_ref()
+                    .map(|value| self.lower_data_expr(schema_id, value, &mut arguments))
+                    .transpose()?;
+                let order = order
+                    .as_ref()
+                    .map(|value| {
+                        self.lower_data_expr(schema_id, &value.key, &mut arguments)
+                            .map(|key| (key, value.descending))
+                    })
+                    .transpose()?;
+                let limit_argument = if let Some(limit) = limit {
+                    let index = arguments.len();
+                    arguments.push(self.lower_expr(limit)?);
+                    Some(index)
+                } else {
+                    None
+                };
+                let id = DataPlanId(self.root.data_plans.borrow().len());
+                self.root.data_plans.borrow_mut().push(DataPlan {
+                    schema: schema_id,
+                    operation: DataOperation::Find {
+                        predicate,
+                        order,
+                        limit_argument,
+                    },
+                    span: expression.span,
+                });
+                (
+                    ExprKind::Call(Call {
+                        target: CallTarget::Data(id),
+                        arguments,
+                        receiver: Some(ReceiverMode::Mutable),
+                        substitutions: vec![],
+                    }),
+                    Type::Result(
+                        Box::new(Type::List(Box::new(Type::Struct(schema_id, vec![])))),
+                        Box::new(Type::Generic("DataError".into())),
+                    ),
+                )
+            }
+            ast::Expression::DataRemove {
+                schema,
+                store,
+                predicate,
+                ..
+            } => {
+                let schema_id = self.root.struct_names[schema];
+                let mut arguments = vec![self.lower_expr(store)?];
+                let predicate = self.lower_data_expr(schema_id, predicate, &mut arguments)?;
+                let id = DataPlanId(self.root.data_plans.borrow().len());
+                self.root.data_plans.borrow_mut().push(DataPlan {
+                    schema: schema_id,
+                    operation: DataOperation::Remove { predicate },
+                    span: expression.span,
+                });
+                (
+                    ExprKind::Call(Call {
+                        target: CallTarget::Data(id),
+                        arguments,
+                        receiver: Some(ReceiverMode::Mutable),
+                        substitutions: vec![],
+                    }),
+                    Type::Result(
+                        Box::new(Type::Int {
+                            signed: false,
+                            width: None,
+                        }),
+                        Box::new(Type::Generic("DataError".into())),
+                    ),
+                )
+            }
             ast::Expression::Closure {
                 move_captures,
                 parameters,
@@ -1721,6 +1920,98 @@ impl FunctionLowering<'_, '_> {
             }
         };
         Ok(Expr {
+            kind,
+            ty,
+            span: expression.span,
+        })
+    }
+
+    fn lower_data_expr(
+        &mut self,
+        schema: StructId,
+        expression: &ast::Expr,
+        arguments: &mut Vec<Expr>,
+    ) -> Result<DataExpr, Diagnostic> {
+        let declaration = &self.root.ast.structs[schema.0];
+        let (kind, ty) = match &expression.node {
+            ast::Expression::Identifier(name)
+                if self.lookup_optional(name).is_none()
+                    && !self.capture_bindings.contains_key(name)
+                    && declaration.fields.iter().any(|field| field.name == *name) =>
+            {
+                let field = declaration
+                    .fields
+                    .iter()
+                    .position(|field| field.name == *name)
+                    .expect("field existence checked");
+                (
+                    DataExprKind::Field(field),
+                    self.lower_type(&declaration.fields[field].ty),
+                )
+            }
+            ast::Expression::Integer(_)
+            | ast::Expression::Float(_)
+            | ast::Expression::String(_)
+            | ast::Expression::Character(_)
+            | ast::Expression::Bool(_) => {
+                let value = self.lower_expr(expression)?;
+                let ExprKind::Constant(constant) = value.kind else {
+                    unreachable!()
+                };
+                (DataExprKind::Constant(constant), value.ty)
+            }
+            ast::Expression::Unary { operator, operand } => {
+                let operand = self.lower_data_expr(schema, operand, arguments)?;
+                let ty = if matches!(operator, ast::UnaryOperator::Not) {
+                    Type::Bool
+                } else {
+                    operand.ty.clone()
+                };
+                (DataExprKind::Unary(*operator, Box::new(operand)), ty)
+            }
+            ast::Expression::Binary {
+                left,
+                operator,
+                right,
+            } => {
+                let left = self.lower_data_expr(schema, left, arguments)?;
+                let right = self.lower_data_expr(schema, right, arguments)?;
+                let ty = if matches!(
+                    operator,
+                    ast::BinaryOperator::Equal
+                        | ast::BinaryOperator::NotEqual
+                        | ast::BinaryOperator::Less
+                        | ast::BinaryOperator::LessEqual
+                        | ast::BinaryOperator::Greater
+                        | ast::BinaryOperator::GreaterEqual
+                        | ast::BinaryOperator::And
+                        | ast::BinaryOperator::Or
+                ) {
+                    Type::Bool
+                } else {
+                    left.ty.clone()
+                };
+                (
+                    DataExprKind::Binary(*operator, Box::new(left), Box::new(right)),
+                    ty,
+                )
+            }
+            ast::Expression::Identifier(_) => {
+                let value = self.lower_expr(expression)?;
+                let ty = value.ty.clone();
+                let index = arguments.len();
+                arguments.push(value);
+                (DataExprKind::Parameter(index), ty)
+            }
+            _ => {
+                return Err(Diagnostic::new(
+                    DiagnosticKind::Internal,
+                    "unsupported expression reached DISP Data lowering",
+                    expression.span,
+                ));
+            }
+        };
+        Ok(DataExpr {
             kind,
             ty,
             span: expression.span,
@@ -4535,50 +4826,58 @@ pub fn validate(program: &Program) -> Result<(), Diagnostic> {
             }
         }
         validate_block(&function.body, function.locals.len())?;
-        validate_semantics_block(&function.body, program.functions.len())?;
+        validate_semantics_block(
+            &function.body,
+            program.functions.len(),
+            program.data_plans.len(),
+        )?;
     }
     Ok(())
 }
 
-fn validate_semantics_block(block: &Block, functions: usize) -> Result<(), Diagnostic> {
+fn validate_semantics_block(
+    block: &Block,
+    functions: usize,
+    data_plans: usize,
+) -> Result<(), Diagnostic> {
     for statement in &block.statements {
         match &statement.kind {
             StatementKind::Let { value, .. } | StatementKind::Return(value) => {
                 if let Some(value) = value {
-                    validate_semantics_expr(value, functions)?;
+                    validate_semantics_expr(value, functions, data_plans)?;
                 }
             }
             StatementKind::Assign { value, .. } | StatementKind::Expression(value) => {
-                validate_semantics_expr(value, functions)?
+                validate_semantics_expr(value, functions, data_plans)?
             }
             StatementKind::If {
                 condition,
                 then_block,
                 else_block,
             } => {
-                validate_semantics_expr(condition, functions)?;
-                validate_semantics_block(then_block, functions)?;
+                validate_semantics_expr(condition, functions, data_plans)?;
+                validate_semantics_block(then_block, functions, data_plans)?;
                 if let Some(block) = else_block {
-                    validate_semantics_block(block, functions)?;
+                    validate_semantics_block(block, functions, data_plans)?;
                 }
             }
             StatementKind::While { condition, body } => {
-                validate_semantics_expr(condition, functions)?;
-                validate_semantics_block(body, functions)?;
+                validate_semantics_expr(condition, functions, data_plans)?;
+                validate_semantics_block(body, functions, data_plans)?;
             }
             StatementKind::For {
                 start, end, body, ..
             } => {
-                validate_semantics_expr(start, functions)?;
-                validate_semantics_expr(end, functions)?;
-                validate_semantics_block(body, functions)?;
+                validate_semantics_expr(start, functions, data_plans)?;
+                validate_semantics_expr(end, functions, data_plans)?;
+                validate_semantics_block(body, functions, data_plans)?;
             }
             StatementKind::ForEach { iterable, body, .. } => {
-                validate_semantics_expr(iterable, functions)?;
-                validate_semantics_block(body, functions)?;
+                validate_semantics_expr(iterable, functions, data_plans)?;
+                validate_semantics_block(body, functions, data_plans)?;
             }
             StatementKind::Loop(block) | StatementKind::Unsafe(block) => {
-                validate_semantics_block(block, functions)?
+                validate_semantics_block(block, functions, data_plans)?
             }
             StatementKind::Break | StatementKind::Continue => {}
         }
@@ -4586,7 +4885,11 @@ fn validate_semantics_block(block: &Block, functions: usize) -> Result<(), Diagn
     Ok(())
 }
 
-fn validate_semantics_expr(expr: &Expr, functions: usize) -> Result<(), Diagnostic> {
+fn validate_semantics_expr(
+    expr: &Expr,
+    functions: usize,
+    data_plans: usize,
+) -> Result<(), Diagnostic> {
     if contains_unknown(&expr.ty) {
         return Err(Diagnostic::new(
             DiagnosticKind::Internal,
@@ -4597,17 +4900,17 @@ fn validate_semantics_expr(expr: &Expr, functions: usize) -> Result<(), Diagnost
     match &expr.kind {
         ExprKind::Array(values) => {
             for value in values {
-                validate_semantics_expr(value, functions)?;
+                validate_semantics_expr(value, functions, data_plans)?;
             }
         }
         ExprKind::Index { object, index } => {
-            validate_semantics_expr(object, functions)?;
-            validate_semantics_expr(index, functions)?;
+            validate_semantics_expr(object, functions, data_plans)?;
+            validate_semantics_expr(index, functions, data_plans)?;
         }
         ExprKind::Subslice { object, start, end } => {
-            validate_semantics_expr(object, functions)?;
-            validate_semantics_expr(start, functions)?;
-            validate_semantics_expr(end, functions)?;
+            validate_semantics_expr(object, functions, data_plans)?;
+            validate_semantics_expr(start, functions, data_plans)?;
+            validate_semantics_expr(end, functions, data_plans)?;
         }
         ExprKind::Call(call) | ExprKind::Spawn(call) => {
             if let CallTarget::Function(target) = call.target
@@ -4619,8 +4922,17 @@ fn validate_semantics_expr(expr: &Expr, functions: usize) -> Result<(), Diagnost
                     expr.span,
                 ));
             }
+            if let CallTarget::Data(target) = call.target
+                && target.0 >= data_plans
+            {
+                return Err(Diagnostic::new(
+                    DiagnosticKind::Internal,
+                    "HIR data plan target is out of range",
+                    expr.span,
+                ));
+            }
             for argument in &call.arguments {
-                validate_semantics_expr(argument, functions)?;
+                validate_semantics_expr(argument, functions, data_plans)?;
             }
         }
         ExprKind::Closure { function, captures } => {
@@ -4632,17 +4944,17 @@ fn validate_semantics_expr(expr: &Expr, functions: usize) -> Result<(), Diagnost
                 ));
             }
             for capture in captures {
-                validate_semantics_expr(capture, functions)?;
+                validate_semantics_expr(capture, functions, data_plans)?;
             }
         }
         ExprKind::Struct { fields, .. } => {
             for (_, value) in fields {
-                validate_semantics_expr(value, functions)?;
+                validate_semantics_expr(value, functions, data_plans)?;
             }
         }
         ExprKind::EnumConstruct { payload, .. } => {
             for value in payload {
-                validate_semantics_expr(value, functions)?;
+                validate_semantics_expr(value, functions, data_plans)?;
             }
         }
         ExprKind::Field { object, .. }
@@ -4651,15 +4963,15 @@ fn validate_semantics_expr(expr: &Expr, functions: usize) -> Result<(), Diagnost
         | ExprKind::Dereference(object, _)
         | ExprKind::Unary {
             operand: object, ..
-        } => validate_semantics_expr(object, functions)?,
+        } => validate_semantics_expr(object, functions, data_plans)?,
         ExprKind::Binary { left, right, .. } => {
-            validate_semantics_expr(left, functions)?;
-            validate_semantics_expr(right, functions)?;
+            validate_semantics_expr(left, functions, data_plans)?;
+            validate_semantics_expr(right, functions, data_plans)?;
         }
         ExprKind::Match { value, arms } => {
-            validate_semantics_expr(value, functions)?;
+            validate_semantics_expr(value, functions, data_plans)?;
             for arm in arms {
-                validate_semantics_expr(&arm.value, functions)?;
+                validate_semantics_expr(&arm.value, functions, data_plans)?;
             }
         }
         ExprKind::Constant(_)

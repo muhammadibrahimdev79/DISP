@@ -907,6 +907,59 @@ impl<'a> Analyzer<'a> {
                 }
                 Ok(Ty::Array(Box::new(element)))
             }
+            Expression::DataWrite { value, store, .. } => {
+                self.check_expr(value, UseMode::Read)?;
+                self.check_data_store(store)?;
+                Ok(Ty::Result(
+                    Box::new(Ty::Copy),
+                    Box::new(Ty::Owned("DataError".into())),
+                ))
+            }
+            Expression::DataStore { path } => {
+                if let Some(path) = path {
+                    self.check_expr(path, UseMode::Read)?;
+                }
+                Ok(Ty::Result(
+                    Box::new(Ty::Owned("Database".into())),
+                    Box::new(Ty::Owned("DataError".into())),
+                ))
+            }
+            Expression::DataQuery {
+                schema,
+                store,
+                predicate,
+                order,
+                limit,
+                ..
+            } => {
+                self.check_data_store(store)?;
+                if let Some(predicate) = predicate {
+                    self.check_data_expression(schema, predicate)?;
+                }
+                if let Some(order) = order {
+                    self.check_data_expression(schema, &order.key)?;
+                }
+                if let Some(limit) = limit {
+                    self.check_expr(limit, UseMode::Read)?;
+                }
+                Ok(Ty::Result(
+                    Box::new(Ty::List(Box::new(Ty::Owned(schema.clone())))),
+                    Box::new(Ty::Owned("DataError".into())),
+                ))
+            }
+            Expression::DataRemove {
+                schema,
+                store,
+                predicate,
+                ..
+            } => {
+                self.check_data_store(store)?;
+                self.check_data_expression(schema, predicate)?;
+                Ok(Ty::Result(
+                    Box::new(Ty::Copy),
+                    Box::new(Ty::Owned("DataError".into())),
+                ))
+            }
             Expression::Closure {
                 move_captures,
                 parameters,
@@ -1160,6 +1213,53 @@ impl<'a> Analyzer<'a> {
                     _ => Ty::Owned("try-output".into()),
                 })
             }
+        }
+    }
+
+    fn check_data_store(&mut self, store: &Expr) -> Result<(), Diagnostic> {
+        if let Ok(place) = self.place(store) {
+            self.check_borrow(&place, true, store.span)?;
+            self.use_place(&place, UseMode::Read, store.span)?;
+        } else {
+            self.check_expr(store, UseMode::Read)?;
+        }
+        Ok(())
+    }
+
+    fn check_data_expression(&mut self, schema: &str, expression: &Expr) -> Result<(), Diagnostic> {
+        match &expression.node {
+            Expression::Identifier(name)
+                if self.lookup(name).is_none()
+                    && self
+                        .program
+                        .structs
+                        .iter()
+                        .find(|item| item.name == schema && item.data)
+                        .is_some_and(|item| {
+                            item.fields.iter().any(|field| field.name == *name)
+                        }) =>
+            {
+                Ok(())
+            }
+            Expression::Unary { operand, .. } => self.check_data_expression(schema, operand),
+            Expression::Binary { left, right, .. } => {
+                self.check_data_expression(schema, left)?;
+                self.check_data_expression(schema, right)
+            }
+            Expression::Integer(_)
+            | Expression::Float(_)
+            | Expression::String(_)
+            | Expression::Character(_)
+            | Expression::Bool(_) => Ok(()),
+            Expression::Identifier(_) => {
+                self.check_expr(expression, UseMode::Read)?;
+                Ok(())
+            }
+            _ => Err(Diagnostic::new(
+                DiagnosticKind::Type,
+                "unsupported expression in a DISP Data plan",
+                expression.span,
+            )),
         }
     }
 
@@ -3542,6 +3642,39 @@ fn collect_expr_names(expression: &Expr, names: &mut HashSet<String>) {
             for value in values {
                 collect_expr_names(value, names);
             }
+        }
+        Expression::DataWrite { value, store, .. } => {
+            collect_expr_names(value, names);
+            collect_expr_names(store, names);
+        }
+        Expression::DataStore { path } => {
+            if let Some(path) = path {
+                collect_expr_names(path, names);
+            }
+        }
+        Expression::DataQuery {
+            store,
+            predicate,
+            order,
+            limit,
+            ..
+        } => {
+            collect_expr_names(store, names);
+            if let Some(predicate) = predicate {
+                collect_expr_names(predicate, names);
+            }
+            if let Some(order) = order {
+                collect_expr_names(&order.key, names);
+            }
+            if let Some(limit) = limit {
+                collect_expr_names(limit, names);
+            }
+        }
+        Expression::DataRemove {
+            store, predicate, ..
+        } => {
+            collect_expr_names(store, names);
+            collect_expr_names(predicate, names);
         }
         Expression::Closure {
             parameters, body, ..

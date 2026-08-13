@@ -544,7 +544,9 @@ pub fn resolve_target(
 ) -> Result<Option<FunctionInstance>, Diagnostic> {
     let caller_map = mapping(caller, instance);
     match target {
-        hir::CallTarget::Intrinsic(_) | hir::CallTarget::Callable => Ok(None),
+        hir::CallTarget::Intrinsic(_) | hir::CallTarget::Data(_) | hir::CallTarget::Callable => {
+            Ok(None)
+        }
         hir::CallTarget::Function(function) => {
             let callee = program
                 .functions

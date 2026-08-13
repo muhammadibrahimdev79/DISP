@@ -411,6 +411,23 @@ static bool disp_database_query(disp_database_state *state,const char *sql,size_
 static bool disp_database_control(disp_database_state *state,const char *sql,bool expected_transaction,disp_native_string *error){if(!disp_database_require(state,error))return false;bool transaction=sqlite3_get_autocommit(state->handle)==0;if(transaction!=expected_transaction){*error=disp_owned_bytes(expected_transaction?"database has no active transaction":"database transaction is already active",expected_transaction?34:38);return false;}uint64_t ignored=0;return disp_database_execute(state,sql,strlen(sql),NULL,0,&ignored,error);}
 static bool disp_database_close(disp_native_database *database,disp_native_string *error){disp_database_state *state=database->state;if(!state)return true;if(sqlite3_get_autocommit(state->handle)==0){uint64_t ignored=0;disp_native_string rollback_error={0};disp_database_execute(state,"ROLLBACK",8,NULL,0,&ignored,&rollback_error);disp_string_drop(&rollback_error);}int code=sqlite3_close_v2(state->handle);if(code!=DISP_SQLITE_OK){*error=disp_database_error(state,"could not close database");return false;}state->handle=NULL;state->closed=true;disp_dealloc(state);database->state=NULL;return true;}
 static void disp_database_drop(disp_native_database *database){if(!database||!database->state)return;disp_native_string ignored={0};disp_database_close(database,&ignored);disp_string_drop(&ignored);}
+static bool disp_data_ensure_schema(disp_database_state *state,const char *create_sql,size_t create_len,const char *inspect_sql,size_t inspect_len,const char *const *names,const char *const *types,const bool *required,const bool *primary,size_t count,disp_native_string *error){
+uint64_t ignored=0;
+if(!disp_database_execute(state,create_sql,create_len,NULL,0,&ignored,error))return false;
+sqlite3_stmt *statement=NULL;
+if(!disp_database_prepare(state,inspect_sql,inspect_len,&statement,error))return false;
+for(size_t i=0;i<count;i++){
+int code=sqlite3_step(statement);
+if(code!=DISP_SQLITE_ROW){const char *message="stored layout does not match its DISP Data schema";*error=disp_owned_bytes(message,strlen(message));sqlite3_finalize(statement);return false;}
+const unsigned char *name=sqlite3_column_text(statement,1),*type=sqlite3_column_text(statement,2);
+bool not_null=sqlite3_column_int64(statement,3)!=0,is_primary=sqlite3_column_int64(statement,5)!=0;
+if(!name||!type||strcmp((const char*)name,names[i])||strcmp((const char*)type,types[i])||not_null!=required[i]||is_primary!=primary[i]){const char *message="stored field is incompatible with its DISP Data schema";*error=disp_owned_bytes(message,strlen(message));sqlite3_finalize(statement);return false;}
+}
+int code=sqlite3_step(statement);
+if(code!=DISP_SQLITE_DONE){const char *message="stored layout has extra DISP Data fields";*error=disp_owned_bytes(message,strlen(message));sqlite3_finalize(statement);return false;}
+if(sqlite3_finalize(statement)!=DISP_SQLITE_OK){*error=disp_database_error(state,"could not validate DISP Data schema");return false;}
+return true;
+}
 #endif
 
 static disp_native_string disp_owned_bytes(const char *bytes,size_t len){disp_native_string value={0};if(len){value.data=(char*)disp_alloc(len,1);memcpy(value.data,bytes,len);value.len=len;value.cap=len;}return value;}

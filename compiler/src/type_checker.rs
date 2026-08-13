@@ -75,9 +75,11 @@ pub struct TypeId(usize);
 #[derive(Debug, Clone)]
 struct StructInfo {
     name: String,
+    data: bool,
     generics: Vec<String>,
     constraints: Vec<Vec<String>>,
     fields: HashMap<String, Type>,
+    primary: Option<Type>,
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +139,7 @@ pub struct TypeChecker {
     external_functions: HashSet<String>,
     unsafe_depth: usize,
     async_depth: usize,
+    data_context: Option<TypeId>,
 }
 
 impl TypeChecker {
@@ -155,6 +158,7 @@ impl TypeChecker {
             external_functions: HashSet::new(),
             unsafe_depth: 0,
             async_depth: 0,
+            data_context: None,
         }
     }
 
@@ -186,6 +190,7 @@ impl TypeChecker {
                 id,
                 StructInfo {
                     name: declaration.name.clone(),
+                    data: declaration.data,
                     generics: declaration
                         .generics
                         .iter()
@@ -203,6 +208,7 @@ impl TypeChecker {
                         })
                         .collect(),
                     fields: HashMap::new(),
+                    primary: None,
                 },
             );
         }
@@ -240,9 +246,51 @@ impl TypeChecker {
                 unreachable!();
             };
             self.set_generics(&declaration.generics);
+            if declaration.data && !declaration.generics.is_empty() {
+                return Err(Diagnostic::new(
+                    DiagnosticKind::Type,
+                    "data schemas cannot be generic",
+                    declaration.name_span,
+                ));
+            }
+            if declaration.data && declaration.fields.is_empty() {
+                return Err(Diagnostic::new(
+                    DiagnosticKind::Type,
+                    "a data schema must declare at least one field",
+                    declaration.name_span,
+                ));
+            }
             let mut fields = HashMap::new();
+            let mut primary = None;
             for field in &declaration.fields {
                 let ty = self.resolve_type(&field.ty)?;
+                if declaration.data {
+                    self.ensure_data_field_type(&ty, field.ty.span)?;
+                    if field.primary {
+                        if primary.is_some() {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Type,
+                                "a data schema must have exactly one primary field",
+                                field.name_span,
+                            ));
+                        }
+                        if matches!(ty, Type::Option(_)) {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Type,
+                                "a primary data field cannot be optional",
+                                field.ty.span,
+                            ));
+                        }
+                        if !matches!(ty, Type::Int | Type::Signed(_) | Type::String) {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Type,
+                                "a primary data field must be a signed integer or String",
+                                field.ty.span,
+                            ));
+                        }
+                        primary = Some(ty.clone());
+                    }
+                }
                 if type_contains_task(&ty) {
                     return Err(Diagnostic::new(
                         DiagnosticKind::Type,
@@ -253,7 +301,16 @@ impl TypeChecker {
                 }
                 fields.insert(field.name.clone(), ty);
             }
-            self.structs.get_mut(&id).unwrap().fields = fields;
+            if declaration.data && primary.is_none() {
+                return Err(Diagnostic::new(
+                    DiagnosticKind::Type,
+                    "a data schema must mark exactly one field as `primary`",
+                    declaration.name_span,
+                ));
+            }
+            let info = self.structs.get_mut(&id).unwrap();
+            info.fields = fields;
+            info.primary = primary;
         }
         for declaration in &program.enums {
             let Type::Enum(id, _) = self.types[&declaration.name] else {
@@ -1086,6 +1143,120 @@ impl TypeChecker {
                 }
                 Ok(Type::Array(Box::new(element), values.len()))
             }
+            Expression::DataWrite {
+                value,
+                store,
+                replace: _,
+            } => {
+                let value_ty = materialize_literal(self.check_expression(value)?);
+                let Type::Struct(id, arguments) = value_ty else {
+                    return Err(Diagnostic::new(
+                        DiagnosticKind::Type,
+                        "`data add` and `data save` require a data value",
+                        value.span,
+                    ));
+                };
+                let info = &self.structs[&id];
+                if !info.data || !arguments.is_empty() {
+                    return Err(Diagnostic::new(
+                        DiagnosticKind::Type,
+                        format!("`{}` is not a concrete data schema", info.name),
+                        value.span,
+                    ));
+                }
+                let store_ty = self.check_expression(store)?;
+                self.require_same(&Type::Database, &store_ty, store.span, "DISP Data store")?;
+                Ok(Type::Result(
+                    Box::new(Type::UInt),
+                    Box::new(Type::DataError),
+                ))
+            }
+            Expression::DataStore { path } => {
+                if let Some(path) = path {
+                    let ty = self.check_expression(path)?;
+                    if !matches!(ty, Type::Path) {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            "`data open` requires a Path",
+                            path.span,
+                        ));
+                    }
+                }
+                Ok(Type::Result(
+                    Box::new(Type::Database),
+                    Box::new(Type::DataError),
+                ))
+            }
+            Expression::DataQuery {
+                schema,
+                schema_span,
+                store,
+                predicate,
+                order,
+                limit,
+            } => {
+                let id = self.require_data_schema(schema, *schema_span)?;
+                let store_ty = self.check_expression(store)?;
+                self.require_same(&Type::Database, &store_ty, store.span, "DISP Data store")?;
+                let previous = self.data_context.replace(id);
+                let checked = (|| {
+                    if let Some(predicate) = predicate {
+                        let ty = self.check_expression(predicate)?;
+                        self.require_same(&Type::Bool, &ty, predicate.span, "DISP Data condition")?;
+                    }
+                    if let Some(order) = order {
+                        let ty = materialize_literal(self.check_expression(&order.key)?);
+                        if !is_data_order_type(&ty) {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Type,
+                                format!("cannot order data by {}", self.format_type(&ty)),
+                                order.key.span,
+                            ));
+                        }
+                    }
+                    Ok(())
+                })();
+                self.data_context = previous;
+                checked?;
+                if let Some(limit) = limit {
+                    let ty = self.check_expression(limit)?;
+                    if !is_integer(&ty) {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            "DISP Data limit must be an integer",
+                            limit.span,
+                        ));
+                    }
+                }
+                Ok(Type::Result(
+                    Box::new(Type::List(Box::new(Type::Struct(id, vec![])))),
+                    Box::new(Type::DataError),
+                ))
+            }
+            Expression::DataRemove {
+                schema,
+                schema_span,
+                store,
+                predicate,
+            } => {
+                let id = self.require_data_schema(schema, *schema_span)?;
+                let store_ty = self.check_expression(store)?;
+                self.require_same(&Type::Database, &store_ty, store.span, "DISP Data store")?;
+                let previous = self.data_context.replace(id);
+                let predicate_ty = self.check_expression(predicate);
+                self.data_context = previous;
+                let predicate_ty = predicate_ty?;
+                self.require_same(
+                    &Type::Bool,
+                    &predicate_ty,
+                    predicate.span,
+                    "DISP Data condition",
+                )?;
+                Ok(Type::Result(
+                    Box::new(Type::UInt),
+                    Box::new(Type::DataError),
+                ))
+            }
             Expression::Closure {
                 parameters,
                 return_type,
@@ -1380,6 +1551,11 @@ impl TypeChecker {
             Expression::Identifier(name) => {
                 if let Some(variable) = self.lookup_variable(name) {
                     return Ok(variable.ty);
+                }
+                if let Some(schema) = self.data_context
+                    && let Some(ty) = self.structs[&schema].fields.get(name)
+                {
+                    return Ok(ty.clone());
                 }
                 if let Some(signature) = self.functions.get(name) {
                     if !signature.generics.is_empty() {
@@ -5030,6 +5206,63 @@ impl TypeChecker {
         }
     }
 
+    fn ensure_data_field_type(&self, ty: &Type, span: Span) -> Result<(), Diagnostic> {
+        let supported = match ty {
+            Type::Int
+            | Type::Signed(8 | 16 | 32 | 64)
+            | Type::Float
+            | Type::Float32
+            | Type::String
+            | Type::Char
+            | Type::Bool => true,
+            Type::Unsigned(8 | 16 | 32) => true,
+            Type::Option(inner) => matches!(
+                inner.as_ref(),
+                Type::Int
+                    | Type::Signed(8 | 16 | 32 | 64)
+                    | Type::Unsigned(8 | 16 | 32)
+                    | Type::Float
+                    | Type::Float32
+                    | Type::String
+                    | Type::Char
+                    | Type::Bool
+            ),
+            _ => false,
+        };
+        if supported {
+            Ok(())
+        } else {
+            Err(Diagnostic::new(
+                DiagnosticKind::Type,
+                format!(
+                    "{} cannot be stored directly in a data schema",
+                    self.format_type(ty)
+                ),
+                span,
+            )
+            .with_help("data fields currently support signed integers through i64, u8/u16/u32, finite floats, bool, char, String, and Option of those types"))
+        }
+    }
+
+    fn require_data_schema(&self, name: &str, span: Span) -> Result<TypeId, Diagnostic> {
+        let Some(Type::Struct(id, arguments)) = self.types.get(name) else {
+            return Err(Diagnostic::new(
+                DiagnosticKind::Type,
+                format!("unknown data schema `{name}`"),
+                span,
+            ));
+        };
+        if !arguments.is_empty() || !self.structs[id].data {
+            return Err(Diagnostic::new(
+                DiagnosticKind::Type,
+                format!("`{name}` is not a data schema"),
+                span,
+            )
+            .with_help("declare persistent records with `data Name { ... }`"));
+        }
+        Ok(*id)
+    }
+
     fn generic_arity(&self, name: &str, expected: usize, actual: usize, span: Span) -> Diagnostic {
         Diagnostic::new(
             DiagnosticKind::Type,
@@ -5234,7 +5467,11 @@ impl TypeChecker {
             | Expression::Closure { .. }
             | Expression::Move(_)
             | Expression::Borrow { .. }
-            | Expression::Dereference(_) => false,
+            | Expression::Dereference(_)
+            | Expression::DataWrite { .. }
+            | Expression::DataStore { .. }
+            | Expression::DataQuery { .. }
+            | Expression::DataRemove { .. } => false,
         }
     }
 
@@ -5787,6 +6024,21 @@ fn is_integer(ty: &Type) -> bool {
             | Type::UInt
             | Type::Signed(_)
             | Type::Unsigned(_)
+    )
+}
+
+fn is_data_order_type(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Int
+            | Type::UInt
+            | Type::Signed(_)
+            | Type::Unsigned(_)
+            | Type::Float
+            | Type::Float32
+            | Type::String
+            | Type::Char
+            | Type::Bool
     )
 }
 

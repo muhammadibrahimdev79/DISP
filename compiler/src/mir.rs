@@ -16,6 +16,7 @@ pub struct Program {
     pub enums: Vec<hir::Enum>,
     pub implementations: Vec<hir::Implementation>,
     pub traits: Vec<hir::Trait>,
+    pub data_plans: Vec<hir::DataPlan>,
 }
 
 #[derive(Debug, Clone)]
@@ -206,6 +207,7 @@ pub fn lower(program: &hir::Program) -> Result<Program, Diagnostic> {
         enums: program.enums.clone(),
         implementations: program.implementations.clone(),
         traits: program.traits.clone(),
+        data_plans: program.data_plans.clone(),
     };
     validate(&mir)?;
     Ok(mir)
@@ -976,13 +978,19 @@ impl<'a> Builder<'a> {
                 && matches!(&call.target, hir::CallTarget::Intrinsic(name) if name == "CString.new")
             {
                 Some(hir::ReceiverMode::Shared)
+            } else if matches!(call.target, hir::CallTarget::Data(_)) {
+                Some(if index == 0 {
+                    hir::ReceiverMode::Mutable
+                } else {
+                    hir::ReceiverMode::Shared
+                })
             } else if index == 0 {
                 call.receiver
             } else if (index == 1
                 && matches!(&call.target, hir::CallTarget::Intrinsic(name) if matches!(name.as_str(), "String.push_str" | "String.contains" | "String.starts_with" | "String.ends_with" | "Map.has" | "Map.get" | "Map.get_mut" | "Map.remove" | "Set.has" | "Set.remove")))
                 || (index == 2
                     && matches!(&call.target, hir::CallTarget::Intrinsic(name) if name == "Memory.copy_from"))
-                || matches!(&call.target, hir::CallTarget::Intrinsic(name) if name == "Path.new" || name == "Path.join" || name.starts_with("File.") || name.starts_with("Directory.") || name == "Database.open" || ((name == "Database.execute" || name == "Database.query") && (index == 1 || index == 2)))
+                || matches!(&call.target, hir::CallTarget::Intrinsic(name) if name == "Path.new" || name == "Path.join" || name.starts_with("File.") || name.starts_with("Directory.") || name == "Database.open" || name == "DataStore.open" || ((name == "Database.execute" || name == "Database.query") && (index == 1 || index == 2)))
             {
                 Some(hir::ReceiverMode::Shared)
             } else {
@@ -1748,16 +1756,41 @@ pub fn validate(program: &Program) -> Result<(), Diagnostic> {
                     check_block(*otherwise)?;
                 }
                 Terminator::Call {
+                    target,
+                    arguments,
                     destination,
                     next,
                     unwind,
+                    span,
                     ..
                 } => {
-                    check_place(program, function, destination, function.span)?;
-                    if let Terminator::Call { arguments, .. } = &block.terminator {
-                        for argument in arguments {
-                            validate_operand(program, function, argument, function.span)?;
+                    check_place(program, function, destination, *span)?;
+                    for argument in arguments {
+                        validate_operand(program, function, argument, *span)?;
+                    }
+                    if let hir::CallTarget::Data(id) = target {
+                        let plan = program.data_plans.get(id.0).ok_or_else(|| {
+                            Diagnostic::new(
+                                DiagnosticKind::Internal,
+                                "MIR call targets a missing DISP Data plan",
+                                *span,
+                            )
+                        })?;
+                        if plan.schema.0 >= program.structs.len()
+                            || !program.structs[plan.schema.0].data
+                        {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Internal,
+                                "MIR DISP Data plan targets an invalid schema",
+                                *span,
+                            ));
                         }
+                        validate_data_plan(
+                            plan,
+                            arguments.len(),
+                            program.structs[plan.schema.0].fields.len(),
+                            *span,
+                        )?;
                     }
                     check_block(*next)?;
                     if let Some(x) = unwind {
@@ -1836,6 +1869,54 @@ pub fn validate(program: &Program) -> Result<(), Diagnostic> {
         }
     }
     Ok(())
+}
+
+fn validate_data_plan(
+    plan: &hir::DataPlan,
+    arguments: usize,
+    fields: usize,
+    span: Span,
+) -> Result<(), Diagnostic> {
+    fn check(expression: &hir::DataExpr, arguments: usize, fields: usize) -> bool {
+        match &expression.kind {
+            hir::DataExprKind::Parameter(index) => *index < arguments,
+            hir::DataExprKind::Unary(_, operand) => check(operand, arguments, fields),
+            hir::DataExprKind::Binary(_, left, right) => {
+                check(left, arguments, fields) && check(right, arguments, fields)
+            }
+            hir::DataExprKind::Field(index) => *index < fields,
+            hir::DataExprKind::Constant(_) => true,
+        }
+    }
+    let valid = match &plan.operation {
+        hir::DataOperation::Add { .. } => arguments == 2,
+        hir::DataOperation::Find {
+            predicate,
+            order,
+            limit_argument,
+        } => {
+            arguments >= 1
+                && predicate
+                    .as_ref()
+                    .is_none_or(|value| check(value, arguments, fields))
+                && order
+                    .as_ref()
+                    .is_none_or(|(value, _)| check(value, arguments, fields))
+                && limit_argument.is_none_or(|index| index < arguments)
+        }
+        hir::DataOperation::Remove { predicate } => {
+            arguments >= 1 && check(predicate, arguments, fields)
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(Diagnostic::new(
+            DiagnosticKind::Internal,
+            "MIR DISP Data plan has invalid operands",
+            span,
+        ))
+    }
 }
 fn check_local(function: &Function, local: LocalId, span: Span) -> Result<(), Diagnostic> {
     if local.0 >= function.locals.len() {

@@ -3215,6 +3215,183 @@ impl Drop for RuntimeDatabaseState {
     }
 }
 
+fn data_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn data_inner_type(ty: &TypeName) -> (&TypeName, bool) {
+    if ty.name == "Option" && ty.arguments.len() == 1 {
+        (&ty.arguments[0], true)
+    } else {
+        (ty, false)
+    }
+}
+
+fn data_sql_type(ty: &TypeName) -> &'static str {
+    match data_inner_type(ty).0.name.as_str() {
+        "f32" | "f64" | "float" => "REAL",
+        "String" | "char" => "TEXT",
+        _ => "INTEGER",
+    }
+}
+
+fn data_column_sql(field: &crate::ast::FieldDeclaration) -> String {
+    let (inner, optional) = data_inner_type(&field.ty);
+    let mut sql = format!(
+        "{} {}",
+        data_identifier(&field.name),
+        data_sql_type(&field.ty)
+    );
+    if !optional {
+        sql.push_str(" NOT NULL");
+    }
+    if inner.name == "bool" {
+        let name = data_identifier(&field.name);
+        sql.push_str(&format!(" CHECK ({name} IN (0,1))"));
+    }
+    if field.primary {
+        sql.push_str(" PRIMARY KEY");
+    }
+    sql
+}
+
+fn data_create_sql(schema: &crate::ast::StructDeclaration) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {} ({})",
+        data_identifier(&schema.name),
+        schema
+            .fields
+            .iter()
+            .map(data_column_sql)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn data_select_sql(schema: &crate::ast::StructDeclaration) -> String {
+    schema
+        .fields
+        .iter()
+        .map(|field| data_identifier(&field.name))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn data_json_integer(value: &RuntimeJson, context: &str) -> io::Result<i64> {
+    if value.kind != "number" {
+        return Err(io::Error::other(format!("{context} is not an integer")));
+    }
+    value
+        .text
+        .parse::<i64>()
+        .map_err(|_| io::Error::other(format!("{context} is not an integer")))
+}
+
+fn data_ensure_schema(
+    database: &RuntimeDatabase,
+    schema: &crate::ast::StructDeclaration,
+) -> io::Result<()> {
+    database.execute(&data_create_sql(schema), &[])?;
+    let pragma = format!("PRAGMA table_info({})", data_identifier(&schema.name));
+    let columns = database.query(&pragma, &[])?;
+    if columns.len() != schema.fields.len() {
+        return Err(io::Error::other(format!(
+            "stored `{}` layout does not match its DISP Data schema",
+            schema.name
+        )));
+    }
+    for (field, column) in schema.fields.iter().zip(columns) {
+        let entries = json_object_entries(&column)?;
+        let get = |name: &str| {
+            entries
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value)
+                .ok_or_else(|| io::Error::other("storage schema metadata is incomplete"))
+        };
+        let name = json_string_value(&get("name")?.text)?;
+        let storage = json_string_value(&get("type")?.text)?.to_ascii_uppercase();
+        let required = data_json_integer(get("notnull")?, "stored nullability")? != 0;
+        let primary = data_json_integer(get("pk")?, "stored primary marker")? != 0;
+        let optional = data_inner_type(&field.ty).1;
+        if name != field.name
+            || storage != data_sql_type(&field.ty)
+            || required == optional
+            || primary != field.primary
+        {
+            return Err(io::Error::other(format!(
+                "stored field `{}` is incompatible with its DISP Data schema",
+                field.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_data_value(ty: &TypeName, value: &RuntimeJson) -> io::Result<RuntimeJson> {
+    let (inner, optional) = data_inner_type(ty);
+    if optional && value.kind == "null" {
+        return Ok(value.clone());
+    }
+    match inner.name.as_str() {
+        "bool" => match data_json_integer(value, "stored bool")? {
+            0 => runtime_json("false".into()),
+            1 => runtime_json("true".into()),
+            _ => Err(io::Error::other("stored bool is outside 0 or 1")),
+        },
+        "int" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" => {
+            if value.kind == "number" && !value.text.contains(['.', 'e', 'E']) {
+                Ok(value.clone())
+            } else {
+                Err(io::Error::other("stored data field is not an integer"))
+            }
+        }
+        "f32" | "f64" | "float" if value.kind == "number" => Ok(value.clone()),
+        "String" | "char" if value.kind == "string" => Ok(value.clone()),
+        _ => Err(io::Error::other("stored data field has an invalid value")),
+    }
+}
+
+fn data_decode_rows(
+    program: &Program,
+    schema: &crate::ast::StructDeclaration,
+    rows: Vec<RuntimeJson>,
+) -> io::Result<Vec<Value>> {
+    let ty = TypeName {
+        name: schema.name.clone(),
+        arguments: vec![],
+        qualifier: TypeQualifier::Owned,
+        span: schema.name_span,
+    };
+    rows.into_iter()
+        .map(|row| {
+            let entries = json_object_entries(&row)?;
+            if entries.len() != schema.fields.len() {
+                return Err(io::Error::other(
+                    "stored row does not match its data schema",
+                ));
+            }
+            let mut normalized = String::from("{");
+            for (index, field) in schema.fields.iter().enumerate() {
+                let value = entries
+                    .iter()
+                    .find(|(name, _)| name == &field.name)
+                    .map(|(_, value)| value)
+                    .ok_or_else(|| io::Error::other("stored row is missing a data field"))?;
+                let value = normalize_data_value(&field.ty, value)?;
+                if index != 0 {
+                    normalized.push(',');
+                }
+                normalized.push_str(&json_escape_string(&field.name)?);
+                normalized.push(':');
+                normalized.push_str(&value.text);
+            }
+            normalized.push('}');
+            decode_json_value(program, &ty, &HashMap::new(), &runtime_json(normalized)?)
+        })
+        .collect()
+}
+
 const PROCESS_STREAM_LIMIT: usize = 16 * 1024 * 1024;
 
 #[derive(Default)]
@@ -4759,6 +4936,237 @@ impl Interpreter {
         }
     }
 
+    fn data_expression_sql(
+        &mut self,
+        program: &Program,
+        schema: &crate::ast::StructDeclaration,
+        expression: &Expr,
+        parameters: &mut Vec<RuntimeJson>,
+    ) -> RuntimeResult<String> {
+        match &expression.node {
+            Expression::Identifier(name)
+                if schema.fields.iter().any(|field| field.name == *name)
+                    && self.expression_place(expression).is_none() =>
+            {
+                Ok(data_identifier(name))
+            }
+            Expression::Unary { operator, operand } => {
+                let operand = self.data_expression_sql(program, schema, operand, parameters)?;
+                Ok(match operator {
+                    UnaryOperator::Not => format!("(NOT {operand})"),
+                    UnaryOperator::Negate => format!("(-{operand})"),
+                })
+            }
+            Expression::Binary {
+                left,
+                operator,
+                right,
+            } => {
+                let left = self.data_expression_sql(program, schema, left, parameters)?;
+                let right = self.data_expression_sql(program, schema, right, parameters)?;
+                let operator = match operator {
+                    BinaryOperator::Add => "+",
+                    BinaryOperator::Subtract => "-",
+                    BinaryOperator::Multiply => "*",
+                    BinaryOperator::Divide => "/",
+                    BinaryOperator::Remainder => "%",
+                    BinaryOperator::Equal => "=",
+                    BinaryOperator::NotEqual => "<>",
+                    BinaryOperator::Less => "<",
+                    BinaryOperator::LessEqual => "<=",
+                    BinaryOperator::Greater => ">",
+                    BinaryOperator::GreaterEqual => ">=",
+                    BinaryOperator::And => "AND",
+                    BinaryOperator::Or => "OR",
+                };
+                Ok(format!("({left} {operator} {right})"))
+            }
+            Expression::Integer(_)
+            | Expression::Float(_)
+            | Expression::String(_)
+            | Expression::Character(_)
+            | Expression::Bool(_)
+            | Expression::Identifier(_) => {
+                let value = self.evaluate(program, expression)?;
+                parameters.push(
+                    encode_json_value(program, &value)
+                        .map_err(|cause| self.error(cause.to_string(), expression.span))?,
+                );
+                Ok("?".into())
+            }
+            _ => Err(self.error(
+                "unsupported expression reached a DISP Data plan",
+                expression.span,
+            )),
+        }
+    }
+
+    fn evaluate_data_write(
+        &mut self,
+        program: &Program,
+        value: &Expr,
+        store: &Expr,
+        replace: bool,
+        span: Span,
+    ) -> RuntimeResult<Value> {
+        let Value::Database(database) = self.evaluate(program, store)? else {
+            unreachable!("type checking validates the DISP Data store")
+        };
+        let value = self.evaluate(program, value)?;
+        let Value::Struct { type_name, fields } = &value else {
+            unreachable!("type checking validates the DISP Data value")
+        };
+        let schema = program
+            .structs
+            .iter()
+            .find(|schema| schema.name == *type_name && schema.data)
+            .expect("type checking validates the DISP Data schema");
+        let result = (|| {
+            data_ensure_schema(&database, schema)?;
+            let names = data_select_sql(schema);
+            let placeholders = std::iter::repeat_n("?", schema.fields.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut sql = format!(
+                "INSERT INTO {} ({names}) VALUES ({placeholders})",
+                data_identifier(&schema.name)
+            );
+            if replace {
+                let primary = schema
+                    .fields
+                    .iter()
+                    .find(|field| field.primary)
+                    .expect("validated data schema has a primary field");
+                let primary_name = data_identifier(&primary.name);
+                let updates = schema
+                    .fields
+                    .iter()
+                    .filter(|field| !field.primary)
+                    .map(|field| {
+                        let name = data_identifier(&field.name);
+                        format!("{name}=excluded.{name}")
+                    })
+                    .collect::<Vec<_>>();
+                if updates.is_empty() {
+                    sql.push_str(&format!(" ON CONFLICT({primary_name}) DO NOTHING"));
+                } else {
+                    sql.push_str(&format!(
+                        " ON CONFLICT({primary_name}) DO UPDATE SET {}",
+                        updates.join(",")
+                    ));
+                }
+            }
+            let parameters = schema
+                .fields
+                .iter()
+                .map(|field| {
+                    fields
+                        .get(&field.name)
+                        .ok_or_else(|| io::Error::other("data value is missing a field"))
+                        .and_then(|value| encode_json_value(program, value))
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            database.execute(&sql, &parameters).map(Value::UInt)
+        })();
+        let _ = span;
+        Ok(runtime_result(result))
+    }
+
+    fn evaluate_data_query(
+        &mut self,
+        program: &Program,
+        schema_name: &str,
+        store: &Expr,
+        predicate: Option<&Expr>,
+        order: Option<&crate::ast::DataOrder>,
+        limit: Option<&Expr>,
+    ) -> RuntimeResult<Value> {
+        let Value::Database(database) = self.evaluate(program, store)? else {
+            unreachable!("type checking validates the DISP Data store")
+        };
+        let schema = program
+            .structs
+            .iter()
+            .find(|schema| schema.name == schema_name && schema.data)
+            .expect("type checking validates the DISP Data schema");
+        let mut parameters = Vec::new();
+        let predicate = predicate
+            .map(|value| self.data_expression_sql(program, schema, value, &mut parameters))
+            .transpose()?;
+        let order = order
+            .map(|value| {
+                self.data_expression_sql(program, schema, &value.key, &mut parameters)
+                    .map(|key| (key, value.descending))
+            })
+            .transpose()?;
+        let limit = limit
+            .map(|value| self.evaluate(program, value))
+            .transpose()?;
+        let result = (|| {
+            data_ensure_schema(&database, schema)?;
+            let mut sql = format!(
+                "SELECT {} FROM {}",
+                data_select_sql(schema),
+                data_identifier(&schema.name)
+            );
+            if let Some(predicate) = predicate {
+                sql.push_str(" WHERE ");
+                sql.push_str(&predicate);
+            }
+            if let Some((order, descending)) = order {
+                sql.push_str(" ORDER BY ");
+                sql.push_str(&order);
+                sql.push_str(if descending { " DESC" } else { " ASC" });
+            }
+            if let Some(value) = limit {
+                let amount = match value {
+                    Value::Int(value) if value >= 0 => value as u64,
+                    Value::UInt(value) => value,
+                    _ => return Err(io::Error::other("DISP Data limit is outside uint range")),
+                };
+                if amount > 100_000 {
+                    return Err(io::Error::other("DISP Data limit exceeds 100000 rows"));
+                }
+                sql.push_str(&format!(" LIMIT {amount}"));
+            }
+            let rows = database.query(&sql, &parameters)?;
+            let values = data_decode_rows(program, schema, rows)?;
+            Ok(Value::List {
+                capacity: values.len(),
+                values,
+            })
+        })();
+        Ok(runtime_result(result))
+    }
+
+    fn evaluate_data_remove(
+        &mut self,
+        program: &Program,
+        schema_name: &str,
+        store: &Expr,
+        predicate: &Expr,
+    ) -> RuntimeResult<Value> {
+        let Value::Database(database) = self.evaluate(program, store)? else {
+            unreachable!("type checking validates the DISP Data store")
+        };
+        let schema = program
+            .structs
+            .iter()
+            .find(|schema| schema.name == schema_name && schema.data)
+            .expect("type checking validates the DISP Data schema");
+        let mut parameters = Vec::new();
+        let predicate = self.data_expression_sql(program, schema, predicate, &mut parameters)?;
+        let result = (|| {
+            data_ensure_schema(&database, schema)?;
+            let sql = format!(
+                "DELETE FROM {} WHERE {predicate}",
+                data_identifier(&schema.name)
+            );
+            database.execute(&sql, &parameters).map(Value::UInt)
+        })();
+        Ok(runtime_result(result))
+    }
+
     fn evaluate(&mut self, program: &Program, expression: &Expr) -> RuntimeResult<Value> {
         match &expression.node {
             Expression::Integer(value) => {
@@ -4775,6 +5183,49 @@ impl Interpreter {
                 .map(|value| self.consume(program, value))
                 .collect::<Result<Vec<_>, _>>()
                 .map(Value::Array),
+            Expression::DataStore { path } => {
+                let result = if let Some(path) = path {
+                    let Value::Path(path) = self.evaluate(program, path)? else {
+                        unreachable!("type checking validates data store paths")
+                    };
+                    let path = path.to_str().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "data store path is not valid UTF-8",
+                        )
+                    });
+                    path.and_then(RuntimeDatabase::open)
+                } else {
+                    RuntimeDatabase::open(":memory:")
+                };
+                Ok(runtime_result(result.map(Value::Database)))
+            }
+            Expression::DataWrite {
+                value,
+                store,
+                replace,
+            } => self.evaluate_data_write(program, value, store, *replace, expression.span),
+            Expression::DataQuery {
+                schema,
+                store,
+                predicate,
+                order,
+                limit,
+                ..
+            } => self.evaluate_data_query(
+                program,
+                schema,
+                store,
+                predicate.as_deref(),
+                order.as_ref(),
+                limit.as_deref(),
+            ),
+            Expression::DataRemove {
+                schema,
+                store,
+                predicate,
+                ..
+            } => self.evaluate_data_remove(program, schema, store, predicate),
             Expression::Closure {
                 move_captures,
                 parameters,

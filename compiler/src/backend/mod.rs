@@ -86,7 +86,13 @@ pub fn build(
                     mir::Terminator::Call {
                         target: hir::CallTarget::Intrinsic(name),
                         ..
-                    } if name.starts_with("Database.")
+                    } if name.starts_with("Database.") || name.starts_with("DataStore.")
+                ) || matches!(
+                    &block.terminator,
+                    mir::Terminator::Call {
+                        target: hir::CallTarget::Data(_),
+                        ..
+                    }
                 )
             })
     });

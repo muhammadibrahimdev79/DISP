@@ -374,6 +374,51 @@ track one explicit transaction and reject nesting or completion without an activ
 transaction. `close()` consumes the connection. Dropping a live connection first rolls
 back an active transaction and then closes it, including compiler-generated error paths.
 
+## DISP Data language
+
+Persistent nominal records use `data`. Exactly one non-optional signed integer or
+`String` field is marked `primary`:
+
+```disp
+data User {
+    id: int primary
+    name: String
+    active: bool
+    note: Option<String>
+}
+```
+
+DISP Data operations are language expressions, not SQL strings or methods copied from
+a database API:
+
+```disp
+var store = data memory?
+data add User { id: 1, name: "Ada", active: true, note: None } in store?
+
+wanted = "Ada"
+users = data find User in store
+    where active && name == wanted
+    order id descending
+    limit 20?
+
+data save User { id: 1, name: "Ada Lovelace", active: true, note: None } in store?
+data remove User in store where id == 1?
+```
+
+Schema names, fields, condition types, ordering keys, limits, values, and store types
+are checked by the compiler. Conditions become typed HIR data expressions and plans;
+MIR carries a `DataPlanId` rather than embedded SQL. External values are evaluated once
+and bound as parameters. `remove` requires `where`, preventing an accidental unbounded
+delete in ordinary syntax. Limits are restricted to 100,000 rows.
+
+`data memory` creates an ephemeral store and `data open Path(...)` creates or opens a
+durable store. The current physical provider beneath both operations is the owned
+`Database` connection above. Native code
+generates prepared provider operations only after the DISP plan is checked. The
+interpreter executes the same semantics as a differential oracle. The public Data
+syntax and logical plans are provider-independent so future PostgreSQL and DISP-native
+engines do not require application queries to be rewritten.
+
 ## Collection loops
 
 ```disp

@@ -125,6 +125,37 @@ fn json_codec_types(
                     _ => {}
                 }
             }
+            if let mir::Terminator::Call {
+                target: hir::CallTarget::Data(plan),
+                arguments,
+                ..
+            } = &block.terminator
+            {
+                let plan = &program.data_plans[plan.0];
+                match &plan.operation {
+                    hir::DataOperation::Add { .. } => {
+                        for field in &program.structs[plan.schema.0].fields {
+                            collect_json_codec_types(program, &field.ty, &mut encoders);
+                        }
+                    }
+                    hir::DataOperation::Find { .. } => {
+                        for field in &program.structs[plan.schema.0].fields {
+                            collect_json_codec_types(program, &field.ty, &mut decoders);
+                        }
+                    }
+                    hir::DataOperation::Remove { .. } => {}
+                }
+                for argument in arguments.iter().skip(1) {
+                    let ty = operand_ty(program, function, argument, &mapping);
+                    let ty = match ty {
+                        hir::Type::Reference { inner, .. } => *inner,
+                        other => other,
+                    };
+                    if !matches!(&plan.operation, hir::DataOperation::Add { .. }) {
+                        collect_json_codec_types(program, &ty, &mut encoders);
+                    }
+                }
+            }
         }
     }
     (encoders, decoders)
@@ -1510,6 +1541,14 @@ fn terminator(
         } => {
             let destination_ty = place_ty(program, function, destination, substitutions);
             let call = match target {
+                hir::CallTarget::Data(plan) => data_call(
+                    program,
+                    function,
+                    *plan,
+                    arguments,
+                    &destination_ty,
+                    substitutions,
+                ),
                 hir::CallTarget::Intrinsic(name) if name == "Async.yield" => {
                     "disp_future_yield()".into()
                 }
@@ -2956,10 +2995,13 @@ fn terminator(
                     }
                 }
                 hir::CallTarget::Intrinsic(name)
-                    if matches!(name.as_str(), "Database.open" | "Database.memory") =>
+                    if matches!(
+                        name.as_str(),
+                        "Database.open" | "Database.memory" | "DataStore.open" | "DataStore.memory"
+                    ) =>
                 {
                     let result_c = native_types::c_type(&destination_ty);
-                    if name == "Database.open" {
+                    if matches!(name.as_str(), "Database.open" | "DataStore.open") {
                         let (path, _) =
                             system_argument(program, function, &arguments[0], substitutions);
                         format!(
@@ -4109,6 +4151,379 @@ fn native_key_equal(ty: &hir::Type, left: &str, right: &str) -> String {
             "(({left}).len==({right}).len&&((({left}).len==0)||memcmp(({left}).data,({right}).data,({left}).len)==0))"
         ),
         _ => format!("(({left})==({right}))"),
+    }
+}
+
+fn data_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn data_storage_type(ty: &hir::Type) -> &'static str {
+    let ty = if let hir::Type::Option(inner) = ty {
+        inner.as_ref()
+    } else {
+        ty
+    };
+    match ty {
+        hir::Type::Float { .. } => "REAL",
+        hir::Type::String | hir::Type::Char => "TEXT",
+        _ => "INTEGER",
+    }
+}
+
+fn data_create_sql(schema: &hir::Struct) -> String {
+    let fields = schema
+        .fields
+        .iter()
+        .map(|field| {
+            let optional = matches!(field.ty, hir::Type::Option(_));
+            let mut value = format!(
+                "{} {}",
+                data_identifier(&field.name),
+                data_storage_type(&field.ty)
+            );
+            if !optional {
+                value.push_str(" NOT NULL");
+            }
+            let inner = if let hir::Type::Option(inner) = &field.ty {
+                inner.as_ref()
+            } else {
+                &field.ty
+            };
+            if matches!(inner, hir::Type::Bool) {
+                let name = data_identifier(&field.name);
+                value.push_str(&format!(" CHECK ({name} IN (0,1))"));
+            }
+            if field.primary {
+                value.push_str(" PRIMARY KEY");
+            }
+            value
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "CREATE TABLE IF NOT EXISTS {} ({fields})",
+        data_identifier(&schema.name)
+    )
+}
+
+fn data_select_sql(schema: &hir::Struct) -> String {
+    schema
+        .fields
+        .iter()
+        .map(|field| data_identifier(&field.name))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn data_constant_sql(constant: &hir::Constant) -> String {
+    match constant {
+        hir::Constant::Signed(value, _) => value.to_string(),
+        hir::Constant::Unsigned(value, _) => value.to_string(),
+        hir::Constant::Float(value, _) => format!("{value:?}"),
+        hir::Constant::Bool(value) => if *value { "1" } else { "0" }.into(),
+        hir::Constant::Char(value) => format!("'{}'", value.to_string().replace('\'', "''")),
+        hir::Constant::String(value) => format!("'{}'", value.replace('\'', "''")),
+        hir::Constant::Unit => "NULL".into(),
+    }
+}
+
+fn data_expr_sql(expression: &hir::DataExpr, schema: &hir::Struct) -> String {
+    match &expression.kind {
+        hir::DataExprKind::Field(index) => data_identifier(&schema.fields[*index].name),
+        hir::DataExprKind::Parameter(_) => "?".into(),
+        hir::DataExprKind::Constant(value) => data_constant_sql(value),
+        hir::DataExprKind::Unary(operator, operand) => {
+            let operand = data_expr_sql(operand, schema);
+            match operator {
+                ast::UnaryOperator::Not => format!("(NOT {operand})"),
+                ast::UnaryOperator::Negate => format!("(-{operand})"),
+            }
+        }
+        hir::DataExprKind::Binary(operator, left, right) => {
+            let left = data_expr_sql(left, schema);
+            let right = data_expr_sql(right, schema);
+            let operator = match operator {
+                ast::BinaryOperator::Add => "+",
+                ast::BinaryOperator::Subtract => "-",
+                ast::BinaryOperator::Multiply => "*",
+                ast::BinaryOperator::Divide => "/",
+                ast::BinaryOperator::Remainder => "%",
+                ast::BinaryOperator::Equal => "=",
+                ast::BinaryOperator::NotEqual => "<>",
+                ast::BinaryOperator::Less => "<",
+                ast::BinaryOperator::LessEqual => "<=",
+                ast::BinaryOperator::Greater => ">",
+                ast::BinaryOperator::GreaterEqual => ">=",
+                ast::BinaryOperator::And => "AND",
+                ast::BinaryOperator::Or => "OR",
+            };
+            format!("({left} {operator} {right})")
+        }
+    }
+}
+
+fn data_parameters(expression: &hir::DataExpr, output: &mut Vec<usize>) {
+    match &expression.kind {
+        hir::DataExprKind::Parameter(index) => output.push(*index),
+        hir::DataExprKind::Unary(_, operand) => data_parameters(operand, output),
+        hir::DataExprKind::Binary(_, left, right) => {
+            data_parameters(left, output);
+            data_parameters(right, output);
+        }
+        hir::DataExprKind::Field(_) | hir::DataExprKind::Constant(_) => {}
+    }
+}
+
+fn data_decode_field(field: &hir::Field, row: &str, target: &str) -> String {
+    let key = escape(&field.name);
+    let get = format!(
+        "disp_native_json _field_{}={{0}};if(!disp_json_get({row},\"{key}\",{},&_field_{})){{const char *_message=\"stored row is missing a DISP Data field\";_error=disp_owned_bytes(_message,strlen(_message));_ok=false;}}",
+        field.index,
+        field.name.len(),
+        field.index
+    );
+    let decode = match &field.ty {
+        hir::Type::Bool => format!(
+            "if(_ok){{int64_t _boolean=0;if(!disp_json_as_int(&_field_{},&_boolean,&_error)||(_boolean!=0&&_boolean!=1)){{if(!_error.len){{const char *_message=\"stored bool is outside 0 or 1\";_error=disp_owned_bytes(_message,strlen(_message));}}_ok=false;}}else {target}=(_boolean!=0);}}",
+            field.index
+        ),
+        hir::Type::Option(inner) if matches!(inner.as_ref(), hir::Type::Bool) => format!(
+            "if(_ok){{if(!strcmp(disp_json_kind_name(&_field_{}),\"null\")){{{target}.tag=0;}}else{{int64_t _boolean=0;if(!disp_json_as_int(&_field_{},&_boolean,&_error)||(_boolean!=0&&_boolean!=1)){{if(!_error.len){{const char *_message=\"stored bool is outside 0 or 1\";_error=disp_owned_bytes(_message,strlen(_message));}}_ok=false;}}else{{{target}.tag=1;{target}.payload.v1.f0=(_boolean!=0);}}}}}}",
+            field.index, field.index
+        ),
+        ty => format!(
+            "if(_ok&&!{}(&_field_{},&({target}),&_error))_ok=false;",
+            json_decoder_name(ty),
+            field.index
+        ),
+    };
+    format!(
+        "{{{get}{decode}disp_json_drop(&_field_{});if(_ok)_field_done={};}}",
+        field.index,
+        field.index + 1
+    )
+}
+
+fn data_schema_guard(schema: &hir::Struct, database: &str) -> String {
+    let create = data_create_sql(schema);
+    let inspect = format!("PRAGMA table_info({})", data_identifier(&schema.name));
+    let names = schema
+        .fields
+        .iter()
+        .map(|field| format!("\"{}\"", escape(&field.name)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let types = schema
+        .fields
+        .iter()
+        .map(|field| format!("\"{}\"", data_storage_type(&field.ty)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let required = schema
+        .fields
+        .iter()
+        .map(|field| (!matches!(field.ty, hir::Type::Option(_))).to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let primary = schema
+        .fields
+        .iter()
+        .map(|field| field.primary.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "disp_data_ensure_schema(({database})->state,\"{}\",{},\"{}\",{},(const char*[]){{{names}}},(const char*[]){{{types}}},(bool[]){{{required}}},(bool[]){{{primary}}},{},&_error)",
+        escape(&create),
+        create.len(),
+        escape(&inspect),
+        inspect.len(),
+        schema.fields.len()
+    )
+}
+
+fn data_call(
+    program: &mir::Program,
+    function: &mir::Function,
+    plan: hir::DataPlanId,
+    arguments: &[mir::Operand],
+    destination: &hir::Type,
+    substitutions: &HashMap<String, hir::Type>,
+) -> String {
+    let plan = &program.data_plans[plan.0];
+    let schema = &program.structs[plan.schema.0];
+    let schema_ty = hir::Type::Struct(plan.schema, vec![]);
+    let result_c = native_types::c_type(destination);
+    let (database, _) = system_argument(program, function, &arguments[0], substitutions);
+    let guard = data_schema_guard(schema, &database);
+    match &plan.operation {
+        hir::DataOperation::Add { replace } => {
+            let (value, _) = system_argument(program, function, &arguments[1], substitutions);
+            let count = schema.fields.len();
+            let encoders = schema
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    format!(
+                        "if(_ok){{if(!{}(&({value}->f{index}),&_params[{index}],&_error))_ok=false;else _encoded++;}}",
+                        json_encoder_name(&field.ty)
+                    )
+                })
+                .collect::<String>();
+            let names = data_select_sql(schema);
+            let placeholders = std::iter::repeat_n("?", count)
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut sql = format!(
+                "INSERT INTO {} ({names}) VALUES ({placeholders})",
+                data_identifier(&schema.name)
+            );
+            if *replace {
+                let primary = schema
+                    .fields
+                    .iter()
+                    .find(|field| field.primary)
+                    .expect("validated data schema has a primary field");
+                let primary_name = data_identifier(&primary.name);
+                let updates = schema
+                    .fields
+                    .iter()
+                    .filter(|field| !field.primary)
+                    .map(|field| {
+                        let name = data_identifier(&field.name);
+                        format!("{name}=excluded.{name}")
+                    })
+                    .collect::<Vec<_>>();
+                if updates.is_empty() {
+                    sql.push_str(&format!(" ON CONFLICT({primary_name}) DO NOTHING"));
+                } else {
+                    sql.push_str(&format!(
+                        " ON CONFLICT({primary_name}) DO UPDATE SET {}",
+                        updates.join(",")
+                    ));
+                }
+            }
+            format!(
+                "({{{result_c} _r={{0}};disp_native_string _error={{0}};bool _ok={guard};disp_native_json _params[{}]={{{{0}}}};size_t _encoded=0;{encoders}uint64_t _changes=0;if(_ok)_ok=disp_database_execute(({database})->state,\"{}\",{},_params,{count},&_changes,&_error);for(size_t _i=0;_i<_encoded;_i++)disp_json_drop(&_params[_i]);if(_ok){{_r.tag=0;_r.payload.v0.f0=_changes;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})",
+                count.max(1),
+                escape(&sql),
+                sql.len()
+            )
+        }
+        hir::DataOperation::Find {
+            predicate,
+            order,
+            limit_argument,
+        } => {
+            let mut sql = format!(
+                "SELECT {} FROM {}",
+                data_select_sql(schema),
+                data_identifier(&schema.name)
+            );
+            let mut indices = Vec::new();
+            if let Some(predicate) = predicate {
+                sql.push_str(" WHERE ");
+                sql.push_str(&data_expr_sql(predicate, schema));
+                data_parameters(predicate, &mut indices);
+            }
+            if let Some((order, descending)) = order {
+                sql.push_str(" ORDER BY ");
+                sql.push_str(&data_expr_sql(order, schema));
+                sql.push_str(if *descending { " DESC" } else { " ASC" });
+                data_parameters(order, &mut indices);
+            }
+            if let Some(index) = limit_argument {
+                sql.push_str(" LIMIT ?");
+                indices.push(*index);
+            }
+            let encoders = indices
+                .iter()
+                .enumerate()
+                .map(|(parameter, argument)| {
+                    let (value, ty) =
+                        system_argument(program, function, &arguments[*argument], substitutions);
+                    format!(
+                        "if(_ok){{if(!{}({value},&_params[{parameter}],&_error))_ok=false;else _encoded++;}}",
+                        json_encoder_name(&ty)
+                    )
+                })
+                .collect::<String>();
+            let limit_check = limit_argument.map_or_else(String::new, |index| {
+                let (value, ty) =
+                    system_argument(program, function, &arguments[index], substitutions);
+                let invalid = match ty {
+                    hir::Type::Int { signed: true, .. } => {
+                        format!("((__int128)(*{value})<0||(unsigned __int128)(*{value})>100000)")
+                    }
+                    _ => format!("((unsigned __int128)(*{value})>100000)"),
+                };
+                format!("if(_ok&&{invalid}){{const char *_message=\"DISP Data limit must be between 0 and 100000\";_error=disp_owned_bytes(_message,strlen(_message));_ok=false;}}")
+            });
+            let parameter_count = indices.len();
+            let list_ty = hir::Type::List(Box::new(schema_ty.clone()));
+            let list_c = native_types::c_type(&list_ty);
+            let element_c = native_types::c_type(&schema_ty);
+            let decoders = schema
+                .fields
+                .iter()
+                .map(|field| {
+                    data_decode_field(
+                        field,
+                        "&_rows[_i]",
+                        &format!("_values.data[_i].f{}", field.index),
+                    )
+                })
+                .collect::<String>();
+            let partial_drops = schema
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    let drop = drop_value(
+                        program,
+                        &format!("_values.data[_i].f{}", field.index),
+                        &field.ty,
+                    );
+                    format!("if(_field_done>{index}){{{drop}}}")
+                })
+                .collect::<String>();
+            let drop_element = drop_value(program, "_values.data[_i]", &schema_ty);
+            format!(
+                "({{{result_c} _r={{0}};disp_native_string _error={{0}};bool _ok={guard};disp_native_json _params[{}]={{{{0}}}};size_t _encoded=0;{limit_check}{encoders}disp_native_json *_rows=NULL;size_t _rows_len=0,_rows_cap=0;if(_ok)_ok=disp_database_query(({database})->state,\"{}\",{},_params,{parameter_count},&_rows,&_rows_len,&_rows_cap,&_error);{list_c} _values={{0}};size_t _decoded=0;if(_ok&&_rows_len){{_values.data=({element_c}*)disp_alloc_zeroed(_rows_len,sizeof({element_c}),_Alignof({element_c}));_values.cap=_rows_len;}}if(_ok){{for(size_t _i=0;_i<_rows_len;_i++){{size_t _field_done=0;{decoders}if(!_ok){{{partial_drops}break;}}_decoded++;_values.len++;}}}}disp_database_rows_drop(_rows,_rows_len);for(size_t _i=0;_i<_encoded;_i++)disp_json_drop(&_params[_i]);if(_ok){{_r.tag=0;_r.payload.v0.f0=_values;}}else{{for(size_t _i=0;_i<_decoded;_i++){{{drop_element}}}disp_dealloc(_values.data);_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})",
+                parameter_count.max(1),
+                escape(&sql),
+                sql.len()
+            )
+        }
+        hir::DataOperation::Remove { predicate } => {
+            let mut indices = Vec::new();
+            data_parameters(predicate, &mut indices);
+            let encoders = indices
+                .iter()
+                .enumerate()
+                .map(|(parameter, argument)| {
+                    let (value, ty) =
+                        system_argument(program, function, &arguments[*argument], substitutions);
+                    format!(
+                        "if(_ok){{if(!{}({value},&_params[{parameter}],&_error))_ok=false;else _encoded++;}}",
+                        json_encoder_name(&ty)
+                    )
+                })
+                .collect::<String>();
+            let sql = format!(
+                "DELETE FROM {} WHERE {}",
+                data_identifier(&schema.name),
+                data_expr_sql(predicate, schema)
+            );
+            let count = indices.len();
+            format!(
+                "({{{result_c} _r={{0}};disp_native_string _error={{0}};bool _ok={guard};disp_native_json _params[{}]={{{{0}}}};size_t _encoded=0;{encoders}uint64_t _changes=0;if(_ok)_ok=disp_database_execute(({database})->state,\"{}\",{},_params,{count},&_changes,&_error);for(size_t _i=0;_i<_encoded;_i++)disp_json_drop(&_params[_i]);if(_ok){{_r.tag=0;_r.payload.v0.f0=_changes;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})",
+                count.max(1),
+                escape(&sql),
+                sql.len()
+            )
+        }
     }
 }
 

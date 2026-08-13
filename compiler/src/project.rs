@@ -1549,6 +1549,49 @@ impl<'a> Renamer<'a> {
                     self.rename_expr(&mut field.value);
                 }
             }
+            Expression::DataWrite { value, store, .. } => {
+                self.rename_expr(value);
+                self.rename_expr(store);
+            }
+            Expression::DataStore { path } => {
+                if let Some(path) = path {
+                    self.rename_expr(path);
+                }
+            }
+            Expression::DataQuery {
+                schema,
+                store,
+                predicate,
+                order,
+                limit,
+                ..
+            } => {
+                if let Some(definition) = self.namespace.get(schema) {
+                    *schema = definition.canonical.clone();
+                }
+                self.rename_expr(store);
+                if let Some(predicate) = predicate {
+                    self.rename_expr(predicate);
+                }
+                if let Some(order) = order {
+                    self.rename_expr(&mut order.key);
+                }
+                if let Some(limit) = limit {
+                    self.rename_expr(limit);
+                }
+            }
+            Expression::DataRemove {
+                schema,
+                store,
+                predicate,
+                ..
+            } => {
+                if let Some(definition) = self.namespace.get(schema) {
+                    *schema = definition.canonical.clone();
+                }
+                self.rename_expr(store);
+                self.rename_expr(predicate);
+            }
             Expression::FieldAccess { object, field, .. } => {
                 if let Expression::Identifier(owner) = &object.node
                     && !self.is_local(owner)

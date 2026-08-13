@@ -48,6 +48,7 @@ pub struct GenericParameter {
 pub struct StructDeclaration {
     pub name: String,
     pub name_span: Span,
+    pub data: bool,
     pub generics: Vec<GenericParameter>,
     pub fields: Vec<FieldDeclaration>,
     pub span: Span,
@@ -58,6 +59,7 @@ pub struct FieldDeclaration {
     pub name: String,
     pub name_span: Span,
     pub ty: TypeName,
+    pub primary: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -259,6 +261,28 @@ pub enum Expression {
     String(String),
     Character(char),
     Bool(bool),
+    DataStore {
+        path: Option<Box<Expr>>,
+    },
+    DataWrite {
+        value: Box<Expr>,
+        store: Box<Expr>,
+        replace: bool,
+    },
+    DataQuery {
+        schema: String,
+        schema_span: Span,
+        store: Box<Expr>,
+        predicate: Option<Box<Expr>>,
+        order: Option<DataOrder>,
+        limit: Option<Box<Expr>>,
+    },
+    DataRemove {
+        schema: String,
+        schema_span: Span,
+        store: Box<Expr>,
+        predicate: Box<Expr>,
+    },
     Closure {
         move_captures: bool,
         parameters: Vec<Parameter>,
@@ -314,6 +338,13 @@ pub enum Expression {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct DataOrder {
+    pub key: Box<Expr>,
+    pub descending: bool,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum ClosureBody {
     Expression(Box<Expr>),
     Block(Block),
@@ -326,7 +357,7 @@ pub struct StructFieldValue {
     pub value: Expr,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnaryOperator {
     Negate,
     Not,
@@ -341,7 +372,7 @@ pub enum AssignmentOperator {
     Divide,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinaryOperator {
     Add,
     Subtract,
@@ -559,6 +590,39 @@ fn collect_capture_expr(
             for field in fields {
                 collect_capture_expr(&field.value, CaptureMode::Consume, locals, captures);
             }
+        }
+        Expression::DataWrite { value, store, .. } => {
+            collect_capture_expr(value, CaptureMode::Read, locals, captures);
+            collect_capture_expr(store, CaptureMode::Read, locals, captures);
+        }
+        Expression::DataStore { path } => {
+            if let Some(path) = path {
+                collect_capture_expr(path, CaptureMode::Read, locals, captures);
+            }
+        }
+        Expression::DataQuery {
+            store,
+            predicate,
+            order,
+            limit,
+            ..
+        } => {
+            collect_capture_expr(store, CaptureMode::Read, locals, captures);
+            if let Some(predicate) = predicate {
+                collect_capture_expr(predicate, CaptureMode::Read, locals, captures);
+            }
+            if let Some(order) = order {
+                collect_capture_expr(&order.key, CaptureMode::Read, locals, captures);
+            }
+            if let Some(limit) = limit {
+                collect_capture_expr(limit, CaptureMode::Read, locals, captures);
+            }
+        }
+        Expression::DataRemove {
+            store, predicate, ..
+        } => {
+            collect_capture_expr(store, CaptureMode::Read, locals, captures);
+            collect_capture_expr(predicate, CaptureMode::Read, locals, captures);
         }
         Expression::FieldAccess { object, .. } => {
             collect_capture_expr(object, mode, locals, captures)

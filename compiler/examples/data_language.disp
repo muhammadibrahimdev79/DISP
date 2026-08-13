@@ -1,0 +1,39 @@
+data Scientist {
+    id: int primary
+    name: String
+    field: String
+    active: bool
+}
+
+fn demonstrate() -> Result<bool, DataError> {
+    var knowledge = data memory?
+
+    data add Scientist {
+        id: 1,
+        name: "Ada Lovelace",
+        field: "computing",
+        active: true,
+    } in knowledge?
+
+    data add Scientist {
+        id: 2,
+        name: "Marie Curie",
+        field: "physics",
+        active: true,
+    } in knowledge?
+
+    wanted = "physics"
+    scientists = data find Scientist in knowledge
+        where active && field == wanted
+        order name ascending
+        limit 10?
+
+    return Ok(scientists.len() == 1)
+}
+
+fn main() {
+    match demonstrate() {
+        Ok(value) => print(value),
+        Err(error) => print(error),
+    }
+}

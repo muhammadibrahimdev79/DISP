@@ -1,9 +1,9 @@
 use crate::ast::{
-    AssignmentOperator, BinaryOperator, BindingKind, Block, ClosureBody, EnumDeclaration, Expr,
-    Expression, ExternalAbi, ExternalFunction, FieldDeclaration, Function, FunctionSignature,
-    GenericParameter, Implementation, ImportDeclaration, ImportItem, MatchArm, ModuleDeclaration,
-    Parameter, Pattern, Program, Spanned, Statement, StructDeclaration, StructFieldValue,
-    TraitDeclaration, TypeName, TypeQualifier, UnaryOperator, VariantDeclaration,
+    AssignmentOperator, BinaryOperator, BindingKind, Block, ClosureBody, DataOrder,
+    EnumDeclaration, Expr, Expression, ExternalAbi, ExternalFunction, FieldDeclaration, Function,
+    FunctionSignature, GenericParameter, Implementation, ImportDeclaration, ImportItem, MatchArm,
+    ModuleDeclaration, Parameter, Pattern, Program, Spanned, Statement, StructDeclaration,
+    StructFieldValue, TraitDeclaration, TypeName, TypeQualifier, UnaryOperator, VariantDeclaration,
 };
 use crate::diagnostics::{Diagnostic, DiagnosticKind, Position, Span};
 use crate::lexer::{Token, TokenKind};
@@ -12,6 +12,7 @@ pub struct Parser {
     tokens: Vec<Token>,
     current: usize,
     recursion_depth: usize,
+    suppress_try: bool,
 }
 
 impl Parser {
@@ -28,6 +29,7 @@ impl Parser {
             tokens,
             current: 0,
             recursion_depth: 0,
+            suppress_try: false,
         }
     }
 
@@ -50,8 +52,8 @@ impl Parser {
                 imports.push(self.parse_import(public)?);
                 continue;
             }
-            if self.check(&TokenKind::Struct) {
-                let declaration = self.parse_struct()?;
+            if self.check(&TokenKind::Struct) || self.check(&TokenKind::Data) {
+                let declaration = self.parse_struct(self.check(&TokenKind::Data))?;
                 if public {
                     public_items.push(Spanned {
                         node: declaration.name.clone(),
@@ -206,19 +208,53 @@ impl Parser {
         Ok(path)
     }
 
-    fn parse_struct(&mut self) -> Result<StructDeclaration, Diagnostic> {
-        let start = self.expect(TokenKind::Struct, "expected `struct`")?.span;
-        let (name, name_span) = self.expect_identifier("expected struct name")?;
+    fn parse_struct(&mut self, data: bool) -> Result<StructDeclaration, Diagnostic> {
+        let start = self
+            .expect(
+                if data {
+                    TokenKind::Data
+                } else {
+                    TokenKind::Struct
+                },
+                if data {
+                    "expected `data`"
+                } else {
+                    "expected `struct`"
+                },
+            )?
+            .span;
+        let (name, name_span) = self.expect_identifier(if data {
+            "expected data schema name"
+        } else {
+            "expected struct name"
+        })?;
         let generics = self.parse_generic_parameters()?;
-        self.expect(TokenKind::LeftBrace, "expected `{` after struct name")?;
+        self.expect(
+            TokenKind::LeftBrace,
+            if data {
+                "expected `{` after data schema name"
+            } else {
+                "expected `{` after struct name"
+            },
+        )?;
         let mut fields = Vec::new();
         while !self.check(&TokenKind::RightBrace) && !self.check(&TokenKind::Eof) {
             let (field_name, field_span) = self.expect_identifier("expected field name")?;
             self.expect(TokenKind::Colon, "expected `:` after field name")?;
+            let ty = self.parse_type_name()?;
+            let primary = if data
+                && matches!(&self.peek().kind, TokenKind::Identifier(modifier) if modifier == "primary")
+            {
+                self.advance();
+                true
+            } else {
+                false
+            };
             fields.push(FieldDeclaration {
                 name: field_name,
                 name_span: field_span,
-                ty: self.parse_type_name()?,
+                ty,
+                primary,
             });
             self.match_token(&TokenKind::Comma);
         }
@@ -228,6 +264,7 @@ impl Parser {
         Ok(StructDeclaration {
             name,
             name_span,
+            data,
             generics,
             fields,
             span: start.through(end),
@@ -1275,7 +1312,7 @@ impl Parser {
                     },
                     span,
                 };
-            } else if self.match_token(&TokenKind::Question) {
+            } else if !self.suppress_try && self.match_token(&TokenKind::Question) {
                 let end = self.previous().span;
                 let span = expression.span.through(end);
                 expression = Spanned {
@@ -1299,6 +1336,7 @@ impl Parser {
             TokenKind::Character(value) => Expression::Character(value),
             TokenKind::True => Expression::Bool(true),
             TokenKind::False => Expression::Bool(false),
+            TokenKind::Data => return self.parse_data_expression(span),
             TokenKind::Or => return self.parse_closure(span, false, false),
             TokenKind::OrOr => return self.parse_closure(span, false, true),
             TokenKind::Identifier(name)
@@ -1342,6 +1380,141 @@ impl Parser {
             }
         };
         Ok(Spanned { node, span })
+    }
+
+    fn parse_data_expression(&mut self, start: Span) -> Result<Expr, Diagnostic> {
+        let (operation, operation_span) =
+            self.expect_identifier("expected a DISP Data operation")?;
+        match operation.as_str() {
+            "memory" => Ok(Spanned {
+                node: Expression::DataStore { path: None },
+                span: start.through(operation_span),
+            }),
+            "open" => {
+                let path = self.parse_data_part()?;
+                Ok(Spanned {
+                    span: start.through(path.span),
+                    node: Expression::DataStore {
+                        path: Some(Box::new(path)),
+                    },
+                })
+            }
+            "add" => self.parse_data_write(start, false),
+            "save" => self.parse_data_write(start, true),
+            "find" => self.parse_data_query(start),
+            "remove" => self.parse_data_remove(start),
+            _ => Err(Diagnostic::new(
+                DiagnosticKind::Parse,
+                format!("unknown DISP Data operation `{operation}`"),
+                operation_span,
+            )
+            .with_help("use `data memory`, `data open`, `data add`, `data save`, `data find`, or `data remove`")),
+        }
+    }
+
+    fn parse_data_write(&mut self, start: Span, replace: bool) -> Result<Expr, Diagnostic> {
+        let value = self.parse_data_part()?;
+        self.expect(TokenKind::In, "expected `in` and a data store")?;
+        let store = self.parse_data_part()?;
+        Ok(Spanned {
+            span: start.through(store.span),
+            node: Expression::DataWrite {
+                value: Box::new(value),
+                store: Box::new(store),
+                replace,
+            },
+        })
+    }
+
+    fn parse_data_query(&mut self, start: Span) -> Result<Expr, Diagnostic> {
+        let (schema, schema_span) =
+            self.expect_identifier("expected a data schema after `find`")?;
+        self.expect(TokenKind::In, "expected `in` and a data store")?;
+        let store = self.parse_data_part()?;
+        let predicate = if self.match_data_word("where") {
+            Some(Box::new(self.parse_data_part()?))
+        } else {
+            None
+        };
+        let order = if self.match_data_word("order") {
+            let order_start = self.previous().span;
+            let key = self.parse_data_part()?;
+            let descending = if self.match_data_word("descending") {
+                true
+            } else {
+                self.match_data_word("ascending");
+                false
+            };
+            let end = self.previous().span;
+            Some(DataOrder {
+                key: Box::new(key),
+                descending,
+                span: order_start.through(end),
+            })
+        } else {
+            None
+        };
+        let limit = if self.match_data_word("limit") {
+            Some(Box::new(self.parse_data_part()?))
+        } else {
+            None
+        };
+        let end = limit.as_ref().map_or_else(
+            || order.as_ref().map_or(store.span, |item| item.span),
+            |item| item.span,
+        );
+        Ok(Spanned {
+            span: start.through(end),
+            node: Expression::DataQuery {
+                schema,
+                schema_span,
+                store: Box::new(store),
+                predicate,
+                order,
+                limit,
+            },
+        })
+    }
+
+    fn parse_data_remove(&mut self, start: Span) -> Result<Expr, Diagnostic> {
+        let (schema, schema_span) =
+            self.expect_identifier("expected a data schema after `remove`")?;
+        self.expect(TokenKind::In, "expected `in` and a data store")?;
+        let store = self.parse_data_part()?;
+        if !self.match_data_word("where") {
+            return Err(Diagnostic::new(
+                DiagnosticKind::Parse,
+                "`remove` requires `where` so all rows cannot be deleted accidentally",
+                self.peek().span,
+            ));
+        }
+        let predicate = self.parse_data_part()?;
+        Ok(Spanned {
+            span: start.through(predicate.span),
+            node: Expression::DataRemove {
+                schema,
+                schema_span,
+                store: Box::new(store),
+                predicate: Box::new(predicate),
+            },
+        })
+    }
+
+    fn parse_data_part(&mut self) -> Result<Expr, Diagnostic> {
+        let previous = self.suppress_try;
+        self.suppress_try = true;
+        let result = self.parse_expression();
+        self.suppress_try = previous;
+        result
+    }
+
+    fn match_data_word(&mut self, expected: &str) -> bool {
+        if matches!(&self.peek().kind, TokenKind::Identifier(value) if value == expected) {
+            self.advance();
+            true
+        } else {
+            false
+        }
     }
 
     fn parse_closure(

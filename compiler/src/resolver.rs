@@ -2,7 +2,7 @@ use crate::ast::{
     BindingKind, Block, Expr, Expression, Pattern, Program, Statement, TypeName, TypeQualifier,
 };
 use crate::diagnostics::{Diagnostic, DiagnosticKind, Span};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SymbolId(usize);
@@ -40,6 +40,7 @@ pub struct Resolver {
     variants: HashMap<String, Vec<(String, SymbolId)>>,
     scopes: Vec<HashMap<String, SymbolId>>,
     loop_depth: usize,
+    data_fields: HashMap<String, HashSet<String>>,
 }
 
 impl Resolver {
@@ -53,6 +54,7 @@ impl Resolver {
             variants: HashMap::new(),
             scopes: Vec::new(),
             loop_depth: 0,
+            data_fields: HashMap::new(),
         };
         for builtin in [
             "print", "Some", "None", "Ok", "Err", "i8", "i16", "i32", "i64", "i128", "u8", "u16",
@@ -98,6 +100,16 @@ impl Resolver {
                     .map(|field| (&field.name, field.name_span))
                     .collect::<Vec<_>>(),
             )?;
+            if declaration.data {
+                self.data_fields.insert(
+                    declaration.name.clone(),
+                    declaration
+                        .fields
+                        .iter()
+                        .map(|field| field.name.clone())
+                        .collect(),
+                );
+            }
         }
         for declaration in &program.enums {
             self.declare_type(
@@ -395,6 +407,59 @@ impl Resolver {
                 }
                 Ok(())
             }
+            Expression::DataWrite { value, store, .. } => {
+                self.resolve_expression(value)?;
+                self.resolve_expression(store)
+            }
+            Expression::DataStore { path } => {
+                if let Some(path) = path {
+                    self.resolve_expression(path)?;
+                }
+                Ok(())
+            }
+            Expression::DataQuery {
+                schema,
+                schema_span,
+                store,
+                predicate,
+                order,
+                limit,
+            } => {
+                let fields = self.data_fields.get(schema).cloned().ok_or_else(|| {
+                    Diagnostic::new(
+                        DiagnosticKind::Resolve,
+                        format!("unknown data schema `{schema}`"),
+                        *schema_span,
+                    )
+                })?;
+                self.resolve_expression(store)?;
+                if let Some(predicate) = predicate {
+                    self.resolve_data_expression(predicate, &fields)?;
+                }
+                if let Some(order) = order {
+                    self.resolve_data_expression(&order.key, &fields)?;
+                }
+                if let Some(limit) = limit {
+                    self.resolve_expression(limit)?;
+                }
+                Ok(())
+            }
+            Expression::DataRemove {
+                schema,
+                schema_span,
+                store,
+                predicate,
+            } => {
+                let fields = self.data_fields.get(schema).cloned().ok_or_else(|| {
+                    Diagnostic::new(
+                        DiagnosticKind::Resolve,
+                        format!("unknown data schema `{schema}`"),
+                        *schema_span,
+                    )
+                })?;
+                self.resolve_expression(store)?;
+                self.resolve_data_expression(predicate, &fields)
+            }
             Expression::Closure {
                 parameters,
                 return_type,
@@ -575,6 +640,35 @@ impl Resolver {
             | Expression::String(_)
             | Expression::Character(_)
             | Expression::Bool(_) => Ok(()),
+        }
+    }
+
+    fn resolve_data_expression(
+        &mut self,
+        expression: &Expr,
+        fields: &HashSet<String>,
+    ) -> Result<(), Diagnostic> {
+        match &expression.node {
+            Expression::Identifier(name) if fields.contains(name) && self.lookup(name).is_none() => {
+                Ok(())
+            }
+            Expression::Unary { operand, .. } => self.resolve_data_expression(operand, fields),
+            Expression::Binary { left, right, .. } => {
+                self.resolve_data_expression(left, fields)?;
+                self.resolve_data_expression(right, fields)
+            }
+            Expression::Integer(_)
+            | Expression::Float(_)
+            | Expression::String(_)
+            | Expression::Character(_)
+            | Expression::Bool(_) => Ok(()),
+            Expression::Identifier(_) => self.resolve_expression(expression),
+            _ => Err(Diagnostic::new(
+                DiagnosticKind::Resolve,
+                "DISP Data conditions allow schema fields, values, comparisons, and boolean logic",
+                expression.span,
+            )
+            .with_help("compute complex values before the data operation, then use the result as a parameter")),
         }
     }
 
