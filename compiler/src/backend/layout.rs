@@ -181,6 +181,10 @@ impl<'a> LayoutEngine<'a> {
                 8,
                 1,
             ]),
+            hir::Type::ChildProcess => scalar(
+                u64::from(self.target.pointer_width) / 8,
+                self.target.pointer_alignment,
+            ),
             hir::Type::ProcessOutput => aggregate(&[
                 8,
                 self.target.pointer_alignment,

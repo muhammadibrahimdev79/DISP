@@ -46,6 +46,7 @@ pub enum Type {
     Instant,
     Duration,
     ProcessCommand,
+    ChildProcess,
     ProcessOutput,
     Array(Box<Type>, usize),
     Slice(Box<Type>),
@@ -116,6 +117,7 @@ impl Type {
             | Self::MutexGuard(_)
             | Self::AtomicInt
             | Self::ProcessCommand
+            | Self::ChildProcess
             | Self::ProcessOutput
             | Self::Generic(_)
             | Self::Function(_, _)
@@ -783,6 +785,7 @@ impl<'a> Lowering<'a> {
             "Path" => Type::Path,
             "ProcessOutput" => Type::ProcessOutput,
             "ProcessCommand" => Type::ProcessCommand,
+            "ChildProcess" => Type::ChildProcess,
             "Url" => Type::Url,
             "Json" => Type::Json,
             "IpAddress" => Type::IpAddress,
@@ -2557,6 +2560,11 @@ impl FunctionLowering<'_, '_> {
                         Box::new(Type::ProcessOutput),
                         Box::new(Type::Generic("IoError".into())),
                     )
+                } else if field == "start" {
+                    Type::Result(
+                        Box::new(Type::ChildProcess),
+                        Box::new(Type::Generic("IoError".into())),
+                    )
                 } else {
                     Type::ProcessCommand
                 };
@@ -2565,6 +2573,51 @@ impl FunctionLowering<'_, '_> {
                         target: CallTarget::Intrinsic(format!("ProcessCommand.{field}")),
                         arguments: args,
                         receiver: Some(ReceiverMode::Move),
+                        substitutions: vec![],
+                    }),
+                    ty,
+                    span,
+                });
+            }
+            if matches!(receiver.ty, Type::ChildProcess) {
+                let mut args = vec![receiver];
+                args.extend(
+                    arguments
+                        .iter()
+                        .map(|x| self.lower_expr(x))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+                let io = Type::Generic("IoError".into());
+                let ty = match field.as_str() {
+                    "write" | "write_text" | "close_input" | "kill" => {
+                        Type::Result(Box::new(Type::Unit), Box::new(io))
+                    }
+                    "read_stdout" | "read_stderr" => Type::Result(
+                        Box::new(Type::List(Box::new(Type::Int {
+                            signed: false,
+                            width: Some(8),
+                        }))),
+                        Box::new(io),
+                    ),
+                    "try_wait" => Type::Result(
+                        Box::new(Type::Option(Box::new(Type::Int {
+                            signed: true,
+                            width: None,
+                        }))),
+                        Box::new(io),
+                    ),
+                    "wait" => Type::Result(Box::new(Type::ProcessOutput), Box::new(io)),
+                    _ => Type::Unit,
+                };
+                return Ok(Expr {
+                    kind: ExprKind::Call(Call {
+                        target: CallTarget::Intrinsic(format!("ChildProcess.{field}")),
+                        arguments: args,
+                        receiver: Some(if field == "wait" {
+                            ReceiverMode::Move
+                        } else {
+                            ReceiverMode::Mutable
+                        }),
                         substitutions: vec![],
                     }),
                     ty,
@@ -3997,6 +4050,7 @@ fn surface_type_is_copy(ty: &Type) -> bool {
         | Type::Memory
         | Type::Path
         | Type::ProcessCommand
+        | Type::ChildProcess
         | Type::ProcessOutput
         | Type::Url
         | Type::Json

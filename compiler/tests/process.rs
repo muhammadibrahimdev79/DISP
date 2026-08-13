@@ -341,3 +341,285 @@ fn main() {
 "#;
     differential_with_args("environment-validation", source, &[]);
 }
+
+#[test]
+fn streaming_child_process_io_wait_and_status_are_differential() {
+    #[cfg(windows)]
+    let source = r#"
+fn stream() -> Result<bool, IoError> {
+    c0 = Process.command(Path("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"))
+    c1 = c0.arg("-NoProfile")
+    c2 = c1.arg("-NonInteractive")
+    c3 = c2.arg("-Command")
+    c4 = c3.arg("$a=[Console]::In.ReadLine(); [Console]::Out.Write('A:'+$a); [Console]::Error.Write('E'); $b=[Console]::In.ReadLine(); [Console]::Out.Write(':B:'+$b)")
+    c5 = c4.timeout(Duration.from_seconds(5))
+    var child = c5.start()?
+    text = "one\n"
+    let text_view: &str = &text
+    child.write_text(*text_view)?
+    first = child.read_stdout(5)?
+    running = match child.try_wait()? { Some(status) => false, None => true }
+    bytes = [u8(116), u8(119), u8(111), u8(10)]
+    let byte_view: &[u8] = &bytes[0..4]
+    child.write(*byte_view)?
+    child.close_input()?
+    closed = match child.write_text("late") { Ok(value) => false, Err(error) => true }
+    errors = child.read_stderr(8)?
+    output = child.wait()?
+    remaining = output.stdout()
+    return Ok(running && closed && first.len() == 5 && errors.len() == 1 && output.success() && remaining.len() == 6)
+}
+fn main() { print(match stream() { Ok(value) => value, Err(error) => false }) }
+"#;
+    #[cfg(not(windows))]
+    let source = r#"
+fn stream() -> Result<bool, IoError> {
+    c0 = Process.command(Path("/bin/sh"))
+    c1 = c0.arg("-c")
+    c2 = c1.arg("read a; printf 'A:%s' \"$a\"; printf E >&2; read b; printf ':B:%s' \"$b\"")
+    c3 = c2.timeout(Duration.from_seconds(5))
+    var child = c3.start()?
+    text = "one\n"
+    let text_view: &str = &text
+    child.write_text(*text_view)?
+    first = child.read_stdout(5)?
+    running = match child.try_wait()? { Some(status) => false, None => true }
+    bytes = [u8(116), u8(119), u8(111), u8(10)]
+    let byte_view: &[u8] = &bytes[0..4]
+    child.write(*byte_view)?
+    child.close_input()?
+    closed = match child.write_text("late") { Ok(value) => false, Err(error) => true }
+    errors = child.read_stderr(8)?
+    output = child.wait()?
+    remaining = output.stdout()
+    return Ok(running && closed && first.len() == 5 && errors.len() == 1 && output.success() && remaining.len() == 6)
+}
+
+fn main() { print(match stream() { Ok(value) => value, Err(error) => false }) }
+"#;
+    differential_with_args("streaming", source, &[]);
+}
+
+#[test]
+fn child_start_configuration_failures_are_typed_and_differential() {
+    let source = r#"
+fn main() {
+    result = Process.command(Path("")).start()
+    print(match result { Ok(child) => false, Err(error) => true })
+}
+"#;
+    differential_with_args("start-invalid", source, &[]);
+
+    let arity = check_source("fn main() { Process.command(Path(\"x\")).start(1) }").unwrap_err();
+    assert!(arity.message.contains("method") || arity.message.contains("start"));
+    assert_eq!((arity.span.start.line, arity.span.start.column), (1, 13));
+}
+
+#[test]
+fn child_process_is_linear_mutable_and_has_pointer_layout() {
+    let immutable = check_source(
+        r#"fn test() -> Result<Unit, IoError> {
+            command=Process.command(Path("x"))
+            let child=command.start()?
+            return child.close_input()
+        }
+        fn main() {}"#,
+    )
+    .unwrap_err();
+    assert!(immutable.message.contains("mutable"), "{immutable}");
+    assert_eq!(
+        (immutable.span.start.line, immutable.span.start.column),
+        (4, 20)
+    );
+
+    let moved = check_source(
+        r#"fn use_child() -> Result<Unit, IoError> {
+            var child=Process.command(Path("x")).start()?
+            output=child.wait()
+            return child.kill()
+        }
+        fn main() {}"#,
+    )
+    .unwrap_err();
+    assert!(moved.message.contains("moved"), "{moved}");
+    assert_eq!((moved.span.start.line, moved.span.start.column), (4, 20));
+
+    let moved_through_try = check_source(
+        r#"fn use_child() -> Result<Unit, IoError> {
+            var child=Process.command(Path("x")).start()?
+            output=child.wait()?
+            return child.kill()
+        }
+        fn main() {}"#,
+    )
+    .unwrap_err();
+    assert!(
+        moved_through_try.message.contains("moved"),
+        "{moved_through_try}"
+    );
+    assert_eq!(
+        (
+            moved_through_try.span.start.line,
+            moved_through_try.span.start.column
+        ),
+        (4, 20)
+    );
+
+    let wrong = check_source(
+        r#"fn use_child() -> Result<int, IoError> {
+            var child=Process.command(Path("x")).start()?
+            child.write(1)?
+            return Ok(0)
+        }
+        fn main() {}"#,
+    )
+    .unwrap_err();
+    assert!(wrong.message.contains("List<u8>"), "{wrong}");
+    assert_eq!((wrong.span.start.line, wrong.span.start.column), (3, 25));
+
+    let ir_source = r#"
+fn inspect() -> Result<int, IoError> {
+    var child=Process.command(Path("x")).start()?
+    running=child.try_wait()?
+    child.close_input()?
+    output=child.wait()?
+    return Ok(output.status())
+}
+fn main() {}
+"#;
+    let (ir_hir, ir_mir) = lower_source(ir_source).unwrap();
+    let hir_text = format!("{:?}", ir_hir.functions);
+    assert!(hir_text.contains("ChildProcess.try_wait"));
+    assert!(hir_text.contains("ChildProcess.close_input"));
+    assert!(hir_text.contains("ChildProcess.wait"));
+    assert!(hir_text.contains("receiver: Some(Mutable)"));
+    assert!(hir_text.contains("receiver: Some(Move)"));
+    let mir_intrinsics = ir_mir
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .filter_map(|block| match &block.terminator {
+            disp::mir::Terminator::Call {
+                target: disp::hir::CallTarget::Intrinsic(name),
+                ..
+            } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for intrinsic in [
+        "ProcessCommand.start",
+        "ChildProcess.try_wait",
+        "ChildProcess.close_input",
+        "ChildProcess.wait",
+    ] {
+        assert!(mir_intrinsics.contains(&intrinsic), "missing {intrinsic}");
+    }
+
+    let (hir, _) = lower_source("fn main() {}").unwrap();
+    let target = Target::host().unwrap();
+    let mut layouts = LayoutEngine::new(target, &hir);
+    let layout = layouts.layout(&disp::hir::Type::ChildProcess).unwrap();
+    assert_eq!((layout.size, layout.align), (8, 8));
+    assert_eq!(
+        abi::classify(&disp::hir::Type::ChildProcess, &layout, target),
+        abi::PassMode::Direct
+    );
+}
+
+#[test]
+fn child_kill_timeout_and_drop_cleanup_are_differential() {
+    let marker = std::env::temp_dir().join(format!(
+        "disp-child-drop-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = fs::remove_file(&marker);
+    let marker = marker.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    let source = format!(
+        r#"
+fn killed() -> Result<bool, IoError> {{
+    c0=Process.command(Path("C:/Windows/System32/ping.exe"))
+    c1=c0.arg("-n")
+    c2=c1.arg("6")
+    c3=c2.arg("127.0.0.1")
+    var child=c3.start()?
+    child.kill()?
+    stopped=match child.try_wait()? {{ Some(status) => status != 0, None => false }}
+    output=child.wait()?
+    return Ok(stopped && !output.success())
+}}
+fn timed() -> bool {{
+    c0=Process.command(Path("C:/Windows/System32/ping.exe"))
+    c1=c0.arg("-n")
+    c2=c1.arg("6")
+    c3=c2.arg("127.0.0.1")
+    c4=c3.timeout(Duration.from_millis(1))
+    var child=c4.start()
+    return match child {{
+        Ok(running) => match running.wait() {{ Ok(output) => false, Err(error) => true }}
+        Err(error) => true
+    }}
+}}
+fn launch() -> Result<Unit, IoError> {{
+    c0=Process.command(Path("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"))
+    c1=c0.arg("-NoProfile")
+    c2=c1.arg("-NonInteractive")
+    c3=c2.arg("-Command")
+    c4=c3.arg("Start-Sleep -Milliseconds 500; [IO.File]::WriteAllText('{marker}','bad')")
+    var child=c4.start()?
+    return child.close_input()
+}}
+fn main() {{
+    print(match killed() {{ Ok(value) => value, Err(error) => false }})
+    print(timed())
+    launched=launch()
+    Time.sleep(Duration.from_seconds(1))
+    print(File.exists(Path("{marker}")))
+}}
+"#
+    );
+    #[cfg(not(windows))]
+    let source = format!(
+        r#"
+fn killed() -> Result<bool, IoError> {{
+    c0=Process.command(Path("/bin/sleep"))
+    c1=c0.arg("5")
+    var child=c1.start()?
+    child.kill()?
+    stopped=match child.try_wait()? {{ Some(status) => status != 0, None => false }}
+    output=child.wait()?
+    return Ok(stopped && !output.success())
+}}
+fn timed() -> bool {{
+    c0=Process.command(Path("/bin/sleep"))
+    c1=c0.arg("5")
+    c2=c1.timeout(Duration.from_millis(1))
+    result=c2.start()
+    return match result {{
+        Ok(running) => match running.wait() {{ Ok(output) => false, Err(error) => true }}
+        Err(error) => true
+    }}
+}}
+fn launch() -> Result<Unit, IoError> {{
+    c0=Process.command(Path("/bin/sh"))
+    c1=c0.arg("-c")
+    c2=c1.arg("sleep 1; printf bad > '{marker}'")
+    var child=c2.start()?
+    return child.close_input()
+}}
+fn main() {{
+    print(match killed() {{ Ok(value) => value, Err(error) => false }})
+    print(timed())
+    launched=launch()
+    Time.sleep(Duration.from_seconds(2))
+    print(File.exists(Path("{marker}")))
+}}
+"#
+    );
+    differential_with_args("child-lifecycle", &source, &[]);
+    assert!(!std::path::Path::new(&marker).exists());
+}

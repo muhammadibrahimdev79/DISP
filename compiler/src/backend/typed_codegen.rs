@@ -1050,6 +1050,7 @@ pub fn supported(program: &mir::Program, ty: &hir::Type) -> bool {
         | hir::Type::Instant
         | hir::Type::Duration
         | hir::Type::ProcessCommand
+        | hir::Type::ChildProcess
         | hir::Type::ProcessOutput
         | hir::Type::Int { .. }
         | hir::Type::Float { .. } => true,
@@ -2972,12 +2973,18 @@ fn terminator(
                     let command_ty = operand_ty(program, function, &arguments[0], substitutions);
                     let command =
                         operand(program, function, &arguments[0], &command_ty, substitutions);
-                    if name == "ProcessCommand.run" {
+                    if matches!(name.as_str(), "ProcessCommand.run" | "ProcessCommand.start") {
                         let result_c = native_types::c_type(&destination_ty);
                         let command_c = native_types::c_type(&hir::Type::ProcessCommand);
-                        format!(
-                            "({{{command_c} _c={command};{result_c} _r={{0}};disp_native_process_output _output={{0}};disp_native_string _error={{0}};if(disp_process_run_command(&_c,&_output,&_error)){{_r.tag=0;_r.payload.v0.f0=_output;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}disp_process_command_drop(&_c);_r;}})"
-                        )
+                        if name == "ProcessCommand.run" {
+                            format!(
+                                "({{{command_c} _c={command};{result_c} _r={{0}};disp_native_process_output _output={{0}};disp_native_string _error={{0}};if(disp_process_run_command(&_c,&_output,&_error)){{_r.tag=0;_r.payload.v0.f0=_output;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}disp_process_command_drop(&_c);_r;}})"
+                            )
+                        } else {
+                            format!(
+                                "({{{command_c} _c={command};{result_c} _r={{0}};disp_native_child_process _child={{0}};disp_native_string _error={{0}};if(disp_process_start_command(&_c,&_child,&_error)){{_r.tag=0;_r.payload.v0.f0=_child;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}disp_process_command_drop(&_c);_r;}})"
+                            )
+                        }
                     } else {
                         let reserve_args = "size_t _need=_c.args_len+1;if(_need>DISP_PROCESS_MAX_ARGUMENTS)dv_panic(\"process argument count exceeds 4096\",0,0);if(_need>_c.args_cap){size_t _cap=_c.args_cap?_c.args_cap*2:4;if(_cap<_need)_cap=_need;_c.args=(disp_native_string*)disp_realloc(_c.args,_cap*sizeof(disp_native_string),_Alignof(disp_native_string));_c.args_cap=_cap;}";
                         let result = match name.as_str() {
@@ -3135,6 +3142,69 @@ fn terminator(
                             "({{{} _c={command};{result}_c;}})",
                             native_types::c_type(&hir::Type::ProcessCommand)
                         )
+                    }
+                }
+                hir::CallTarget::Intrinsic(name) if name.starts_with("ChildProcess.") => {
+                    let (child, _) =
+                        system_argument(program, function, &arguments[0], substitutions);
+                    let result_c = native_types::c_type(&destination_ty);
+                    match name.as_str() {
+                        "ChildProcess.write" => {
+                            let bytes_ty =
+                                operand_ty(program, function, &arguments[1], substitutions);
+                            let bytes =
+                                operand(program, function, &arguments[1], &bytes_ty, substitutions);
+                            format!(
+                                "({{{result_c} _r={{0}};disp_native_string _error={{0}};if(disp_child_write(({child})->state,(const uint8_t*)({bytes}).data,({bytes}).len,&_error)){{_r.tag=0;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                            )
+                        }
+                        "ChildProcess.write_text" => {
+                            let (text, _) =
+                                system_argument(program, function, &arguments[1], substitutions);
+                            format!(
+                                "({{{result_c} _r={{0}};disp_native_string _error={{0}};if(disp_child_write(({child})->state,(const uint8_t*)({text})->data,({text})->len,&_error)){{_r.tag=0;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                            )
+                        }
+                        "ChildProcess.close_input" => format!(
+                            "({{{result_c} _r={{0}};disp_child_close_input(({child})->state);_r.tag=0;_r;}})"
+                        ),
+                        "ChildProcess.read_stdout" | "ChildProcess.read_stderr" => {
+                            let limit_ty =
+                                operand_ty(program, function, &arguments[1], substitutions);
+                            let limit =
+                                operand(program, function, &arguments[1], &limit_ty, substitutions);
+                            let (limit_c, invalid) =
+                                if matches!(limit_ty, hir::Type::Int { signed: true, .. }) {
+                                    ("__int128", "_limit<0||_limit>16777216")
+                                } else {
+                                    ("unsigned __int128", "_limit>16777216")
+                                };
+                            let hir::Type::Result(value, _) = &destination_ty else {
+                                unreachable!()
+                            };
+                            let list_c = native_types::c_type(value);
+                            let stdout = name == "ChildProcess.read_stdout";
+                            format!(
+                                "({{{limit_c} _limit=({limit_c})({limit});if({invalid})dv_panic(\"child-process read limit exceeds 16 MiB\",{},{});{result_c} _r={{0}};uint8_t *_data=NULL;size_t _len=0;disp_native_string _error={{0}};if(disp_child_read(({child})->state,{stdout},(size_t)_limit,&_data,&_len,&_error)){{_r.tag=0;_r.payload.v0.f0=({list_c}){{.data=_data,.len=_len,.cap=_len}};}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})",
+                                span.start.line, span.start.column
+                            )
+                        }
+                        "ChildProcess.try_wait" => format!(
+                            "({{{result_c} _r={{0}};disp_native_string _error={{0}};if(disp_child_update(({child})->state,false,&_error)){{_r.tag=0;if(({child})->state->complete){{_r.payload.v0.f0.tag=1;_r.payload.v0.f0.payload.v1.f0=({child})->state->status;}}}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                        ),
+                        "ChildProcess.kill" => format!(
+                            "({{{result_c} _r={{0}};disp_native_string _error={{0}};if(disp_child_kill(({child})->state,&_error)){{_r.tag=0;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                        ),
+                        "ChildProcess.wait" => {
+                            let child_ty =
+                                operand_ty(program, function, &arguments[0], substitutions);
+                            let child_value =
+                                operand(program, function, &arguments[0], &child_ty, substitutions);
+                            format!(
+                                "({{disp_native_child_process _child={child_value};{result_c} _r={{0}};disp_native_process_output _output={{0}};disp_native_string _error={{0}};if(disp_child_wait_output(_child.state,&_output,&_error)){{_r.tag=0;_r.payload.v0.f0=_output;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}disp_child_drop(&_child);_r;}})"
+                            )
+                        }
+                        _ => unreachable!(),
                     }
                 }
                 hir::CallTarget::Intrinsic(name) if name.starts_with("ProcessOutput.") => {
@@ -4486,6 +4556,7 @@ fn to_dv(value: &str, ty: &hir::Type) -> String {
         }
         hir::Type::ProcessOutput => "dv_string(\"<ProcessOutput>\",15)".into(),
         hir::Type::ProcessCommand => "dv_string(\"<ProcessCommand>\",16)".into(),
+        hir::Type::ChildProcess => "dv_string(\"<ChildProcess>\",14)".into(),
         hir::Type::Str => format!("dv_string(({value}).data,({value}).len)"),
         hir::Type::Int {
             signed: true,
@@ -4723,6 +4794,7 @@ fn drop_value_depth(program: &mir::Program, value: &str, ty: &hir::Type, depth: 
             "{{disp_dealloc(({value}).stdout_data);disp_dealloc(({value}).stderr_data);({value})=(disp_native_process_output){{0}};}}"
         ),
         hir::Type::ProcessCommand => format!("disp_process_command_drop(&({value}));"),
+        hir::Type::ChildProcess => format!("disp_child_drop(&({value}));"),
         hir::Type::SocketAddress => format!("disp_socket_address_drop(&({value}));"),
         hir::Type::TcpStream => format!("disp_tcp_stream_drop(&({value}));"),
         hir::Type::TlsStream => format!("disp_tls_stream_drop(&({value}));"),

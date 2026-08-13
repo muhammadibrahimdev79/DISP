@@ -6,7 +6,7 @@ use crate::diagnostics::{Diagnostic, DiagnosticKind, Span};
 use native_tls::{Protocol, TlsConnector, TlsStream as NativeTlsStream};
 use std::{
     any::Any,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs,
     io::{self, Read, Write},
     net::{
@@ -14,8 +14,7 @@ use std::{
         UdpSocket as StdUdpSocket,
     },
     path::PathBuf,
-    process::Command as StdCommand,
-    process::Stdio,
+    process::{Child as StdChild, ChildStdin, Command as StdCommand, Stdio},
     sync::{
         Arc, Mutex as StdMutex, Weak,
         atomic::{AtomicBool, AtomicI64, Ordering},
@@ -2584,6 +2583,7 @@ enum Value {
     Instant(StdInstant),
     Duration(StdDuration),
     ProcessCommand(Box<RuntimeProcessCommand>),
+    ChildProcess(RuntimeChildProcess),
     ProcessOutput(RuntimeProcessOutput),
     Thread(RuntimeThread),
     Future(RuntimeFuture),
@@ -2643,6 +2643,403 @@ struct RuntimeProcessCommand {
     clear_environment: bool,
     input: Vec<u8>,
     timeout: Option<StdDuration>,
+}
+
+const PROCESS_STREAM_LIMIT: usize = 16 * 1024 * 1024;
+
+#[derive(Default)]
+struct RuntimeChildPipe {
+    bytes: StdMutex<VecDeque<u8>>,
+    done: AtomicBool,
+    failed: StdMutex<Option<String>>,
+    overflow: AtomicBool,
+}
+
+struct RuntimeChildState {
+    child: StdChild,
+    input: Option<ChildStdin>,
+    stdout: Arc<RuntimeChildPipe>,
+    stderr: Arc<RuntimeChildPipe>,
+    stdout_thread: Option<thread::JoinHandle<()>>,
+    stderr_thread: Option<thread::JoinHandle<()>>,
+    status: Option<i64>,
+    deadline: Option<StdInstant>,
+}
+
+struct RuntimeChildInner {
+    state: StdMutex<RuntimeChildState>,
+}
+
+#[derive(Clone)]
+struct RuntimeChildProcess(Arc<RuntimeChildInner>);
+
+impl std::fmt::Debug for RuntimeChildProcess {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_tuple("ChildProcess").finish()
+    }
+}
+
+impl PartialEq for RuntimeChildProcess {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+fn child_pipe_reader(mut reader: impl Read, pipe: Arc<RuntimeChildPipe>) {
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => {
+                let mut bytes = pipe.bytes.lock().expect("child pipe bytes");
+                let available = PROCESS_STREAM_LIMIT.saturating_sub(bytes.len());
+                let retained = available.min(count);
+                if retained < count {
+                    pipe.overflow.store(true, Ordering::Release);
+                }
+                if retained != 0 {
+                    bytes.extend(&chunk[..retained]);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                *pipe.failed.lock().expect("child pipe failure") = Some(error.to_string());
+                break;
+            }
+        }
+    }
+    pipe.done.store(true, Ordering::Release);
+}
+
+fn process_status(status: std::process::ExitStatus) -> i64 {
+    status.code().map(i64::from).unwrap_or(-1)
+}
+
+impl RuntimeChildProcess {
+    fn join_readers(&self) -> io::Result<()> {
+        let threads = {
+            let mut state = self
+                .0
+                .state
+                .lock()
+                .map_err(|_| io::Error::other("child-process state is poisoned"))?;
+            [state.stdout_thread.take(), state.stderr_thread.take()]
+        };
+        for thread in threads.into_iter().flatten() {
+            thread
+                .join()
+                .map_err(|_| io::Error::other("child-process reader thread failed"))?;
+        }
+        Ok(())
+    }
+
+    fn check_timeout(state: &mut RuntimeChildState) -> io::Result<()> {
+        if state.status.is_none()
+            && state
+                .deadline
+                .is_some_and(|deadline| StdInstant::now() >= deadline)
+        {
+            let _ = state.child.kill();
+            let _ = state.child.wait();
+            state.status = Some(124);
+            state.input.take();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "process exceeded its configured timeout",
+            ));
+        }
+        Ok(())
+    }
+
+    fn write(&self, bytes: &[u8]) -> io::Result<()> {
+        if bytes.len() > PROCESS_STREAM_LIMIT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "process write exceeds the 16 MiB limit",
+            ));
+        }
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("child-process state is poisoned"))?;
+        Self::check_timeout(&mut state)?;
+        let input = state.input.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "child-process input is closed")
+        })?;
+        input.write_all(bytes)
+    }
+
+    fn close_input(&self) -> io::Result<()> {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("child-process state is poisoned"))?;
+        Self::check_timeout(&mut state)?;
+        state.input.take();
+        Ok(())
+    }
+
+    fn read_pipe(&self, stdout: bool, limit: usize) -> io::Result<Vec<u8>> {
+        if limit > PROCESS_STREAM_LIMIT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "child-process read limit exceeds 16 MiB",
+            ));
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        loop {
+            let pipe = {
+                let mut state = self
+                    .0
+                    .state
+                    .lock()
+                    .map_err(|_| io::Error::other("child-process state is poisoned"))?;
+                Self::check_timeout(&mut state)?;
+                if state.status.is_none()
+                    && let Some(status) = state.child.try_wait()?
+                {
+                    state.status = Some(process_status(status));
+                    state.input.take();
+                }
+                if stdout {
+                    state.stdout.clone()
+                } else {
+                    state.stderr.clone()
+                }
+            };
+            if let Some(error) = pipe
+                .failed
+                .lock()
+                .map_err(|_| io::Error::other("child pipe is poisoned"))?
+                .clone()
+            {
+                return Err(io::Error::other(error));
+            }
+            if pipe.overflow.load(Ordering::Acquire) {
+                return Err(io::Error::other(
+                    "process output exceeds the 16 MiB capture limit",
+                ));
+            }
+            let mut queued = pipe
+                .bytes
+                .lock()
+                .map_err(|_| io::Error::other("child pipe is poisoned"))?;
+            if !queued.is_empty() {
+                let count = limit.min(queued.len());
+                return Ok(queued.drain(..count).collect());
+            }
+            if pipe.done.load(Ordering::Acquire) {
+                return Ok(Vec::new());
+            }
+            drop(queued);
+            thread::sleep(StdDuration::from_millis(1));
+        }
+    }
+
+    fn try_wait(&self) -> io::Result<Option<i64>> {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("child-process state is poisoned"))?;
+        Self::check_timeout(&mut state)?;
+        if state.status.is_none()
+            && let Some(status) = state.child.try_wait()?
+        {
+            state.status = Some(process_status(status));
+            state.input.take();
+        }
+        Ok(state.status)
+    }
+
+    fn kill(&self) -> io::Result<()> {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("child-process state is poisoned"))?;
+        if state.status.is_none() {
+            state.child.kill()?;
+            state.status = Some(process_status(state.child.wait()?));
+        }
+        state.input.take();
+        Ok(())
+    }
+
+    fn wait(&self) -> io::Result<Value> {
+        let (status, stdout, stderr) = loop {
+            let snapshot = {
+                let mut state = self
+                    .0
+                    .state
+                    .lock()
+                    .map_err(|_| io::Error::other("child-process state is poisoned"))?;
+                Self::check_timeout(&mut state)?;
+                if state.status.is_none()
+                    && let Some(status) = state.child.try_wait()?
+                {
+                    state.status = Some(process_status(status));
+                    state.input.take();
+                }
+                (state.status, state.stdout.clone(), state.stderr.clone())
+            };
+            if let Some(status) = snapshot.0
+                && snapshot.1.done.load(Ordering::Acquire)
+                && snapshot.2.done.load(Ordering::Acquire)
+            {
+                break (status, snapshot.1, snapshot.2);
+            }
+            thread::sleep(StdDuration::from_millis(1));
+        };
+        self.join_readers()?;
+        for pipe in [&stdout, &stderr] {
+            if let Some(error) = pipe
+                .failed
+                .lock()
+                .map_err(|_| io::Error::other("child pipe is poisoned"))?
+                .clone()
+            {
+                return Err(io::Error::other(error));
+            }
+            if pipe.overflow.load(Ordering::Acquire) {
+                return Err(io::Error::other(
+                    "process output exceeds the 16 MiB capture limit",
+                ));
+            }
+        }
+        let stdout = stdout
+            .bytes
+            .lock()
+            .map_err(|_| io::Error::other("child pipe is poisoned"))?
+            .drain(..)
+            .collect();
+        let stderr = stderr
+            .bytes
+            .lock()
+            .map_err(|_| io::Error::other("child pipe is poisoned"))?
+            .drain(..)
+            .collect();
+        Ok(Value::ProcessOutput(RuntimeProcessOutput {
+            status,
+            stdout,
+            stderr,
+        }))
+    }
+}
+
+impl Drop for RuntimeChildInner {
+    fn drop(&mut self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.status.is_none() {
+            let _ = state.child.kill();
+            if let Ok(status) = state.child.wait() {
+                state.status = Some(process_status(status));
+            }
+        }
+        state.input.take();
+        let threads = [state.stdout_thread.take(), state.stderr_thread.take()];
+        drop(state);
+        for thread in threads.into_iter().flatten() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn start_process(command: RuntimeProcessCommand) -> io::Result<Value> {
+    if command.program.as_os_str().is_empty()
+        || command
+            .program
+            .to_str()
+            .is_some_and(|value| value.contains('\0'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process program path cannot be empty",
+        ));
+    }
+    let argument_bytes = command
+        .arguments
+        .iter()
+        .try_fold(0usize, |total, argument| total.checked_add(argument.len()))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "process arguments overflow"))?;
+    if command.arguments.len() > 4096
+        || argument_bytes > 1024 * 1024
+        || command.arguments.iter().any(|value| value.contains('\0'))
+        || command.environment.len() > 4096
+        || command.input.len() > PROCESS_STREAM_LIMIT
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process configuration exceeds limits",
+        ));
+    }
+    if command.environment.iter().any(|(name, value)| {
+        name.is_empty() || name.contains('=') || name.contains('\0') || value.contains('\0')
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid process environment override",
+        ));
+    }
+    if command
+        .directory
+        .as_ref()
+        .is_some_and(|directory| directory.to_str().is_some_and(|value| value.contains('\0')))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process working directory cannot contain NUL",
+        ));
+    }
+    let initial_input = command.input;
+    let mut configured = StdCommand::new(command.program);
+    configured
+        .args(command.arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(directory) = command.directory {
+        configured.current_dir(directory);
+    }
+    if command.clear_environment {
+        configured.env_clear();
+    }
+    configured.envs(command.environment);
+    let mut child = configured.spawn()?;
+    let input = child.stdin.take().expect("piped child input");
+    let stdout_reader = child.stdout.take().expect("piped child stdout");
+    let stderr_reader = child.stderr.take().expect("piped child stderr");
+    let stdout = Arc::new(RuntimeChildPipe::default());
+    let stderr = Arc::new(RuntimeChildPipe::default());
+    let stdout_thread = stdout.clone();
+    let stderr_thread = stderr.clone();
+    let stdout_thread = thread::spawn(move || child_pipe_reader(stdout_reader, stdout_thread));
+    let stderr_thread = thread::spawn(move || child_pipe_reader(stderr_reader, stderr_thread));
+    let deadline = command
+        .timeout
+        .and_then(|timeout| StdInstant::now().checked_add(timeout));
+    let process = RuntimeChildProcess(Arc::new(RuntimeChildInner {
+        state: StdMutex::new(RuntimeChildState {
+            child,
+            input: Some(input),
+            stdout,
+            stderr,
+            stdout_thread: Some(stdout_thread),
+            stderr_thread: Some(stderr_thread),
+            status: None,
+            deadline,
+        }),
+    }));
+    if !initial_input.is_empty() {
+        process.write(&initial_input)?;
+    }
+    Ok(Value::ChildProcess(process))
 }
 
 fn execute_process(command: RuntimeProcessCommand) -> io::Result<Value> {
@@ -6063,6 +6460,7 @@ impl Interpreter {
                             | "input"
                             | "input_text"
                             | "timeout"
+                            | "start"
                             | "run"
                     ) {
                         let command = if let Some(place) = self.expression_place(object)
@@ -6156,6 +6554,7 @@ impl Interpreter {
                                     command.timeout = Some(value);
                                 }
                                 "run" => return Ok(runtime_result(execute_process(*command))),
+                                "start" => return Ok(runtime_result(start_process(*command))),
                                 _ => {
                                     return Err(self.error(
                                         "unknown ProcessCommand operation",
@@ -6164,6 +6563,55 @@ impl Interpreter {
                                 }
                             }
                             return Ok(Value::ProcessCommand(command));
+                        }
+                    }
+                    if matches!(
+                        field.as_str(),
+                        "write"
+                            | "write_text"
+                            | "close_input"
+                            | "read_stdout"
+                            | "read_stderr"
+                            | "try_wait"
+                            | "kill"
+                            | "wait"
+                    ) {
+                        let child = if field == "wait" {
+                            self.consume(program, object)?
+                        } else {
+                            self.evaluate(program, object)?
+                        };
+                        if let Value::ChildProcess(child) = child {
+                            let result = match field.as_str() {
+                                "write" => {
+                                    let bytes =
+                                        runtime_http_body(self.evaluate(program, &arguments[0])?)
+                                            .expect("type checking validates child-process bytes");
+                                    child.write(&bytes).map(|()| Value::Unit)
+                                }
+                                "write_text" => {
+                                    let Value::String(text) =
+                                        self.evaluate(program, &arguments[0])?
+                                    else {
+                                        unreachable!()
+                                    };
+                                    child.write(text.text.as_bytes()).map(|()| Value::Unit)
+                                }
+                                "close_input" => child.close_input().map(|()| Value::Unit),
+                                "read_stdout" | "read_stderr" => {
+                                    let limit = self.index_value(program, &arguments[0])?;
+                                    child
+                                        .read_pipe(field == "read_stdout", limit)
+                                        .map(runtime_bytes)
+                                }
+                                "try_wait" => child
+                                    .try_wait()
+                                    .map(|status| option_value(status.map(Value::Int))),
+                                "kill" => child.kill().map(|()| Value::Unit),
+                                "wait" => child.wait(),
+                                _ => unreachable!(),
+                            };
+                            return Ok(runtime_result(result));
                         }
                     }
                     if let Value::Url(url) = self.evaluate(program, object)? {
@@ -7628,6 +8076,7 @@ fn value_type_name(value: &Value) -> &str {
         Value::Duration(_) => "Duration",
         Value::ProcessOutput(_) => "ProcessOutput",
         Value::ProcessCommand(_) => "ProcessCommand",
+        Value::ChildProcess(_) => "ChildProcess",
         Value::Thread(_) => "Thread",
         Value::Future(_) => "Future",
         Value::Task(_) => "Task",
@@ -7695,6 +8144,7 @@ fn value_is_copy(program: &Program, value: &Value) -> bool {
         | Value::Path(_)
         | Value::ProcessOutput(_)
         | Value::ProcessCommand(_)
+        | Value::ChildProcess(_)
         | Value::Url(_)
         | Value::Json(_)
         | Value::SocketAddress(_)
@@ -8091,6 +8541,7 @@ fn display_value(value: Value) -> String {
         Value::Duration(value) => format!("{}ns", value.as_nanos()),
         Value::ProcessOutput(value) => format!("<ProcessOutput:{}>", value.status),
         Value::ProcessCommand(_) => "<ProcessCommand>".into(),
+        Value::ChildProcess(_) => "<ChildProcess>".into(),
         Value::Thread(_) => "<Thread>".into(),
         Value::Future(_) => "<Future>".into(),
         Value::Task(_) => "<Task>".into(),

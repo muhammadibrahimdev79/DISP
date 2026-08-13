@@ -770,8 +770,8 @@ impl Resolver {
             "int" | "f64" | "str" | "String" | "Path" | "IpAddress" | "SocketAddress"
             | "TcpStream" | "TlsStream" | "TcpListener" | "UdpSocket" | "UdpDatagram"
             | "Instant" | "Duration" | "IoError" | "NetworkError" | "HttpError" | "HttpRequest"
-            | "Url" | "Json" | "HttpResponse" | "ProcessCommand" | "ProcessOutput" | "char"
-            | "bool" | "Unit" | "ConversionError" => Some(0),
+            | "Url" | "Json" | "HttpResponse" | "ProcessCommand" | "ChildProcess"
+            | "ProcessOutput" | "char" | "bool" | "Unit" | "ConversionError" => Some(0),
             name if self
                 .generic_types
                 .last()

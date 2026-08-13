@@ -36,6 +36,7 @@ pub enum Type {
     Instant,
     Duration,
     ProcessCommand,
+    ChildProcess,
     ProcessOutput,
     Array(Box<Type>, usize),
     Slice(Box<Type>),
@@ -3198,6 +3199,78 @@ impl TypeChecker {
                                     Box::new(Type::IoError),
                                 ));
                             }
+                            "start" if arguments.is_empty() => {
+                                return Ok(Type::Result(
+                                    Box::new(Type::ChildProcess),
+                                    Box::new(Type::IoError),
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                    if matches!(receiver, Type::ChildProcess) {
+                        match field.as_str() {
+                            "write" if arguments.len() == 1 => {
+                                let bytes = self.check_expression(&arguments[0])?;
+                                if !matches!(bytes, Type::List(ref element) | Type::Slice(ref element) if matches!(**element, Type::Unsigned(8)))
+                                {
+                                    return Err(Diagnostic::new(
+                                        DiagnosticKind::Type,
+                                        "child-process write expects List<u8> or a u8 slice",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                return Ok(Type::Result(
+                                    Box::new(Type::Unit),
+                                    Box::new(Type::IoError),
+                                ));
+                            }
+                            "write_text" if arguments.len() == 1 => {
+                                let text = self.check_expression(&arguments[0])?;
+                                if !matches!(text, Type::String | Type::Str) {
+                                    return Err(Diagnostic::new(
+                                        DiagnosticKind::Type,
+                                        "child-process text input must be String or str",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                return Ok(Type::Result(
+                                    Box::new(Type::Unit),
+                                    Box::new(Type::IoError),
+                                ));
+                            }
+                            "read_stdout" | "read_stderr" if arguments.len() == 1 => {
+                                let limit = self.check_expression(&arguments[0])?;
+                                if !is_integer(&limit) {
+                                    return Err(Diagnostic::new(
+                                        DiagnosticKind::Type,
+                                        "child-process read limit must be an integer",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                return Ok(Type::Result(
+                                    Box::new(Type::List(Box::new(Type::Unsigned(8)))),
+                                    Box::new(Type::IoError),
+                                ));
+                            }
+                            "close_input" | "kill" if arguments.is_empty() => {
+                                return Ok(Type::Result(
+                                    Box::new(Type::Unit),
+                                    Box::new(Type::IoError),
+                                ));
+                            }
+                            "try_wait" if arguments.is_empty() => {
+                                return Ok(Type::Result(
+                                    Box::new(Type::Option(Box::new(Type::Int))),
+                                    Box::new(Type::IoError),
+                                ));
+                            }
+                            "wait" if arguments.is_empty() => {
+                                return Ok(Type::Result(
+                                    Box::new(Type::ProcessOutput),
+                                    Box::new(Type::IoError),
+                                ));
+                            }
                             _ => {}
                         }
                     }
@@ -4502,6 +4575,7 @@ impl TypeChecker {
             "Path" if ty.arguments.is_empty() => Type::Path,
             "ProcessOutput" if ty.arguments.is_empty() => Type::ProcessOutput,
             "ProcessCommand" if ty.arguments.is_empty() => Type::ProcessCommand,
+            "ChildProcess" if ty.arguments.is_empty() => Type::ChildProcess,
             "Url" if ty.arguments.is_empty() => Type::Url,
             "Json" if ty.arguments.is_empty() => Type::Json,
             "IpAddress" if ty.arguments.is_empty() => Type::IpAddress,
@@ -4965,6 +5039,7 @@ impl TypeChecker {
             Type::Path => "Path".into(),
             Type::ProcessOutput => "ProcessOutput".into(),
             Type::ProcessCommand => "ProcessCommand".into(),
+            Type::ChildProcess => "ChildProcess".into(),
             Type::Url => "Url".into(),
             Type::Json => "Json".into(),
             Type::IpAddress => "IpAddress".into(),

@@ -209,6 +209,22 @@ and standard input plus captured standard output/error are bounded to 16 MiB. A 
 terminates and reaps the child. `ProcessOutput` exposes `status()`, `success()`, byte
 `stdout()`/`stderr()`, and UTF-8-checking `stdout_text()`/`stderr_text()`.
 
+Streaming uses an owned `ChildProcess`. Operations that change its state require `var`,
+and `wait()` consumes it so a reaped process cannot be reused:
+
+```disp
+var child = command.start()?
+child.write_text("request\n")?
+first = child.read_stdout(1024)?
+child.close_input()?
+output = child.wait()?
+```
+
+`read_stdout(limit)` and `read_stderr(limit)` return available byte chunks, while
+`try_wait()` reports `None` until the process exits. `kill()` is explicit. If a live
+child leaves scope, DISP closes its input, terminates it, drains its pipes, reaps it,
+and joins the internal readers before releasing the resource.
+
 ## Threads and synchronization
 
 `spawn` transfers owned arguments to a named DISP function and returns a typed handle.

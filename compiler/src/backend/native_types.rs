@@ -36,6 +36,8 @@ pub fn generate(
          typedef struct { uint64_t nanos; } disp_native_instant;\n\
          typedef struct { uint64_t nanos; } disp_native_duration;\n\
          typedef struct { disp_native_path program; disp_native_string *args; size_t args_len; size_t args_cap; disp_native_path directory; _Bool has_directory; disp_native_string *environment_keys; disp_native_string *environment_values; size_t environment_len; size_t environment_cap; _Bool clear_environment; uint8_t *input; size_t input_len; size_t input_cap; uint64_t timeout_nanos; _Bool has_timeout; } disp_native_process_command;\n\
+         typedef struct disp_child_state disp_child_state;\n\
+         typedef struct { disp_child_state *state; } disp_native_child_process;\n\
          typedef struct { int64_t status; uint8_t *stdout_data; size_t stdout_len; uint8_t *stderr_data; size_t stderr_len; } disp_native_process_output;\n\
          typedef struct { uintptr_t handle; void *result; } disp_native_thread;\n\
          typedef struct { void *context; _Bool (*poll)(void *, void *); void (*drop)(void *); } disp_native_future;\n\
@@ -353,6 +355,7 @@ pub fn c_type(ty: &hir::Type) -> String {
         hir::Type::Instant => "disp_native_instant".into(),
         hir::Type::Duration => "disp_native_duration".into(),
         hir::Type::ProcessCommand => "disp_native_process_command".into(),
+        hir::Type::ChildProcess => "disp_native_child_process".into(),
         hir::Type::ProcessOutput => "disp_native_process_output".into(),
         hir::Type::Thread(_) => "disp_native_thread".into(),
         hir::Type::Future(_) => "disp_native_future".into(),

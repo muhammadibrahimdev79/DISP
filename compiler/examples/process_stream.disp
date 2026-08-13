@@ -1,0 +1,23 @@
+fn stream() -> Result<bool, IoError> {
+    command = Process.command(Path("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"))
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-Command")
+        .arg("$text=[Console]::In.ReadToEnd(); [Console]::Out.Write($text.ToUpperInvariant())")
+        .timeout(Duration.from_seconds(3))
+    var child = command.start()?
+    child.write_text("streaming DISP")?
+    child.close_input()?
+    output = child.wait()?
+    return Ok(output.success() && match output.stdout_text() {
+        Ok(text) => text == "STREAMING DISP"
+        Err(error) => false
+    })
+}
+
+fn main() {
+    print(match stream() {
+        Ok(value) => value
+        Err(error) => false
+    })
+}

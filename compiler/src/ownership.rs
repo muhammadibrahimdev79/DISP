@@ -1619,8 +1619,40 @@ impl<'a> Analyzer<'a> {
                         Box::new(Ty::Owned("ProcessOutput".into())),
                         Box::new(Ty::Owned("IoError".into())),
                     )
+                } else if field == "start" {
+                    Ty::Result(
+                        Box::new(Ty::Owned("ChildProcess".into())),
+                        Box::new(Ty::Owned("IoError".into())),
+                    )
                 } else {
                     Ty::Owned("ProcessCommand".into())
+                });
+            }
+            if matches!(self.expr_ty(object), Ok(Ty::Owned(ref name)) if name == "ChildProcess") {
+                if field == "wait" {
+                    self.check_expr(object, UseMode::Consume)?;
+                } else {
+                    let place = self.place(object)?;
+                    self.check_borrow(&place, true, object.span)?;
+                    self.use_place(&place, UseMode::Read, object.span)?;
+                }
+                for argument in arguments {
+                    self.check_expr(argument, UseMode::Read)?;
+                }
+                return Ok(match field.as_str() {
+                    "read_stdout" | "read_stderr" => Ty::Result(
+                        Box::new(Ty::List(Box::new(Ty::Copy))),
+                        Box::new(Ty::Owned("IoError".into())),
+                    ),
+                    "try_wait" => Ty::Result(
+                        Box::new(Ty::Option(Box::new(Ty::Copy))),
+                        Box::new(Ty::Owned("IoError".into())),
+                    ),
+                    "wait" => Ty::Result(
+                        Box::new(Ty::Owned("ProcessOutput".into())),
+                        Box::new(Ty::Owned("IoError".into())),
+                    ),
+                    _ => Ty::Result(Box::new(Ty::Unit), Box::new(Ty::Owned("IoError".into()))),
                 });
             }
             if matches!(self.expr_ty(object), Ok(Ty::Url)) {
@@ -2511,8 +2543,31 @@ impl<'a> Analyzer<'a> {
                             Box::new(Ty::Owned("ProcessOutput".into())),
                             Box::new(Ty::Owned("IoError".into())),
                         )
+                    } else if field == "start" {
+                        Ty::Result(
+                            Box::new(Ty::Owned("ChildProcess".into())),
+                            Box::new(Ty::Owned("IoError".into())),
+                        )
                     } else {
                         Ty::Owned("ProcessCommand".into())
+                    });
+                }
+                if matches!(self.expr_ty(object), Ok(Ty::Owned(ref name)) if name == "ChildProcess")
+                {
+                    return Ok(match field.as_str() {
+                        "read_stdout" | "read_stderr" => Ty::Result(
+                            Box::new(Ty::List(Box::new(Ty::Copy))),
+                            Box::new(Ty::Owned("IoError".into())),
+                        ),
+                        "try_wait" => Ty::Result(
+                            Box::new(Ty::Option(Box::new(Ty::Copy))),
+                            Box::new(Ty::Owned("IoError".into())),
+                        ),
+                        "wait" => Ty::Result(
+                            Box::new(Ty::Owned("ProcessOutput".into())),
+                            Box::new(Ty::Owned("IoError".into())),
+                        ),
+                        _ => Ty::Result(Box::new(Ty::Unit), Box::new(Ty::Owned("IoError".into()))),
                     });
                 }
                 Ok(Ty::Owned("expression".into()))
