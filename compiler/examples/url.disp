@@ -1,0 +1,15 @@
+fn inspect() -> Result<bool, NetworkError> {
+    url = Url("https://example.com:8443/api/items?limit=10")?
+    print(url.scheme())
+    print(url.host())
+    print(url.port())
+    print(url.path())
+    print(url.query())
+    print(url.is_secure())
+    print(url.as_string())
+    return Ok(true)
+}
+
+fn main() {
+    print(inspect())
+}

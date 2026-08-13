@@ -823,6 +823,29 @@ Sequential requests reuse eligible HTTP/1.1 connections without exposing pooling
 DISP code. Reuse requires an exactly framed response and is disabled when the peer requests
 closure; interpreter pooling is bounded to 32 origins and two idle connections per origin.
 
+Structured URLs are nominal owned values and can be passed anywhere an HTTP URL is accepted:
+
+```disp
+url = Url("https://example.com:8443/api/items?limit=10")?
+print(url.scheme())
+print(url.host())
+print(url.port())
+print(url.path())
+print(url.query())
+```
+
+`Url` accepts only bounded HTTP/HTTPS URLs with a host, no embedded credentials, no fragments,
+and no control characters or spaces. It exposes `as_string`, `scheme`, `host`, `port`, `path`,
+`query`, and `is_secure`. Parsing returns `Result<Url, NetworkError>`; the type is non-Copy so its
+owned serialization has one deterministic cleanup path. The validated serialization is preserved
+exactly; component methods expose the spelling present in that serialization.
+
+`Json(text)` validates a complete UTF-8 JSON document before producing a nominal owned `Json`.
+Documents are limited to 16 MiB and 128 nesting levels. `kind`, `is_null`, `is_bool`, `is_number`,
+`is_string`, `is_array`, `is_object`, `len`, and `as_string` are available without exposing parser
+state. `Http.post_json`, `HttpRequest.json`, and `HttpResponse.json` apply and validate
+`application/json` bodies in both native and interpreter execution.
+
 ---
 
 # 38. HTTP Server

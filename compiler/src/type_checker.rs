@@ -22,6 +22,8 @@ pub enum Type {
     CStr,
     Memory,
     Path,
+    Url,
+    Json,
     IpAddress,
     SocketAddress,
     TcpStream,
@@ -1760,6 +1762,48 @@ impl TypeChecker {
                     }
                     return Ok(Type::Path);
                 }
+                if matches!(&callee.node, Expression::Identifier(name) if name == "Url") {
+                    if arguments.len() != 1 {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            "`Url` expects one String or str",
+                            expression.span,
+                        ));
+                    }
+                    let source = self.check_expression(&arguments[0])?;
+                    if !matches!(source, Type::String | Type::Str) {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            "URL source must be String or str",
+                            arguments[0].span,
+                        ));
+                    }
+                    return Ok(Type::Result(
+                        Box::new(Type::Url),
+                        Box::new(Type::NetworkError),
+                    ));
+                }
+                if matches!(&callee.node, Expression::Identifier(name) if name == "Json") {
+                    if arguments.len() != 1 {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            "`Json` expects one String or str",
+                            expression.span,
+                        ));
+                    }
+                    let source = self.check_expression(&arguments[0])?;
+                    if !matches!(source, Type::String | Type::Str) {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            "JSON source must be String or str",
+                            arguments[0].span,
+                        ));
+                    }
+                    return Ok(Type::Result(
+                        Box::new(Type::Json),
+                        Box::new(Type::ConversionError),
+                    ));
+                }
                 if matches!(&callee.node, Expression::Identifier(name) if name == "SocketAddress") {
                     if arguments.len() != 2 {
                         return Err(Diagnostic::new(
@@ -1871,6 +1915,8 @@ impl TypeChecker {
                             | "get_timeout"
                             | "post"
                             | "post_timeout"
+                            | "post_json"
+                            | "post_json_timeout"
                             | "put"
                             | "put_timeout"
                             | "patch"
@@ -1882,9 +1928,8 @@ impl TypeChecker {
                 {
                     let expected = match field.as_str() {
                         "get" | "delete" => 1,
-                        "get_timeout" | "delete_timeout" | "post" | "put" | "patch" | "request" => {
-                            2
-                        }
+                        "get_timeout" | "delete_timeout" | "post" | "post_json" | "put"
+                        | "patch" | "request" => 2,
                         _ => 3,
                     };
                     if arguments.len() != expected {
@@ -1915,10 +1960,10 @@ impl TypeChecker {
                         }
                     }
                     let url = self.check_expression(&arguments[url_index])?;
-                    if !matches!(url, Type::String | Type::Str) {
+                    if !matches!(url, Type::String | Type::Str | Type::Url) {
                         return Err(Diagnostic::new(
                             DiagnosticKind::Type,
-                            "HTTP URL must be String or str",
+                            "HTTP URL must be Url, String, or str",
                             arguments[url_index].span,
                         ));
                     }
@@ -1930,11 +1975,25 @@ impl TypeChecker {
                     }
                     let has_body = matches!(
                         field.as_str(),
-                        "post" | "post_timeout" | "put" | "put_timeout" | "patch" | "patch_timeout"
+                        "post"
+                            | "post_timeout"
+                            | "post_json"
+                            | "post_json_timeout"
+                            | "put"
+                            | "put_timeout"
+                            | "patch"
+                            | "patch_timeout"
                     );
                     if has_body {
                         let body = self.check_expression(&arguments[1])?;
-                        if !http_body_type(&body) {
+                        if field.starts_with("post_json") && !matches!(body, Type::Json) {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Type,
+                                "HTTP JSON body must be Json",
+                                arguments[1].span,
+                            ));
+                        }
+                        if !field.starts_with("post_json") && !http_body_type(&body) {
                             return Err(Diagnostic::new(
                                 DiagnosticKind::Type,
                                 "HTTP body must be String, str, List<u8>, or a u8 slice",
@@ -2850,6 +2909,36 @@ impl TypeChecker {
                             _ => {}
                         }
                     }
+                    if matches!(receiver, Type::Url) {
+                        match field.as_str() {
+                            "as_string" | "scheme" | "path" if arguments.is_empty() => {
+                                return Ok(Type::String);
+                            }
+                            "host" | "query" if arguments.is_empty() => {
+                                return Ok(Type::Option(Box::new(Type::String)));
+                            }
+                            "port" if arguments.is_empty() => {
+                                return Ok(Type::Option(Box::new(Type::UInt)));
+                            }
+                            "is_secure" if arguments.is_empty() => return Ok(Type::Bool),
+                            _ => {}
+                        }
+                    }
+                    if matches!(receiver, Type::Json) {
+                        match field.as_str() {
+                            "as_string" | "kind" if arguments.is_empty() => {
+                                return Ok(Type::String);
+                            }
+                            "len" if arguments.is_empty() => return Ok(Type::UInt),
+                            "is_null" | "is_bool" | "is_number" | "is_string" | "is_array"
+                            | "is_object"
+                                if arguments.is_empty() =>
+                            {
+                                return Ok(Type::Bool);
+                            }
+                            _ => {}
+                        }
+                    }
                     if matches!(receiver, Type::TcpStream) {
                         match field.as_str() {
                             "read" | "read_async" if arguments.len() == 1 => {
@@ -3043,6 +3132,12 @@ impl TypeChecker {
                                     Box::new(Type::HttpError),
                                 ));
                             }
+                            "json" if arguments.is_empty() => {
+                                return Ok(Type::Result(
+                                    Box::new(Type::Json),
+                                    Box::new(Type::HttpError),
+                                ));
+                            }
                             "url" if arguments.is_empty() => return Ok(Type::String),
                             "header" if arguments.len() == 1 => {
                                 let name = self.check_expression(&arguments[0])?;
@@ -3121,6 +3216,19 @@ impl TypeChecker {
                                         arguments[0].span,
                                     ));
                                 }
+                                return Ok(Type::Result(
+                                    Box::new(Type::HttpRequest),
+                                    Box::new(Type::HttpError),
+                                ));
+                            }
+                            "json" if arguments.len() == 1 => {
+                                let body = self.check_expression(&arguments[0])?;
+                                self.require_same(
+                                    &Type::Json,
+                                    &body,
+                                    arguments[0].span,
+                                    "HTTP JSON body",
+                                )?;
                                 return Ok(Type::Result(
                                     Box::new(Type::HttpRequest),
                                     Box::new(Type::HttpError),
@@ -4018,6 +4126,8 @@ impl TypeChecker {
             "CFloat" if ty.arguments.is_empty() => Type::Float32,
             "CDouble" if ty.arguments.is_empty() => Type::Float,
             "Path" if ty.arguments.is_empty() => Type::Path,
+            "Url" if ty.arguments.is_empty() => Type::Url,
+            "Json" if ty.arguments.is_empty() => Type::Json,
             "IpAddress" if ty.arguments.is_empty() => Type::IpAddress,
             "SocketAddress" if ty.arguments.is_empty() => Type::SocketAddress,
             "TcpStream" if ty.arguments.is_empty() => Type::TcpStream,
@@ -4364,6 +4474,8 @@ impl TypeChecker {
             Type::CStr => "CStr".into(),
             Type::Memory => "Memory".into(),
             Type::Path => "Path".into(),
+            Type::Url => "Url".into(),
+            Type::Json => "Json".into(),
             Type::IpAddress => "IpAddress".into(),
             Type::SocketAddress => "SocketAddress".into(),
             Type::TcpStream => "TcpStream".into(),

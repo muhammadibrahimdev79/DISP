@@ -30,6 +30,8 @@ enum Ty {
     CStr,
     Memory,
     Path,
+    Url,
+    Json,
     IpAddress,
     SocketAddress,
     TcpStream,
@@ -1178,6 +1180,24 @@ impl<'a> Analyzer<'a> {
                 }
                 return Ok(Ty::Path);
             }
+            if name == "Url" {
+                for argument in arguments {
+                    self.check_expr(argument, UseMode::Read)?;
+                }
+                return Ok(Ty::Result(
+                    Box::new(Ty::Url),
+                    Box::new(Ty::Owned("NetworkError".into())),
+                ));
+            }
+            if name == "Json" {
+                for argument in arguments {
+                    self.check_expr(argument, UseMode::Read)?;
+                }
+                return Ok(Ty::Result(
+                    Box::new(Ty::Json),
+                    Box::new(Ty::Owned("ConversionError".into())),
+                ));
+            }
             if name == "SocketAddress" {
                 for argument in arguments {
                     self.check_expr(argument, UseMode::Read)?;
@@ -1364,6 +1384,8 @@ impl<'a> Analyzer<'a> {
                         | "get_timeout"
                         | "post"
                         | "post_timeout"
+                        | "post_json"
+                        | "post_json_timeout"
                         | "put"
                         | "put_timeout"
                         | "patch"
@@ -1527,6 +1549,28 @@ impl<'a> Analyzer<'a> {
                     _ => Ty::Copy,
                 });
             }
+            if matches!(self.expr_ty(object), Ok(Ty::Url)) {
+                self.check_expr(object, UseMode::Read)?;
+                for argument in arguments {
+                    self.check_expr(argument, UseMode::Read)?;
+                }
+                return Ok(match field.as_str() {
+                    "as_string" | "scheme" | "path" => Ty::Owned("String".into()),
+                    "host" | "query" => Ty::Option(Box::new(Ty::Owned("String".into()))),
+                    "port" => Ty::Option(Box::new(Ty::Copy)),
+                    _ => Ty::Copy,
+                });
+            }
+            if matches!(self.expr_ty(object), Ok(Ty::Json)) {
+                self.check_expr(object, UseMode::Read)?;
+                for argument in arguments {
+                    self.check_expr(argument, UseMode::Read)?;
+                }
+                return Ok(match field.as_str() {
+                    "as_string" | "kind" => Ty::Owned("String".into()),
+                    _ => Ty::Copy,
+                });
+            }
             if matches!(self.expr_ty(object), Ok(Ty::TcpStream)) {
                 let place = self.place(object)?;
                 self.check_borrow(&place, true, object.span)?;
@@ -1596,6 +1640,9 @@ impl<'a> Analyzer<'a> {
                         Box::new(Ty::Owned("String".into())),
                         Box::new(Ty::Owned("HttpError".into())),
                     ),
+                    "json" => {
+                        Ty::Result(Box::new(Ty::Json), Box::new(Ty::Owned("HttpError".into())))
+                    }
                     "url" => Ty::Owned("String".into()),
                     "header" => Ty::Option(Box::new(Ty::Owned("String".into()))),
                     _ => Ty::Copy,
@@ -1607,7 +1654,7 @@ impl<'a> Analyzer<'a> {
                     self.check_expr(argument, UseMode::Read)?;
                 }
                 return Ok(match field.as_str() {
-                    "header" | "text" | "bytes" => Ty::Result(
+                    "header" | "text" | "bytes" | "json" => Ty::Result(
                         Box::new(Ty::HttpRequest),
                         Box::new(Ty::Owned("HttpError".into())),
                     ),
@@ -2786,6 +2833,8 @@ impl<'a> Analyzer<'a> {
             "CInt" | "CUInt" | "CSize" | "CSSize" | "CChar" | "CUChar" | "CShort" | "CUShort"
             | "CLongLong" | "CULongLong" | "CFloat" | "CDouble" => Ty::Copy,
             "Path" => Ty::Path,
+            "Url" => Ty::Url,
+            "Json" => Ty::Json,
             "IpAddress" => Ty::IpAddress,
             "SocketAddress" => Ty::SocketAddress,
             "TcpStream" => Ty::TcpStream,
@@ -2837,6 +2886,8 @@ impl<'a> Analyzer<'a> {
             Ty::Array(element) => self.ty_is_copy(element),
             Ty::Slice(_) | Ty::Str | Ty::CStr | Ty::Instant | Ty::Duration | Ty::IpAddress => true,
             Ty::Path
+            | Ty::Url
+            | Ty::Json
             | Ty::SocketAddress
             | Ty::TcpStream
             | Ty::TlsStream

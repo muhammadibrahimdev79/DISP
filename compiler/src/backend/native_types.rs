@@ -15,6 +15,8 @@ pub fn generate(
          typedef struct { char *data; size_t len; size_t cap; } disp_native_cstring;\n\
          typedef struct { uint8_t *data; size_t len; size_t align; } disp_native_memory;\n\
          typedef struct { char *data; size_t len; size_t cap; } disp_native_path;\n\
+         typedef struct { char *data; size_t len; size_t cap; } disp_native_url;\n\
+         typedef struct { char *data; size_t len; size_t cap; } disp_native_json;\n\
          typedef struct { uint8_t bytes[16]; uint8_t family; } disp_native_ip_address;\n\
          typedef struct { disp_native_ip_address *data; size_t len; size_t cap; } disp_native_ip_list;\n\
          typedef struct { char *host; size_t len; uint16_t port; } disp_native_socket_address;\n\
@@ -335,6 +337,8 @@ pub fn c_type(ty: &hir::Type) -> String {
         hir::Type::CStr => "const char *".into(),
         hir::Type::Memory => "disp_native_memory".into(),
         hir::Type::Path => "disp_native_path".into(),
+        hir::Type::Url => "disp_native_url".into(),
+        hir::Type::Json => "disp_native_json".into(),
         hir::Type::IpAddress => "disp_native_ip_address".into(),
         hir::Type::SocketAddress => "disp_native_socket_address".into(),
         hir::Type::TcpStream => "disp_native_tcp_stream".into(),

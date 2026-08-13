@@ -60,13 +60,16 @@ impl<'a> LayoutEngine<'a> {
             hir::Type::Unit => scalar(0, 1),
             hir::Type::Bool => scalar(1, 1),
             hir::Type::Char => scalar(4, 4),
-            hir::Type::String | hir::Type::CString | hir::Type::Memory | hir::Type::Path => {
-                aggregate(&[
-                    self.target.pointer_alignment,
-                    self.target.pointer_alignment,
-                    self.target.pointer_alignment,
-                ])
-            }
+            hir::Type::String
+            | hir::Type::CString
+            | hir::Type::Memory
+            | hir::Type::Path
+            | hir::Type::Url
+            | hir::Type::Json => aggregate(&[
+                self.target.pointer_alignment,
+                self.target.pointer_alignment,
+                self.target.pointer_alignment,
+            ]),
             hir::Type::IpAddress => aggregate_layout(&[scalar(16, 1), scalar(1, 1)]),
             hir::Type::SocketAddress => aggregate(&[
                 self.target.pointer_alignment,

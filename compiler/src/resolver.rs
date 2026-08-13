@@ -448,6 +448,8 @@ impl Resolver {
                         | "Map"
                         | "Set"
                         | "Path"
+                        | "Url"
+                        | "Json"
                         | "SocketAddress"
                         | "Tls"
                         | "Http"
@@ -503,7 +505,7 @@ impl Resolver {
                 field,
                 field_span,
             } => {
-                if matches!(&object.node, Expression::Identifier(name) if matches!(name.as_str(), "String" | "List" | "Map" | "Set" | "Mutex" | "AtomicInt" | "Path" | "IpAddress" | "Dns" | "SocketAddress" | "Tls" | "Http" | "TcpListener" | "UdpSocket" | "File" | "Directory" | "Time" | "Duration" | "Async"))
+                if matches!(&object.node, Expression::Identifier(name) if matches!(name.as_str(), "String" | "List" | "Map" | "Set" | "Mutex" | "AtomicInt" | "Path" | "Url" | "Json" | "IpAddress" | "Dns" | "SocketAddress" | "Tls" | "Http" | "TcpListener" | "UdpSocket" | "File" | "Directory" | "Time" | "Duration" | "Async"))
                 {
                     return Ok(());
                 }
@@ -760,7 +762,9 @@ impl Resolver {
             "int" | "f64" | "str" | "String" | "Path" | "IpAddress" | "SocketAddress"
             | "TcpStream" | "TlsStream" | "TcpListener" | "UdpSocket" | "UdpDatagram"
             | "Instant" | "Duration" | "IoError" | "NetworkError" | "HttpError" | "HttpRequest"
-            | "HttpResponse" | "char" | "bool" | "Unit" | "ConversionError" => Some(0),
+            | "Url" | "Json" | "HttpResponse" | "char" | "bool" | "Unit" | "ConversionError" => {
+                Some(0)
+            }
             name if self
                 .generic_types
                 .last()

@@ -157,6 +157,254 @@ struct RuntimeHttpResponseData {
     body: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct RuntimeJson {
+    text: String,
+    kind: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct RuntimeUrl {
+    text: String,
+}
+
+impl RuntimeUrl {
+    fn scheme(&self) -> &str {
+        self.text.split_once(':').map_or("", |(scheme, _)| scheme)
+    }
+
+    fn authority(&self) -> &str {
+        let start = self.text.find("://").map_or(0, |index| index + 3);
+        let tail = &self.text[start..];
+        let end = tail.find(['/', '?']).unwrap_or(tail.len());
+        &tail[..end]
+    }
+
+    fn host(&self) -> Option<&str> {
+        let authority = self.authority();
+        if let Some(bracketed) = authority.strip_prefix('[') {
+            return bracketed.split_once(']').map(|(host, _)| host);
+        }
+        Some(
+            authority
+                .rsplit_once(':')
+                .map_or(authority, |(host, _)| host),
+        )
+        .filter(|host| !host.is_empty())
+    }
+
+    fn port(&self) -> Option<u16> {
+        let authority = self.authority();
+        let port = if authority.starts_with('[') {
+            authority.split_once("]:").map(|(_, port)| port)
+        } else {
+            authority.rsplit_once(':').map(|(_, port)| port)
+        }?;
+        port.parse().ok()
+    }
+
+    fn path(&self) -> &str {
+        let start = self.text.find("://").map_or(0, |index| index + 3);
+        let tail = &self.text[start..];
+        let Some(path) = tail.find('/') else {
+            return "/";
+        };
+        let path = &tail[path..];
+        path.split_once('?').map_or(path, |(path, _)| path)
+    }
+
+    fn query(&self) -> Option<&str> {
+        self.text.split_once('?').map(|(_, query)| query)
+    }
+}
+
+struct JsonParser<'a> {
+    bytes: &'a [u8],
+    at: usize,
+    depth: usize,
+}
+
+impl JsonParser<'_> {
+    fn space(&mut self) {
+        while self
+            .bytes
+            .get(self.at)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            self.at += 1;
+        }
+    }
+
+    fn string(&mut self) -> Result<(), &'static str> {
+        if self.bytes.get(self.at) != Some(&b'"') {
+            return Err("JSON object key must be a string");
+        }
+        self.at += 1;
+        while let Some(&byte) = self.bytes.get(self.at) {
+            self.at += 1;
+            match byte {
+                b'"' => return Ok(()),
+                0..=0x1f => return Err("JSON string contains a control character"),
+                b'\\' => {
+                    let escape = *self.bytes.get(self.at).ok_or("JSON escape is incomplete")?;
+                    self.at += 1;
+                    if matches!(
+                        escape,
+                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't'
+                    ) {
+                        continue;
+                    }
+                    if escape != b'u' {
+                        return Err("JSON escape is invalid");
+                    }
+                    for _ in 0..4 {
+                        if !self.bytes.get(self.at).is_some_and(u8::is_ascii_hexdigit) {
+                            return Err("JSON Unicode escape is invalid");
+                        }
+                        self.at += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Err("JSON string is unterminated")
+    }
+
+    fn number(&mut self) -> Result<(), &'static str> {
+        if self.bytes.get(self.at) == Some(&b'-') {
+            self.at += 1;
+        }
+        match self.bytes.get(self.at) {
+            Some(b'0') => self.at += 1,
+            Some(b'1'..=b'9') => {
+                self.at += 1;
+                while self.bytes.get(self.at).is_some_and(u8::is_ascii_digit) {
+                    self.at += 1;
+                }
+            }
+            _ => return Err("JSON number is invalid"),
+        }
+        if self.bytes.get(self.at) == Some(&b'.') {
+            self.at += 1;
+            if !self.bytes.get(self.at).is_some_and(u8::is_ascii_digit) {
+                return Err("JSON number is invalid");
+            }
+            while self.bytes.get(self.at).is_some_and(u8::is_ascii_digit) {
+                self.at += 1;
+            }
+        }
+        if self
+            .bytes
+            .get(self.at)
+            .is_some_and(|byte| matches!(byte, b'e' | b'E'))
+        {
+            self.at += 1;
+            if self
+                .bytes
+                .get(self.at)
+                .is_some_and(|byte| matches!(byte, b'+' | b'-'))
+            {
+                self.at += 1;
+            }
+            if !self.bytes.get(self.at).is_some_and(u8::is_ascii_digit) {
+                return Err("JSON number is invalid");
+            }
+            while self.bytes.get(self.at).is_some_and(u8::is_ascii_digit) {
+                self.at += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn value(&mut self) -> Result<&'static str, &'static str> {
+        self.space();
+        match self.bytes.get(self.at).copied() {
+            Some(b'"') => {
+                self.string()?;
+                Ok("string")
+            }
+            Some(b'-' | b'0'..=b'9') => {
+                self.number()?;
+                Ok("number")
+            }
+            Some(b'n') if self.bytes.get(self.at..self.at + 4) == Some(b"null") => {
+                self.at += 4;
+                Ok("null")
+            }
+            Some(b't') if self.bytes.get(self.at..self.at + 4) == Some(b"true") => {
+                self.at += 4;
+                Ok("bool")
+            }
+            Some(b'f') if self.bytes.get(self.at..self.at + 5) == Some(b"false") => {
+                self.at += 5;
+                Ok("bool")
+            }
+            Some(open @ (b'[' | b'{')) => {
+                if self.depth >= 128 {
+                    return Err("JSON nesting exceeds 128 levels");
+                }
+                self.at += 1;
+                self.depth += 1;
+                self.space();
+                let close = if open == b'[' { b']' } else { b'}' };
+                if self.bytes.get(self.at) == Some(&close) {
+                    self.at += 1;
+                    self.depth -= 1;
+                    return Ok(if open == b'[' { "array" } else { "object" });
+                }
+                loop {
+                    if open == b'{' {
+                        self.string()?;
+                        self.space();
+                        if self.bytes.get(self.at) != Some(&b':') {
+                            return Err("JSON object key is missing ':'");
+                        }
+                        self.at += 1;
+                    }
+                    self.value()?;
+                    self.space();
+                    if self.bytes.get(self.at) == Some(&close) {
+                        self.at += 1;
+                        self.depth -= 1;
+                        return Ok(if open == b'[' { "array" } else { "object" });
+                    }
+                    if self.bytes.get(self.at) != Some(&b',') {
+                        return Err("JSON container is missing ',' or its closing delimiter");
+                    }
+                    self.at += 1;
+                    self.space();
+                }
+            }
+            _ => Err("JSON value is invalid"),
+        }
+    }
+}
+
+fn runtime_json(source: String) -> io::Result<RuntimeJson> {
+    if source.len() > HTTP_BODY_LIMIT {
+        return Err(http_error(
+            io::ErrorKind::InvalidInput,
+            "JSON document exceeds the 16 MiB limit",
+        ));
+    }
+    let mut parser = JsonParser {
+        bytes: source.as_bytes(),
+        at: 0,
+        depth: 0,
+    };
+    let kind = parser
+        .value()
+        .map_err(|message| http_error(io::ErrorKind::InvalidData, message))?;
+    parser.space();
+    if parser.at != parser.bytes.len() {
+        return Err(http_error(
+            io::ErrorKind::InvalidData,
+            "JSON document has trailing data",
+        ));
+    }
+    Ok(RuntimeJson { text: source, kind })
+}
+
 struct RuntimeTcpStreamState {
     socket: Option<StdTcpStream>,
     read_shutdown: bool,
@@ -648,6 +896,7 @@ fn runtime_bytes(bytes: Vec<u8>) -> Value {
 fn runtime_http_body(value: Value) -> Option<Vec<u8>> {
     match value {
         Value::String(text) => Some(text.text.into_bytes()),
+        Value::Json(json) => Some(json.text.into_bytes()),
         Value::List { values, .. } | Value::Slice(values) => values
             .into_iter()
             .map(|value| match value {
@@ -1404,6 +1653,8 @@ enum Value {
     CStr(RuntimeCString),
     Memory(RuntimeMemory),
     Path(PathBuf),
+    Url(RuntimeUrl),
+    Json(RuntimeJson),
     IpAddress(RuntimeIpAddress),
     SocketAddress(RuntimeSocketAddress),
     TcpStream(RuntimeTcpStream),
@@ -2883,6 +3134,8 @@ impl Interpreter {
                             | "get_timeout"
                             | "post"
                             | "post_timeout"
+                            | "post_json"
+                            | "post_json_timeout"
                             | "put"
                             | "put_timeout"
                             | "patch"
@@ -2906,13 +3159,15 @@ impl Interpreter {
                         name if name.starts_with("delete") => ("DELETE".into(), 0),
                         _ => ("GET".into(), 0),
                     };
-                    let Value::String(url) = self.evaluate(program, &arguments[url_index])? else {
-                        unreachable!("type checking validates HTTP URL")
+                    let url = match self.evaluate(program, &arguments[url_index])? {
+                        Value::String(url) => url.text,
+                        Value::Url(url) => url.text,
+                        _ => unreachable!("type checking validates HTTP URL"),
                     };
                     if field == "request" {
                         let request = http_method(&method)
                             .and_then(|method| {
-                                parse_http_url(&url.text).map(|url| RuntimeHttpRequest {
+                                parse_http_url(&url).map(|url| RuntimeHttpRequest {
                                     method,
                                     url: url.to_string(),
                                     headers: vec![],
@@ -2925,9 +3180,12 @@ impl Interpreter {
                     let (body, headers) = if matches!(method.as_str(), "POST" | "PUT" | "PATCH") {
                         let value = self.evaluate(program, &arguments[1])?;
                         let text = matches!(value, Value::String(_));
+                        let json = matches!(value, Value::Json(_));
                         let body = runtime_http_body(value)
                             .unwrap_or_else(|| unreachable!("type checking validates HTTP body"));
-                        let headers = if text {
+                        let headers = if json {
+                            vec![("Content-Type".into(), "application/json".into())]
+                        } else if text {
                             vec![("Content-Type".into(), "text/plain; charset=utf-8".into())]
                         } else {
                             vec![]
@@ -2957,7 +3215,7 @@ impl Interpreter {
                         FutureWork::HttpRequest(
                             RuntimeHttpRequest {
                                 method,
-                                url: url.text,
+                                url,
                                 headers,
                                 body,
                             },
@@ -2974,6 +3232,21 @@ impl Interpreter {
                         return Err(self.error("Path cannot contain a NUL byte", arguments[0].span));
                     }
                     return Ok(Value::Path(path));
+                }
+                if matches!(&callee.node, Expression::Identifier(name) if name == "Url") {
+                    let Value::String(source) = self.evaluate(program, &arguments[0])? else {
+                        unreachable!("type checking validates URL source")
+                    };
+                    return Ok(runtime_result(
+                        parse_http_url(&source.text)
+                            .map(|_| Value::Url(RuntimeUrl { text: source.text })),
+                    ));
+                }
+                if matches!(&callee.node, Expression::Identifier(name) if name == "Json") {
+                    let Value::String(source) = self.evaluate(program, &arguments[0])? else {
+                        unreachable!("type checking validates JSON source")
+                    };
+                    return Ok(runtime_result(runtime_json(source.text).map(Value::Json)));
                 }
                 if let Expression::FieldAccess { object, field, .. } = &callee.node
                     && matches!(&object.node, Expression::Identifier(name) if name == "String")
@@ -4073,6 +4346,19 @@ impl Interpreter {
                                     format!("HTTP response body is not valid UTF-8: {error}"),
                                 ))),
                             }),
+                            "json" => Ok(runtime_result(
+                                String::from_utf8(response.body.clone())
+                                    .map_err(|error| {
+                                        http_error(
+                                            io::ErrorKind::InvalidData,
+                                            format!(
+                                                "HTTP response body is not valid UTF-8: {error}"
+                                            ),
+                                        )
+                                    })
+                                    .and_then(runtime_json)
+                                    .map(Value::Json),
+                            )),
                             "header" => {
                                 let Value::String(name) = self.evaluate(program, &arguments[0])?
                                 else {
@@ -4130,7 +4416,7 @@ impl Interpreter {
                     if http_request_receiver
                         && matches!(
                             field.as_str(),
-                            "header" | "text" | "bytes" | "send" | "send_timeout"
+                            "header" | "text" | "bytes" | "json" | "send" | "send_timeout"
                         )
                     {
                         let value = self.consume(program, object)?;
@@ -4155,21 +4441,25 @@ impl Interpreter {
                                         .map(|()| Value::HttpRequest(request));
                                     Ok(runtime_result(result))
                                 }
-                                "text" | "bytes" => {
+                                "text" | "bytes" | "json" => {
                                     let body =
                                         runtime_http_body(self.evaluate(program, &arguments[0])?)
                                             .unwrap_or_else(|| {
                                                 unreachable!("type checking validates HTTP body")
                                             });
                                     request.body = body;
-                                    if field == "text"
+                                    if matches!(field.as_str(), "text" | "json")
                                         && !request.headers.iter().any(|(name, _)| {
                                             name.eq_ignore_ascii_case("content-type")
                                         })
                                     {
                                         request.headers.push((
                                             "Content-Type".into(),
-                                            "text/plain; charset=utf-8".into(),
+                                            if field == "json" {
+                                                "application/json".into()
+                                            } else {
+                                                "text/plain; charset=utf-8".into()
+                                            },
                                         ));
                                     }
                                     Ok(runtime_result(
@@ -4363,6 +4653,46 @@ impl Interpreter {
                                 path.parent().map(|value| Value::Path(value.to_path_buf())),
                             )),
                             _ => Err(self.error("unknown Path operation", expression.span)),
+                        };
+                    }
+                    if let Value::Url(url) = self.evaluate(program, object)? {
+                        return match field.as_str() {
+                            "as_string" => {
+                                Ok(Value::String(RuntimeString::literal(url.text.clone())))
+                            }
+                            "scheme" => Ok(Value::String(RuntimeString::literal(
+                                url.scheme().to_owned(),
+                            ))),
+                            "host" => Ok(option_value(url.host().map(|host| {
+                                Value::String(RuntimeString::literal(host.to_owned()))
+                            }))),
+                            "port" => Ok(option_value(
+                                url.port().map(|port| Value::UInt(u64::from(port))),
+                            )),
+                            "path" => {
+                                Ok(Value::String(RuntimeString::literal(url.path().to_owned())))
+                            }
+                            "query" => Ok(option_value(url.query().map(|query| {
+                                Value::String(RuntimeString::literal(query.to_owned()))
+                            }))),
+                            "is_secure" => {
+                                Ok(Value::Bool(url.scheme().eq_ignore_ascii_case("https")))
+                            }
+                            _ => Err(self.error("unknown Url operation", expression.span)),
+                        };
+                    }
+                    if let Value::Json(json) = self.evaluate(program, object)? {
+                        return match field.as_str() {
+                            "as_string" => Ok(Value::String(RuntimeString::literal(json.text))),
+                            "kind" => Ok(Value::String(RuntimeString::literal(json.kind.into()))),
+                            "len" => Ok(Value::UInt(json.text.len() as u64)),
+                            "is_null" => Ok(Value::Bool(json.kind == "null")),
+                            "is_bool" => Ok(Value::Bool(json.kind == "bool")),
+                            "is_number" => Ok(Value::Bool(json.kind == "number")),
+                            "is_string" => Ok(Value::Bool(json.kind == "string")),
+                            "is_array" => Ok(Value::Bool(json.kind == "array")),
+                            "is_object" => Ok(Value::Bool(json.kind == "object")),
+                            _ => Err(self.error("unknown Json operation", expression.span)),
                         };
                     }
                     if let Value::Instant(instant) = self.evaluate(program, object)?
@@ -5686,6 +6016,8 @@ fn value_type_name(value: &Value) -> &str {
         Value::CStr(_) => "CStr",
         Value::Memory(_) => "Memory",
         Value::Path(_) => "Path",
+        Value::Url(_) => "Url",
+        Value::Json(_) => "Json",
         Value::IpAddress(_) => "IpAddress",
         Value::SocketAddress(_) => "SocketAddress",
         Value::TcpStream(_) => "TcpStream",
@@ -5762,6 +6094,8 @@ fn value_is_copy(program: &Program, value: &Value) -> bool {
         | Value::MutexGuard(_)
         | Value::AtomicInt(_)
         | Value::Path(_)
+        | Value::Url(_)
+        | Value::Json(_)
         | Value::SocketAddress(_)
         | Value::TcpStream(_)
         | Value::TlsStream(_)
@@ -6135,6 +6469,8 @@ fn display_value(value: Value) -> String {
         Value::CString(value) | Value::CStr(value) => value.text(),
         Value::Memory(_) => "<Memory>".into(),
         Value::Path(value) => value.to_string_lossy().into_owned(),
+        Value::Url(value) => value.text,
+        Value::Json(value) => value.text,
         Value::IpAddress(value) => value.0.to_string(),
         Value::SocketAddress(value) => format!("{}:{}", value.host, value.port),
         Value::TcpStream(_) => "<TcpStream>".into(),

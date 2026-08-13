@@ -1,0 +1,13 @@
+fn inspect() -> Result<bool, ConversionError> {
+    document = Json("{\"name\":\"DISP\",\"safe\":true,\"passes\":[22,23]}")?
+    print(document.kind())
+    print(document.is_object())
+    print(document.is_array())
+    print(document.len())
+    print(document.as_string())
+    return Ok(true)
+}
+
+fn main() {
+    print(inspect())
+}

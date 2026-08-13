@@ -32,6 +32,8 @@ pub enum Type {
     CStr,
     Memory,
     Path,
+    Url,
+    Json,
     IpAddress,
     SocketAddress,
     TcpStream,
@@ -92,6 +94,8 @@ impl Type {
             | Self::CString
             | Self::Memory
             | Self::Path
+            | Self::Url
+            | Self::Json
             | Self::SocketAddress
             | Self::TcpStream
             | Self::TlsStream
@@ -773,6 +777,8 @@ impl<'a> Lowering<'a> {
             "CFloat" => Type::Float { width: 32 },
             "CDouble" => Type::Float { width: 64 },
             "Path" => Type::Path,
+            "Url" => Type::Url,
+            "Json" => Type::Json,
             "IpAddress" => Type::IpAddress,
             "SocketAddress" => Type::SocketAddress,
             "TcpStream" => Type::TcpStream,
@@ -1867,6 +1873,8 @@ impl FunctionLowering<'_, '_> {
                             | "get_timeout"
                             | "post"
                             | "post_timeout"
+                            | "post_json"
+                            | "post_json_timeout"
                             | "put"
                             | "put_timeout"
                             | "patch"
@@ -2407,6 +2415,55 @@ impl FunctionLowering<'_, '_> {
                     span,
                 });
             }
+            if matches!(receiver.ty, Type::Url) {
+                let mut args = vec![receiver];
+                args.extend(
+                    arguments
+                        .iter()
+                        .map(|x| self.lower_expr(x))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+                let ty = match field.as_str() {
+                    "as_string" | "scheme" | "path" => Type::String,
+                    "host" | "query" => Type::Option(Box::new(Type::String)),
+                    "port" => Type::Option(Box::new(Type::Int {
+                        signed: false,
+                        width: None,
+                    })),
+                    _ => Type::Bool,
+                };
+                return Ok(Expr {
+                    kind: ExprKind::Call(Call {
+                        target: CallTarget::Intrinsic(format!("Url.{field}")),
+                        arguments: args,
+                        receiver: Some(ReceiverMode::Shared),
+                        substitutions: vec![],
+                    }),
+                    ty,
+                    span,
+                });
+            }
+            if matches!(receiver.ty, Type::Json) {
+                let args = vec![receiver];
+                let ty = match field.as_str() {
+                    "as_string" | "kind" => Type::String,
+                    "len" => Type::Int {
+                        signed: false,
+                        width: None,
+                    },
+                    _ => Type::Bool,
+                };
+                return Ok(Expr {
+                    kind: ExprKind::Call(Call {
+                        target: CallTarget::Intrinsic(format!("Json.{field}")),
+                        arguments: args,
+                        receiver: Some(ReceiverMode::Shared),
+                        substitutions: vec![],
+                    }),
+                    ty,
+                    span,
+                });
+            }
             if matches!(receiver.ty, Type::TcpStream) {
                 let mut args = vec![receiver];
                 args.extend(
@@ -2527,6 +2584,10 @@ impl FunctionLowering<'_, '_> {
                         Box::new(Type::String),
                         Box::new(Type::Generic("HttpError".into())),
                     ),
+                    "json" => Type::Result(
+                        Box::new(Type::Json),
+                        Box::new(Type::Generic("HttpError".into())),
+                    ),
                     "url" => Type::String,
                     "header" => Type::Option(Box::new(Type::String)),
                     _ => Type::Unknown,
@@ -2551,7 +2612,7 @@ impl FunctionLowering<'_, '_> {
                         .collect::<Result<Vec<_>, _>>()?,
                 );
                 let ty = match field.as_str() {
-                    "header" | "text" | "bytes" => Type::Result(
+                    "header" | "text" | "bytes" | "json" => Type::Result(
                         Box::new(Type::HttpRequest),
                         Box::new(Type::Generic("HttpError".into())),
                     ),
@@ -3063,6 +3124,44 @@ impl FunctionLowering<'_, '_> {
                         substitutions: vec![],
                     }),
                     ty: Type::Path,
+                    span,
+                });
+            }
+            if name == "Url" {
+                let args = arguments
+                    .iter()
+                    .map(|x| self.lower_expr(x))
+                    .collect::<Result<Vec<_>, _>>()?;
+                return Ok(Expr {
+                    kind: ExprKind::Call(Call {
+                        target: CallTarget::Intrinsic("Url.parse".into()),
+                        arguments: args,
+                        receiver: None,
+                        substitutions: vec![],
+                    }),
+                    ty: Type::Result(
+                        Box::new(Type::Url),
+                        Box::new(Type::Generic("NetworkError".into())),
+                    ),
+                    span,
+                });
+            }
+            if name == "Json" {
+                let args = arguments
+                    .iter()
+                    .map(|x| self.lower_expr(x))
+                    .collect::<Result<Vec<_>, _>>()?;
+                return Ok(Expr {
+                    kind: ExprKind::Call(Call {
+                        target: CallTarget::Intrinsic("Json.parse".into()),
+                        arguments: args,
+                        receiver: None,
+                        substitutions: vec![],
+                    }),
+                    ty: Type::Result(
+                        Box::new(Type::Json),
+                        Box::new(Type::Generic("ConversionError".into())),
+                    ),
                     span,
                 });
             }
@@ -3704,6 +3803,8 @@ fn surface_type_is_copy(ty: &Type) -> bool {
         | Type::CString
         | Type::Memory
         | Type::Path
+        | Type::Url
+        | Type::Json
         | Type::IpAddress
         | Type::SocketAddress
         | Type::TcpStream

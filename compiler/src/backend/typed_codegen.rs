@@ -183,6 +183,8 @@ fn async_operations(
                         | "Http.get_timeout"
                         | "Http.post"
                         | "Http.post_timeout"
+                        | "Http.post_json"
+                        | "Http.post_json_timeout"
                         | "Http.put"
                         | "Http.put_timeout"
                         | "Http.patch"
@@ -569,6 +571,8 @@ pub fn supported(program: &mir::Program, ty: &hir::Type) -> bool {
         | hir::Type::CStr
         | hir::Type::Memory
         | hir::Type::Path
+        | hir::Type::Url
+        | hir::Type::Json
         | hir::Type::IpAddress
         | hir::Type::SocketAddress
         | hir::Type::TcpStream
@@ -1153,6 +1157,8 @@ fn terminator(
                             | "Http.get_timeout"
                             | "Http.post"
                             | "Http.post_timeout"
+                            | "Http.post_json"
+                            | "Http.post_json_timeout"
                             | "Http.put"
                             | "Http.put_timeout"
                             | "Http.patch"
@@ -1182,15 +1188,24 @@ fn terminator(
                         let (body, _) =
                             system_argument(program, function, &arguments[1], substitutions);
                         let text = matches!(body_ty, hir::Type::String | hir::Type::Str);
+                        let json = matches!(body_ty, hir::Type::Json);
                         (
                             format!("(const char*)({body})->data"),
                             format!("({body})->len"),
-                            if text {
+                            if json {
+                                "\"Content-Type: application/json\\r\\n\""
+                            } else if text {
                                 "\"Content-Type: text/plain; charset=utf-8\\r\\n\""
                             } else {
                                 "NULL"
                             },
-                            if text { "41" } else { "0" },
+                            if json {
+                                "32"
+                            } else if text {
+                                "41"
+                            } else {
+                                "0"
+                            },
                         )
                     } else {
                         ("NULL".into(), "0".into(), "NULL", "0")
@@ -1501,6 +1516,22 @@ fn terminator(
                     format!(
                         "disp_path_from_bytes(({source})->data,({source})->len,{},{})",
                         span.start.line, span.start.column
+                    )
+                }
+                hir::CallTarget::Intrinsic(name) if name == "Url.parse" => {
+                    let (source, _) =
+                        system_argument(program, function, &arguments[0], substitutions);
+                    let result_c = native_types::c_type(&destination_ty);
+                    format!(
+                        "({{{result_c} _r={{0}};disp_native_url _url={{0}};disp_native_string _error={{0}};if(disp_url_parse(({source})->data,({source})->len,&_url,&_error)){{_r.tag=0;_r.payload.v0.f0=_url;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                    )
+                }
+                hir::CallTarget::Intrinsic(name) if name == "Json.parse" => {
+                    let (source, _) =
+                        system_argument(program, function, &arguments[0], substitutions);
+                    let result_c = native_types::c_type(&destination_ty);
+                    format!(
+                        "({{{result_c} _r={{0}};disp_native_json _json={{0}};disp_native_string _error={{0}};if(disp_json_parse(({source})->data,({source})->len,&_json,&_error)){{_r.tag=0;_r.payload.v0.f0=_json;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
                     )
                 }
                 hir::CallTarget::Intrinsic(name) if name == "SocketAddress.new" => {
@@ -1985,6 +2016,12 @@ fn terminator(
                                 "({{{result_c} _r={{0}};disp_native_string _text={{0}},_error={{0}};if(disp_http_response_text({response},&_text,&_error)){{_r.tag=0;_r.payload.v0.f0=_text;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
                             )
                         }
+                        "HttpResponse.json" => {
+                            let result_c = native_types::c_type(&destination_ty);
+                            format!(
+                                "({{{result_c} _r={{0}};disp_native_json _json={{0}};disp_native_string _error={{0}};if(disp_http_response_json({response},&_json,&_error)){{_r.tag=0;_r.payload.v0.f0=_json;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                            )
+                        }
                         "HttpResponse.header" => {
                             let option_c = native_types::c_type(&destination_ty);
                             let (header, _) =
@@ -2016,13 +2053,14 @@ fn terminator(
                                 "({{{result_c} _r={{0}};disp_native_http_request _next={{0}};disp_native_string _error={{0}};if(disp_http_builder_header({request},({header})->data,({header})->len,({value})->data,({value})->len,&_next,&_error)){{_r.tag=0;_r.payload.v0.f0=_next;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
                             )
                         }
-                        "HttpRequest.text" | "HttpRequest.bytes" => {
+                        "HttpRequest.text" | "HttpRequest.bytes" | "HttpRequest.json" => {
                             let result_c = native_types::c_type(&destination_ty);
                             let (body, _) =
                                 system_argument(program, function, &arguments[1], substitutions);
                             let text = name == "HttpRequest.text";
+                            let json = name == "HttpRequest.json";
                             format!(
-                                "({{{result_c} _r={{0}};disp_native_http_request _next={{0}};disp_native_string _error={{0}};if(disp_http_builder_body({request},({body})->data,({body})->len,{text},&_next,&_error)){{_r.tag=0;_r.payload.v0.f0=_next;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                                "({{{result_c} _r={{0}};disp_native_http_request _next={{0}};disp_native_string _error={{0}};if(disp_http_builder_body({request},({body})->data,({body})->len,{text},{json},&_next,&_error)){{_r.tag=0;_r.payload.v0.f0=_next;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
                             )
                         }
                         "HttpRequest.send" | "HttpRequest.send_timeout" => {
@@ -2105,6 +2143,49 @@ fn terminator(
                                 "({{{option_c} _r={{0}};size_t _end=({path})->len;while(_end>1&&((({path})->data[_end-1]=='/')||(({path})->data[_end-1]=='\\\\')))_end--;size_t _split=_end;while(_split&&({path})->data[_split-1]!='/'&&({path})->data[_split-1]!='\\\\')_split--;if(({path})->len){{size_t _parent=_split?(_split==1?1:_split-1):0;_r.tag=1;_r.payload.v1.f0=disp_path_from_bytes(({path})->data,_parent,0,0);}}_r;}})"
                             )
                         }
+                        _ => unreachable!(),
+                    }
+                }
+                hir::CallTarget::Intrinsic(name) if name.starts_with("Url.") => {
+                    let (url, _) = system_argument(program, function, &arguments[0], substitutions);
+                    match name.as_str() {
+                        "Url.as_string" => format!("disp_url_as_string({url})"),
+                        "Url.scheme" => format!("disp_url_scheme({url})"),
+                        "Url.host" | "Url.query" => {
+                            let option_c = native_types::c_type(&destination_ty);
+                            let helper = if name == "Url.host" {
+                                "disp_url_host"
+                            } else {
+                                "disp_url_query"
+                            };
+                            format!(
+                                "({{{option_c} _r={{0}};disp_native_string _value={{0}};if({helper}({url},&_value)){{_r.tag=1;_r.payload.v1.f0=_value;}}_r;}})"
+                            )
+                        }
+                        "Url.port" => {
+                            let option_c = native_types::c_type(&destination_ty);
+                            format!(
+                                "({{{option_c} _r={{0}};uint64_t _value=0;if(disp_url_port({url},&_value)){{_r.tag=1;_r.payload.v1.f0=_value;}}_r;}})"
+                            )
+                        }
+                        "Url.path" => format!("disp_url_path({url})"),
+                        "Url.is_secure" => format!("disp_url_is_secure({url})"),
+                        _ => unreachable!(),
+                    }
+                }
+                hir::CallTarget::Intrinsic(name) if name.starts_with("Json.") => {
+                    let (json, _) =
+                        system_argument(program, function, &arguments[0], substitutions);
+                    match name.as_str() {
+                        "Json.as_string" => format!("disp_json_as_string({json})"),
+                        "Json.kind" => format!("disp_json_kind({json})"),
+                        "Json.len" => format!("({json})->len"),
+                        "Json.is_null" => format!("disp_json_is_kind({json},\"null\")"),
+                        "Json.is_bool" => format!("disp_json_is_kind({json},\"bool\")"),
+                        "Json.is_number" => format!("disp_json_is_kind({json},\"number\")"),
+                        "Json.is_string" => format!("disp_json_is_kind({json},\"string\")"),
+                        "Json.is_array" => format!("disp_json_is_kind({json},\"array\")"),
+                        "Json.is_object" => format!("disp_json_is_kind({json},\"object\")"),
                         _ => unreachable!(),
                     }
                 }
@@ -3476,6 +3557,8 @@ fn to_dv(value: &str, ty: &hir::Type) -> String {
         hir::Type::CStr => format!("dv_string(({value}),strlen({value}))"),
         hir::Type::Memory => "dv_string(\"<Memory>\",8)".into(),
         hir::Type::Path => format!("dv_string(({value}).data,({value}).len)"),
+        hir::Type::Url => format!("dv_string(({value}).data,({value}).len)"),
+        hir::Type::Json => format!("dv_string(({value}).data,({value}).len)"),
         hir::Type::IpAddress => format!("dv_ip({value})"),
         hir::Type::SocketAddress => "dv_string(\"<SocketAddress>\",15)".into(),
         hir::Type::TcpStream => "dv_string(\"<TcpStream>\",11)".into(),
@@ -3718,6 +3801,8 @@ fn drop_value_depth(program: &mir::Program, value: &str, ty: &hir::Type, depth: 
         hir::Type::CString => format!("disp_cstring_drop(&({value}));"),
         hir::Type::Memory => format!("disp_memory_drop(&({value}));"),
         hir::Type::Path => format!("disp_path_drop(&({value}));"),
+        hir::Type::Url => format!("disp_url_drop(&({value}));"),
+        hir::Type::Json => format!("disp_json_drop(&({value}));"),
         hir::Type::SocketAddress => format!("disp_socket_address_drop(&({value}));"),
         hir::Type::TcpStream => format!("disp_tcp_stream_drop(&({value}));"),
         hir::Type::TlsStream => format!("disp_tls_stream_drop(&({value}));"),

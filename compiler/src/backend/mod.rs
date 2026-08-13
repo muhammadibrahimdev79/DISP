@@ -150,7 +150,7 @@ pub fn build(
 
 fn type_uses_http(ty: &hir::Type) -> bool {
     match ty {
-        hir::Type::HttpRequest | hir::Type::HttpResponse => true,
+        hir::Type::Url | hir::Type::HttpRequest | hir::Type::HttpResponse => true,
         hir::Type::Array(inner, _)
         | hir::Type::Slice(inner)
         | hir::Type::List(inner)
@@ -179,6 +179,7 @@ fn type_uses_http(ty: &hir::Type) -> bool {
 fn type_uses_networking(ty: &hir::Type) -> bool {
     match ty {
         hir::Type::IpAddress
+        | hir::Type::Url
         | hir::Type::SocketAddress
         | hir::Type::TcpStream
         | hir::Type::TlsStream

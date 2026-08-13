@@ -842,6 +842,13 @@ limit. Native/interpreter differential tests exercise successful responses, conn
 redirects, chunked
 bodies, invalid UTF-8, malformed framing, typed failures, laziness, and zero deadlines.
 
+`Url` and `Json` use concrete owned three-word native layouts. URL parsing shares the safe HTTP
+URL policy and can feed requests without converting back through an ordinary string. JSON is
+validated before ownership is established, with a 16 MiB document bound and a 128-level nesting
+bound in both runtimes. Generated native code contains its own bounded parser, avoiding a dynamic
+JSON runtime dependency. HTTP JSON builders snapshot validated bytes and response conversion
+validates the full document before returning `Json`.
+
 ---
 
 # 48. Cryptography Runtime Policy
