@@ -159,6 +159,28 @@ impl<'a> LayoutEngine<'a> {
                 aggregate(&[self.target.pointer_alignment])
             }
             hir::Type::Instant | hir::Type::Duration => scalar(8, 8),
+            hir::Type::ProcessCommand => aggregate(&[
+                self.target.pointer_alignment,
+                self.target.pointer_alignment,
+                self.target.pointer_alignment,
+                self.target.pointer_alignment,
+                self.target.pointer_alignment,
+                self.target.pointer_alignment,
+                self.target.pointer_alignment,
+                self.target.pointer_alignment,
+                self.target.pointer_alignment,
+                1,
+                self.target.pointer_alignment,
+                self.target.pointer_alignment,
+                self.target.pointer_alignment,
+                self.target.pointer_alignment,
+                1,
+                self.target.pointer_alignment,
+                self.target.pointer_alignment,
+                self.target.pointer_alignment,
+                8,
+                1,
+            ]),
             hir::Type::ProcessOutput => aggregate(&[
                 8,
                 self.target.pointer_alignment,

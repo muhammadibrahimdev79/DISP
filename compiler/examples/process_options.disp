@@ -1,0 +1,12 @@
+fn main() {
+    command = Process.command(Path("C:/Windows/System32/where.exe"))
+        .arg("cmd.exe")
+        .directory(Path("C:/Windows"))
+        .environment("DISP_EXAMPLE", "safe")
+        .input_text("")
+        .timeout(Duration.from_seconds(3))
+    match command.run() {
+        Ok(output) => print(output.success())
+        Err(error) => print(error)
+    }
+}

@@ -14,7 +14,7 @@ code generation, first-class functions and ownership-safe closures, algebraic
 data types, generics and traits, strings, slices,
 lists, maps, sets, iteration, paths, filesystem operations, and time
 foundations, UTF-8 command-line arguments, explicit environment reads, injection-safe direct
-process execution with bounded stdout/stderr capture, native concurrency, checked C
+process execution plus linear configured commands with bounded input/output and timeouts, native concurrency, checked C
 interoperability, explicit system-memory
 control, deterministic multi-file modules, content-locked local package dependencies,
 and lazy owned `Future<T>` values compiled to resumable native `async fn` state machines.

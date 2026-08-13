@@ -45,6 +45,7 @@ pub enum Type {
     UdpDatagram,
     Instant,
     Duration,
+    ProcessCommand,
     ProcessOutput,
     Array(Box<Type>, usize),
     Slice(Box<Type>),
@@ -114,6 +115,7 @@ impl Type {
             | Self::Mutex(_)
             | Self::MutexGuard(_)
             | Self::AtomicInt
+            | Self::ProcessCommand
             | Self::ProcessOutput
             | Self::Generic(_)
             | Self::Function(_, _)
@@ -780,6 +782,7 @@ impl<'a> Lowering<'a> {
             "CDouble" => Type::Float { width: 64 },
             "Path" => Type::Path,
             "ProcessOutput" => Type::ProcessOutput,
+            "ProcessCommand" => Type::ProcessCommand,
             "Url" => Type::Url,
             "Json" => Type::Json,
             "IpAddress" => Type::IpAddress,
@@ -2181,6 +2184,7 @@ impl FunctionLowering<'_, '_> {
                         ("Duration", _) => Type::Duration,
                         ("Environment", "arguments") => Type::List(Box::new(Type::String)),
                         ("Environment", "get") => Type::Option(Box::new(Type::String)),
+                        ("Process", "command") => Type::ProcessCommand,
                         ("Process", "run") => {
                             Type::Result(Box::new(Type::ProcessOutput), Box::new(io))
                         }
@@ -2534,6 +2538,33 @@ impl FunctionLowering<'_, '_> {
                         target: CallTarget::Intrinsic(format!("ProcessOutput.{field}")),
                         arguments: args,
                         receiver: Some(ReceiverMode::Shared),
+                        substitutions: vec![],
+                    }),
+                    ty,
+                    span,
+                });
+            }
+            if matches!(receiver.ty, Type::ProcessCommand) {
+                let mut args = vec![receiver];
+                args.extend(
+                    arguments
+                        .iter()
+                        .map(|x| self.lower_expr(x))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+                let ty = if field == "run" {
+                    Type::Result(
+                        Box::new(Type::ProcessOutput),
+                        Box::new(Type::Generic("IoError".into())),
+                    )
+                } else {
+                    Type::ProcessCommand
+                };
+                return Ok(Expr {
+                    kind: ExprKind::Call(Call {
+                        target: CallTarget::Intrinsic(format!("ProcessCommand.{field}")),
+                        arguments: args,
+                        receiver: Some(ReceiverMode::Move),
                         substitutions: vec![],
                     }),
                     ty,
@@ -3965,6 +3996,7 @@ fn surface_type_is_copy(ty: &Type) -> bool {
         | Type::CString
         | Type::Memory
         | Type::Path
+        | Type::ProcessCommand
         | Type::ProcessOutput
         | Type::Url
         | Type::Json

@@ -1416,7 +1416,14 @@ impl<'a> Analyzer<'a> {
                 )
             {
                 for argument in arguments {
-                    self.check_expr(argument, UseMode::Read)?;
+                    self.check_expr(
+                        argument,
+                        if owner == "Process" && field == "command" {
+                            UseMode::Consume
+                        } else {
+                            UseMode::Read
+                        },
+                    )?;
                 }
                 return Ok(match (owner.as_str(), field.as_str()) {
                     ("Path", _) => Ty::Path,
@@ -1449,6 +1456,7 @@ impl<'a> Analyzer<'a> {
                         Box::new(Ty::Owned("ProcessOutput".into())),
                         Box::new(Ty::Owned("IoError".into())),
                     ),
+                    ("Process", "command") => Ty::Owned("ProcessCommand".into()),
                     _ => Ty::Unit,
                 });
             }
@@ -1599,6 +1607,20 @@ impl<'a> Analyzer<'a> {
                         Box::new(Ty::Owned("String".into())),
                         Box::new(Ty::Owned("ConversionError".into())),
                     ),
+                });
+            }
+            if matches!(self.expr_ty(object), Ok(Ty::Owned(ref name)) if name == "ProcessCommand") {
+                self.check_expr(object, UseMode::Consume)?;
+                for argument in arguments {
+                    self.check_expr(argument, UseMode::Consume)?;
+                }
+                return Ok(if field == "run" {
+                    Ty::Result(
+                        Box::new(Ty::Owned("ProcessOutput".into())),
+                        Box::new(Ty::Owned("IoError".into())),
+                    )
+                } else {
+                    Ty::Owned("ProcessCommand".into())
                 });
             }
             if matches!(self.expr_ty(object), Ok(Ty::Url)) {
@@ -2473,6 +2495,28 @@ impl<'a> Analyzer<'a> {
             | Expression::Bool(_) => Ok(Ty::Copy),
             Expression::String(_) => Ok(Ty::Owned("String".into())),
             Expression::StructConstruct { name, .. } => Ok(Ty::Owned(name.clone())),
+            Expression::Call { callee, .. } => {
+                let Expression::FieldAccess { object, field, .. } = &callee.node else {
+                    return Ok(Ty::Owned("expression".into()));
+                };
+                if matches!(&object.node, Expression::Identifier(owner) if owner == "Process")
+                    && field == "command"
+                {
+                    return Ok(Ty::Owned("ProcessCommand".into()));
+                }
+                if matches!(self.expr_ty(object), Ok(Ty::Owned(ref name)) if name == "ProcessCommand")
+                {
+                    return Ok(if field == "run" {
+                        Ty::Result(
+                            Box::new(Ty::Owned("ProcessOutput".into())),
+                            Box::new(Ty::Owned("IoError".into())),
+                        )
+                    } else {
+                        Ty::Owned("ProcessCommand".into())
+                    });
+                }
+                Ok(Ty::Owned("expression".into()))
+            }
             _ => Ok(Ty::Owned("expression".into())),
         }
     }

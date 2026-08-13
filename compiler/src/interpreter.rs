@@ -15,6 +15,7 @@ use std::{
     },
     path::PathBuf,
     process::Command as StdCommand,
+    process::Stdio,
     sync::{
         Arc, Mutex as StdMutex, Weak,
         atomic::{AtomicBool, AtomicI64, Ordering},
@@ -2582,6 +2583,7 @@ enum Value {
     UdpDatagram(RuntimeUdpDatagram),
     Instant(StdInstant),
     Duration(StdDuration),
+    ProcessCommand(Box<RuntimeProcessCommand>),
     ProcessOutput(RuntimeProcessOutput),
     Thread(RuntimeThread),
     Future(RuntimeFuture),
@@ -2630,6 +2632,158 @@ struct RuntimeProcessOutput {
     status: i64,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct RuntimeProcessCommand {
+    program: PathBuf,
+    arguments: Vec<String>,
+    directory: Option<PathBuf>,
+    environment: Vec<(String, String)>,
+    clear_environment: bool,
+    input: Vec<u8>,
+    timeout: Option<StdDuration>,
+}
+
+fn execute_process(command: RuntimeProcessCommand) -> io::Result<Value> {
+    const MAX_ARGUMENTS: usize = 4096;
+    const MAX_ARGUMENT_BYTES: usize = 1024 * 1024;
+    const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
+    const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
+    if command.program.as_os_str().is_empty()
+        || command
+            .program
+            .to_str()
+            .is_some_and(|program| program.contains('\0'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process program path must be non-empty and contain no NUL",
+        ));
+    }
+    if command.arguments.len() > MAX_ARGUMENTS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process argument count exceeds 4096",
+        ));
+    }
+    let argument_bytes = command
+        .arguments
+        .iter()
+        .try_fold(0usize, |total, value| total.checked_add(value.len()))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "process arguments overflow"))?;
+    if argument_bytes > MAX_ARGUMENT_BYTES
+        || command.arguments.iter().any(|value| value.contains('\0'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process arguments exceed limits or contain NUL",
+        ));
+    }
+    if command.input.len() > MAX_INPUT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process input exceeds the 16 MiB limit",
+        ));
+    }
+    if command.environment.len() > MAX_ARGUMENTS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process environment override count exceeds 4096",
+        ));
+    }
+    if command.environment.iter().any(|(name, value)| {
+        name.is_empty() || name.contains('=') || name.contains('\0') || value.contains('\0')
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process environment names must be non-empty, names cannot contain '=', and names or values cannot contain NUL",
+        ));
+    }
+    if command.directory.as_ref().is_some_and(|directory| {
+        directory
+            .to_str()
+            .is_some_and(|directory| directory.contains('\0'))
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process working directory cannot contain NUL",
+        ));
+    }
+    let mut child = StdCommand::new(command.program);
+    child
+        .args(command.arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(directory) = command.directory {
+        child.current_dir(directory);
+    }
+    if command.clear_environment {
+        child.env_clear();
+    }
+    child.envs(command.environment);
+    let mut child = child.spawn()?;
+    let mut stdin = child.stdin.take().expect("piped child stdin");
+    let mut stdout = child.stdout.take().expect("piped child stdout");
+    let mut stderr = child.stderr.take().expect("piped child stderr");
+    let started = StdInstant::now();
+    thread::scope(|scope| -> io::Result<Value> {
+        let input = command.input;
+        let writer = scope.spawn(move || stdin.write_all(&input));
+        let out = scope.spawn(move || {
+            let mut bytes = Vec::new();
+            stdout
+                .by_ref()
+                .take((MAX_CAPTURE_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)?;
+            Ok::<_, io::Error>(bytes)
+        });
+        let err = scope.spawn(move || {
+            let mut bytes = Vec::new();
+            stderr
+                .by_ref()
+                .take((MAX_CAPTURE_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)?;
+            Ok::<_, io::Error>(bytes)
+        });
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if command
+                .timeout
+                .is_some_and(|timeout| started.elapsed() >= timeout)
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "process exceeded its configured timeout",
+                ));
+            }
+            thread::sleep(StdDuration::from_millis(1));
+        };
+        writer
+            .join()
+            .map_err(|_| io::Error::other("process input writer panicked"))??;
+        let stdout = out
+            .join()
+            .map_err(|_| io::Error::other("process stdout reader panicked"))??;
+        let stderr = err
+            .join()
+            .map_err(|_| io::Error::other("process stderr reader panicked"))??;
+        if stdout.len() > MAX_CAPTURE_BYTES || stderr.len() > MAX_CAPTURE_BYTES {
+            return Err(io::Error::other(
+                "process output exceeds the 16 MiB capture limit",
+            ));
+        }
+        Ok(Value::ProcessOutput(RuntimeProcessOutput {
+            status: status.code().map(i64::from).unwrap_or(-1),
+            stdout,
+            stderr,
+        }))
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -4693,57 +4847,44 @@ impl Interpreter {
                         };
                     }
                     if owner == "Process" {
-                        let Value::Path(program_path) = self.evaluate(program, &arguments[0])?
-                        else {
+                        let path = if field == "command" {
+                            self.consume(program, &arguments[0])?
+                        } else {
+                            self.evaluate(program, &arguments[0])?
+                        };
+                        let Value::Path(program_path) = path else {
                             unreachable!("type checking validates process paths")
                         };
+                        if field == "command" {
+                            return Ok(Value::ProcessCommand(Box::new(RuntimeProcessCommand {
+                                program: program_path,
+                                arguments: Vec::new(),
+                                directory: None,
+                                environment: Vec::new(),
+                                clear_environment: false,
+                                input: Vec::new(),
+                                timeout: None,
+                            })));
+                        }
                         let Value::List { values, .. } = self.evaluate(program, &arguments[1])?
                         else {
                             unreachable!("type checking validates process arguments")
                         };
-                        const MAX_ARGUMENTS: usize = 4096;
-                        const MAX_ARGUMENT_BYTES: usize = 1024 * 1024;
-                        if values.len() > MAX_ARGUMENTS {
-                            return Ok(runtime_result(Err(io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                "process argument count exceeds 4096",
-                            ))));
-                        }
-                        let mut command = StdCommand::new(program_path);
-                        let mut total = 0usize;
+                        let mut process_arguments = Vec::with_capacity(values.len());
                         for value in values {
                             let Value::String(value) = value else {
                                 unreachable!("type checking validates process arguments")
                             };
-                            if value.text.contains('\0') {
-                                return Ok(runtime_result(Err(io::Error::new(
-                                    io::ErrorKind::InvalidInput,
-                                    "process argument cannot contain NUL",
-                                ))));
-                            }
-                            total = total.saturating_add(value.text.len());
-                            command.arg(value.text);
+                            process_arguments.push(value.text);
                         }
-                        if total > MAX_ARGUMENT_BYTES {
-                            return Ok(runtime_result(Err(io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                "process arguments exceed 1 MiB",
-                            ))));
-                        }
-                        const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
-                        return Ok(runtime_result(command.output().and_then(|output| {
-                            if output.stdout.len() > MAX_CAPTURE_BYTES
-                                || output.stderr.len() > MAX_CAPTURE_BYTES
-                            {
-                                return Err(io::Error::other(
-                                    "process output exceeds the 16 MiB capture limit",
-                                ));
-                            }
-                            Ok(Value::ProcessOutput(RuntimeProcessOutput {
-                                status: output.status.code().map(i64::from).unwrap_or(-1),
-                                stdout: output.stdout,
-                                stderr: output.stderr,
-                            }))
+                        return Ok(runtime_result(execute_process(RuntimeProcessCommand {
+                            program: program_path,
+                            arguments: process_arguments,
+                            directory: None,
+                            environment: Vec::new(),
+                            clear_environment: false,
+                            input: Vec::new(),
+                            timeout: None,
                         })));
                     }
                     if owner == "Path" {
@@ -5911,6 +6052,119 @@ impl Interpreter {
                                 Err(self.error("unknown ProcessOutput operation", expression.span))
                             }
                         };
+                    }
+                    if matches!(
+                        field.as_str(),
+                        "arg"
+                            | "arguments"
+                            | "directory"
+                            | "environment"
+                            | "clear_environment"
+                            | "input"
+                            | "input_text"
+                            | "timeout"
+                            | "run"
+                    ) {
+                        let command = if let Some(place) = self.expression_place(object)
+                            && matches!(self.read_place(&place), Some(Value::ProcessCommand(_)))
+                        {
+                            Some(self.consume(program, object)?)
+                        } else {
+                            match self.evaluate(program, object)? {
+                                value @ Value::ProcessCommand(_) => Some(value),
+                                _ => None,
+                            }
+                        };
+                        if let Some(Value::ProcessCommand(mut command)) = command {
+                            match field.as_str() {
+                                "arg" => {
+                                    let Value::String(value) =
+                                        self.consume(program, &arguments[0])?
+                                    else {
+                                        unreachable!()
+                                    };
+                                    command.arguments.push(value.text);
+                                }
+                                "arguments" => {
+                                    let Value::List { values, .. } =
+                                        self.consume(program, &arguments[0])?
+                                    else {
+                                        unreachable!()
+                                    };
+                                    command.arguments.extend(values.into_iter().map(|value| {
+                                        let Value::String(value) = value else {
+                                            unreachable!()
+                                        };
+                                        value.text
+                                    }));
+                                }
+                                "directory" => {
+                                    let Value::Path(value) =
+                                        self.consume(program, &arguments[0])?
+                                    else {
+                                        unreachable!()
+                                    };
+                                    command.directory = Some(value);
+                                }
+                                "environment" => {
+                                    let Value::String(name) =
+                                        self.consume(program, &arguments[0])?
+                                    else {
+                                        unreachable!()
+                                    };
+                                    let Value::String(value) =
+                                        self.consume(program, &arguments[1])?
+                                    else {
+                                        unreachable!()
+                                    };
+                                    command
+                                        .environment
+                                        .retain(|(existing, _)| existing != &name.text);
+                                    command.environment.push((name.text, value.text));
+                                }
+                                "clear_environment" => command.clear_environment = true,
+                                "input" => {
+                                    let Value::List { values, .. } =
+                                        self.consume(program, &arguments[0])?
+                                    else {
+                                        unreachable!()
+                                    };
+                                    command.input = values
+                                        .into_iter()
+                                        .map(|value| {
+                                            let Value::Unsigned(value, 8) = value else {
+                                                unreachable!()
+                                            };
+                                            value as u8
+                                        })
+                                        .collect();
+                                }
+                                "input_text" => {
+                                    let Value::String(value) =
+                                        self.consume(program, &arguments[0])?
+                                    else {
+                                        unreachable!()
+                                    };
+                                    command.input = value.text.into_bytes();
+                                }
+                                "timeout" => {
+                                    let Value::Duration(value) =
+                                        self.evaluate(program, &arguments[0])?
+                                    else {
+                                        unreachable!()
+                                    };
+                                    command.timeout = Some(value);
+                                }
+                                "run" => return Ok(runtime_result(execute_process(*command))),
+                                _ => {
+                                    return Err(self.error(
+                                        "unknown ProcessCommand operation",
+                                        expression.span,
+                                    ));
+                                }
+                            }
+                            return Ok(Value::ProcessCommand(command));
+                        }
                     }
                     if let Value::Url(url) = self.evaluate(program, object)? {
                         return match field.as_str() {
@@ -7373,6 +7627,7 @@ fn value_type_name(value: &Value) -> &str {
         Value::Instant(_) => "Instant",
         Value::Duration(_) => "Duration",
         Value::ProcessOutput(_) => "ProcessOutput",
+        Value::ProcessCommand(_) => "ProcessCommand",
         Value::Thread(_) => "Thread",
         Value::Future(_) => "Future",
         Value::Task(_) => "Task",
@@ -7439,6 +7694,7 @@ fn value_is_copy(program: &Program, value: &Value) -> bool {
         | Value::AtomicInt(_)
         | Value::Path(_)
         | Value::ProcessOutput(_)
+        | Value::ProcessCommand(_)
         | Value::Url(_)
         | Value::Json(_)
         | Value::SocketAddress(_)
@@ -7834,6 +8090,7 @@ fn display_value(value: Value) -> String {
         Value::Instant(_) => "<Instant>".into(),
         Value::Duration(value) => format!("{}ns", value.as_nanos()),
         Value::ProcessOutput(value) => format!("<ProcessOutput:{}>", value.status),
+        Value::ProcessCommand(_) => "<ProcessCommand>".into(),
         Value::Thread(_) => "<Thread>".into(),
         Value::Future(_) => "<Future>".into(),
         Value::Task(_) => "<Task>".into(),

@@ -1049,6 +1049,7 @@ pub fn supported(program: &mir::Program, ty: &hir::Type) -> bool {
         | hir::Type::UdpDatagram
         | hir::Type::Instant
         | hir::Type::Duration
+        | hir::Type::ProcessCommand
         | hir::Type::ProcessOutput
         | hir::Type::Int { .. }
         | hir::Type::Float { .. } => true,
@@ -2952,6 +2953,11 @@ fn terminator(
                         _ => unreachable!(),
                     }
                 }
+                hir::CallTarget::Intrinsic(name) if name == "Process.command" => {
+                    let path_ty = operand_ty(program, function, &arguments[0], substitutions);
+                    let path = operand(program, function, &arguments[0], &path_ty, substitutions);
+                    format!("(disp_native_process_command){{.program={path}}}")
+                }
                 hir::CallTarget::Intrinsic(name) if name == "Process.run" => {
                     let (path, _) =
                         system_argument(program, function, &arguments[0], substitutions);
@@ -2959,8 +2965,177 @@ fn terminator(
                         system_argument(program, function, &arguments[1], substitutions);
                     let result_c = native_types::c_type(&destination_ty);
                     format!(
-                        "({{{result_c} _r={{0}};disp_native_process_output _output={{0}};disp_native_string _error={{0}};if(disp_process_run({path},({args})->data,({args})->len,&_output,&_error)){{_r.tag=0;_r.payload.v0.f0=_output;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                        "({{disp_native_process_command _c={{.program=*{path},.args=({args})->data,.args_len=({args})->len,.args_cap=({args})->len}};{result_c} _r={{0}};disp_native_process_output _output={{0}};disp_native_string _error={{0}};if(disp_process_run_command(&_c,&_output,&_error)){{_r.tag=0;_r.payload.v0.f0=_output;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
                     )
+                }
+                hir::CallTarget::Intrinsic(name) if name.starts_with("ProcessCommand.") => {
+                    let command_ty = operand_ty(program, function, &arguments[0], substitutions);
+                    let command =
+                        operand(program, function, &arguments[0], &command_ty, substitutions);
+                    if name == "ProcessCommand.run" {
+                        let result_c = native_types::c_type(&destination_ty);
+                        let command_c = native_types::c_type(&hir::Type::ProcessCommand);
+                        format!(
+                            "({{{command_c} _c={command};{result_c} _r={{0}};disp_native_process_output _output={{0}};disp_native_string _error={{0}};if(disp_process_run_command(&_c,&_output,&_error)){{_r.tag=0;_r.payload.v0.f0=_output;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}disp_process_command_drop(&_c);_r;}})"
+                        )
+                    } else {
+                        let reserve_args = "size_t _need=_c.args_len+1;if(_need>DISP_PROCESS_MAX_ARGUMENTS)dv_panic(\"process argument count exceeds 4096\",0,0);if(_need>_c.args_cap){size_t _cap=_c.args_cap?_c.args_cap*2:4;if(_cap<_need)_cap=_need;_c.args=(disp_native_string*)disp_realloc(_c.args,_cap*sizeof(disp_native_string),_Alignof(disp_native_string));_c.args_cap=_cap;}";
+                        let result = match name.as_str() {
+                            "ProcessCommand.arg" => {
+                                let actual =
+                                    operand_ty(program, function, &arguments[1], substitutions);
+                                if matches!(actual, hir::Type::String) {
+                                    let value = operand(
+                                        program,
+                                        function,
+                                        &arguments[1],
+                                        &actual,
+                                        substitutions,
+                                    );
+                                    format!("{{{reserve_args}_c.args[_c.args_len++]={value};}}")
+                                } else {
+                                    let (value, _) = system_argument(
+                                        program,
+                                        function,
+                                        &arguments[1],
+                                        substitutions,
+                                    );
+                                    format!(
+                                        "{{{reserve_args}_c.args[_c.args_len++]=disp_owned_bytes(({value})->data,({value})->len);}}"
+                                    )
+                                }
+                            }
+                            "ProcessCommand.arguments" => {
+                                let values_ty =
+                                    operand_ty(program, function, &arguments[1], substitutions);
+                                let values = operand(
+                                    program,
+                                    function,
+                                    &arguments[1],
+                                    &values_ty,
+                                    substitutions,
+                                );
+                                "{disp_t_Vs _v=VALUE;size_t _need;if(__builtin_add_overflow(_c.args_len,_v.len,&_need)||_need>DISP_PROCESS_MAX_ARGUMENTS)dv_panic(\"process argument count exceeds 4096\",0,0);if(_need>_c.args_cap){size_t _cap=_c.args_cap?_c.args_cap:4;while(_cap<_need)_cap*=2;_c.args=(disp_native_string*)disp_realloc(_c.args,_cap*sizeof(disp_native_string),_Alignof(disp_native_string));_c.args_cap=_cap;}if(_v.len)memcpy(_c.args+_c.args_len,_v.data,_v.len*sizeof(disp_native_string));_c.args_len=_need;disp_dealloc(_v.data);}".replace("VALUE", &values)
+                            }
+                            "ProcessCommand.directory" => {
+                                let path_ty =
+                                    operand_ty(program, function, &arguments[1], substitutions);
+                                let path = operand(
+                                    program,
+                                    function,
+                                    &arguments[1],
+                                    &path_ty,
+                                    substitutions,
+                                );
+                                format!(
+                                    "{{if(_c.has_directory)disp_path_drop(&_c.directory);_c.directory={path};_c.has_directory=true;}}"
+                                )
+                            }
+                            "ProcessCommand.environment" => {
+                                let key_ty =
+                                    operand_ty(program, function, &arguments[1], substitutions);
+                                let value_ty =
+                                    operand_ty(program, function, &arguments[2], substitutions);
+                                let key = if matches!(key_ty, hir::Type::String) {
+                                    operand(
+                                        program,
+                                        function,
+                                        &arguments[1],
+                                        &key_ty,
+                                        substitutions,
+                                    )
+                                } else {
+                                    let (value, _) = system_argument(
+                                        program,
+                                        function,
+                                        &arguments[1],
+                                        substitutions,
+                                    );
+                                    format!("disp_owned_bytes(({value})->data,({value})->len)")
+                                };
+                                let value = if matches!(value_ty, hir::Type::String) {
+                                    operand(
+                                        program,
+                                        function,
+                                        &arguments[2],
+                                        &value_ty,
+                                        substitutions,
+                                    )
+                                } else {
+                                    let (value, _) = system_argument(
+                                        program,
+                                        function,
+                                        &arguments[2],
+                                        substitutions,
+                                    );
+                                    format!("disp_owned_bytes(({value})->data,({value})->len)")
+                                };
+                                format!(
+                                    "{{disp_native_string _key={key},_value={value};size_t _found=SIZE_MAX;for(size_t _i=0;_i<_c.environment_len;_i++)if(_c.environment_keys[_i].len==_key.len&&!memcmp(_c.environment_keys[_i].data,_key.data,_key.len)){{_found=_i;break;}}if(_found!=SIZE_MAX){{disp_string_drop(&_c.environment_values[_found]);_c.environment_values[_found]=_value;disp_string_drop(&_key);}}else{{if(_c.environment_len>=4096)dv_panic(\"process environment override count exceeds 4096\",0,0);size_t _need=_c.environment_len+1;if(_need>_c.environment_cap){{size_t _cap=_c.environment_cap?_c.environment_cap*2:4;_c.environment_keys=(disp_native_string*)disp_realloc(_c.environment_keys,_cap*sizeof(disp_native_string),_Alignof(disp_native_string));_c.environment_values=(disp_native_string*)disp_realloc(_c.environment_values,_cap*sizeof(disp_native_string),_Alignof(disp_native_string));_c.environment_cap=_cap;}}_c.environment_keys[_c.environment_len]=_key;_c.environment_values[_c.environment_len]=_value;_c.environment_len++;}}}}"
+                                )
+                            }
+                            "ProcessCommand.clear_environment" => {
+                                "{_c.clear_environment=true;}".into()
+                            }
+                            "ProcessCommand.input" => {
+                                let input_ty =
+                                    operand_ty(program, function, &arguments[1], substitutions);
+                                let input = operand(
+                                    program,
+                                    function,
+                                    &arguments[1],
+                                    &input_ty,
+                                    substitutions,
+                                );
+                                "{disp_t_Vu8 _v=VALUE;if(_c.input_cap)disp_dealloc(_c.input);_c.input=_v.data;_c.input_len=_v.len;_c.input_cap=_v.cap;}".replace("VALUE", &input)
+                            }
+                            "ProcessCommand.input_text" => {
+                                let actual =
+                                    operand_ty(program, function, &arguments[1], substitutions);
+                                if matches!(actual, hir::Type::String) {
+                                    let input = operand(
+                                        program,
+                                        function,
+                                        &arguments[1],
+                                        &actual,
+                                        substitutions,
+                                    );
+                                    format!(
+                                        "{{disp_native_string _v={input};if(_c.input_cap)disp_dealloc(_c.input);_c.input=(uint8_t*)_v.data;_c.input_len=_v.len;_c.input_cap=_v.cap;}}"
+                                    )
+                                } else {
+                                    let (input, _) = system_argument(
+                                        program,
+                                        function,
+                                        &arguments[1],
+                                        substitutions,
+                                    );
+                                    format!(
+                                        "{{if(_c.input_cap)disp_dealloc(_c.input);_c.input=NULL;_c.input_len=_c.input_cap=0;if(({input})->len){{_c.input=(uint8_t*)disp_alloc(({input})->len,1);memcpy(_c.input,({input})->data,({input})->len);_c.input_len=_c.input_cap=({input})->len;}}}}"
+                                    )
+                                }
+                            }
+                            "ProcessCommand.timeout" => {
+                                let timeout_ty =
+                                    operand_ty(program, function, &arguments[1], substitutions);
+                                let timeout = operand(
+                                    program,
+                                    function,
+                                    &arguments[1],
+                                    &timeout_ty,
+                                    substitutions,
+                                );
+                                format!(
+                                    "{{_c.timeout_nanos=({timeout}).nanos;_c.has_timeout=true;}}"
+                                )
+                            }
+                            _ => unreachable!(),
+                        };
+                        format!(
+                            "({{{} _c={command};{result}_c;}})",
+                            native_types::c_type(&hir::Type::ProcessCommand)
+                        )
+                    }
                 }
                 hir::CallTarget::Intrinsic(name) if name.starts_with("ProcessOutput.") => {
                     let (output, _) =
@@ -4310,6 +4485,7 @@ fn to_dv(value: &str, ty: &hir::Type) -> String {
             format!("dv_u((unsigned __int128)({value}).nanos,64)")
         }
         hir::Type::ProcessOutput => "dv_string(\"<ProcessOutput>\",15)".into(),
+        hir::Type::ProcessCommand => "dv_string(\"<ProcessCommand>\",16)".into(),
         hir::Type::Str => format!("dv_string(({value}).data,({value}).len)"),
         hir::Type::Int {
             signed: true,
@@ -4546,6 +4722,7 @@ fn drop_value_depth(program: &mir::Program, value: &str, ty: &hir::Type, depth: 
         hir::Type::ProcessOutput => format!(
             "{{disp_dealloc(({value}).stdout_data);disp_dealloc(({value}).stderr_data);({value})=(disp_native_process_output){{0}};}}"
         ),
+        hir::Type::ProcessCommand => format!("disp_process_command_drop(&({value}));"),
         hir::Type::SocketAddress => format!("disp_socket_address_drop(&({value}));"),
         hir::Type::TcpStream => format!("disp_tcp_stream_drop(&({value}));"),
         hir::Type::TlsStream => format!("disp_tls_stream_drop(&({value}));"),

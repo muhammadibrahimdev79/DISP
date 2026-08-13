@@ -1,6 +1,7 @@
 # Compiler and fuzz build outputs
 .targets/
 .disp-target-*/
+.codex-target-*/
 target/
 **/target/
 **/build/

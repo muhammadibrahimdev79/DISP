@@ -180,6 +180,35 @@ print(started.elapsed().millis())
 `Time.unix_seconds()` is the wall-clock operation. Keeping it separate prevents clock
 adjustments from corrupting elapsed-time measurements.
 
+## Programs, environment, and child processes
+
+`fn main(args: List<String>)` receives only arguments supplied after the command-line
+`--` separator. `Environment.arguments()` returns the same owned values, and
+`Environment.get(name)` performs an explicit environment read.
+
+`Process.run(path, arguments)` is the small direct-execution API. More control uses a
+linear command value whose configuration methods consume it and return the configured
+replacement:
+
+```disp
+fn invoke() -> Result<String, IoError> {
+    command = Process.command(Path("tool"))
+        .arg("--format=json")
+        .directory(Path("workspace"))
+        .environment("MODE", "safe")
+        .input_text("request\n")
+        .timeout(Duration.from_seconds(2))
+    output = command.run()?
+    return output.stdout_text()
+}
+```
+
+Execution never invokes a command shell. Program paths and arguments stay separate,
+working directories are nominal `Path` values, environment overrides are validated,
+and standard input plus captured standard output/error are bounded to 16 MiB. A timeout
+terminates and reaps the child. `ProcessOutput` exposes `status()`, `success()`, byte
+`stdout()`/`stderr()`, and UTF-8-checking `stdout_text()`/`stderr_text()`.
+
 ## Threads and synchronization
 
 `spawn` transfers owned arguments to a named DISP function and returns a typed handle.
