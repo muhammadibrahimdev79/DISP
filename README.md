@@ -45,7 +45,8 @@ cancellation discards its result but lets the operating-system operation finish,
 drains that work so owned resources are released deterministically. The implementation
 also includes nominal structured HTTP URLs with injection-safe path/query builders and bounded
 validated JSON documents with safe navigation, checked scalar extraction, array/object
-construction, native HTTP body integration, deterministic cleanup, and matching interpreter
+construction, automatic type-safe struct/enum conversion, native HTTP body integration,
+deterministic cleanup, and matching interpreter
 semantics. The implementation
 remains under active development and should not
 yet be treated as a stable production language.

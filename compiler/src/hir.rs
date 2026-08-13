@@ -1054,22 +1054,7 @@ impl FunctionLowering<'_, '_> {
                     .or_else(|| value.as_ref().map(|x| x.ty.clone()))
                     .unwrap_or(Type::Unknown);
                 if let Some(value) = &mut value {
-                    fill_unknown(&mut value.ty, &ty);
-                    if matches!(
-                        (&ty, &value.ty),
-                        (
-                            Type::Reference {
-                                mutable: false,
-                                inner: expected,
-                            },
-                            Type::Reference {
-                                mutable: false,
-                                inner: actual,
-                            }
-                        ) if matches!((&**expected, &**actual), (Type::Str, Type::String))
-                    ) {
-                        value.ty = ty.clone();
-                    }
+                    coerce_contextual(value, &ty);
                 }
                 let local = self.declare(name, ty, *kind == BindingKind::Var, false, *name_span)?;
                 StatementKind::Let { local, value }
@@ -1127,8 +1112,7 @@ impl FunctionLowering<'_, '_> {
             ast::Statement::Return(x) => {
                 let mut value = x.as_ref().map(|x| self.lower_expr(x)).transpose()?;
                 if let Some(value) = &mut value {
-                    fill_unknown(&mut value.ty, &self.expected_return);
-                    coerce_str_view(value, &self.expected_return);
+                    coerce_contextual(value, &self.expected_return);
                 }
                 StatementKind::Return(value)
             }
@@ -1539,7 +1523,20 @@ impl FunctionLowering<'_, '_> {
                             .cloned()
                             .unwrap_or_else(|| Type::Generic(generic.name.clone()))
                     })
-                    .collect();
+                    .collect::<Vec<_>>();
+                let substitutions = declaration
+                    .generics
+                    .iter()
+                    .map(|generic| generic.name.clone())
+                    .zip(arguments.iter().cloned())
+                    .collect::<HashMap<_, _>>();
+                for (index, value) in &mut lowered {
+                    let expected = substitute_type(
+                        &self.lower_type(&declaration.fields[*index].ty),
+                        &substitutions,
+                    );
+                    coerce_contextual(value, &expected);
+                }
                 (
                     ExprKind::Struct {
                         id,
@@ -1912,14 +1909,31 @@ impl FunctionLowering<'_, '_> {
                 if owner == "Json"
                     && matches!(
                         field.as_str(),
-                        "null" | "bool" | "int" | "uint" | "float" | "string" | "array" | "object"
+                        "null"
+                            | "bool"
+                            | "int"
+                            | "uint"
+                            | "float"
+                            | "string"
+                            | "array"
+                            | "object"
+                            | "from"
                     )
                 {
                     let args = arguments
                         .iter()
                         .map(|x| self.lower_expr(x))
                         .collect::<Result<Vec<_>, _>>()?;
-                    let ty = if matches!(field.as_str(), "float" | "string" | "array" | "object") {
+                    let codec_ty = (field == "from").then(|| {
+                        args.first()
+                            .expect("type checking validates Json.from arity")
+                            .ty
+                            .clone()
+                    });
+                    let ty = if matches!(
+                        field.as_str(),
+                        "float" | "string" | "array" | "object" | "from"
+                    ) {
                         Type::Result(
                             Box::new(Type::Json),
                             Box::new(Type::Generic("ConversionError".into())),
@@ -1931,10 +1945,46 @@ impl FunctionLowering<'_, '_> {
                         kind: ExprKind::Call(Call {
                             target: CallTarget::Intrinsic(format!("Json.{field}")),
                             arguments: args,
-                            receiver: None,
-                            substitutions: vec![],
+                            receiver: (field == "from").then_some(ReceiverMode::Shared),
+                            substitutions: codec_ty.into_iter().collect(),
                         }),
                         ty,
+                        span,
+                    });
+                }
+                if field == "from_json"
+                    && (self.root.struct_names.contains_key(owner)
+                        || self.root.enum_names.contains_key(owner))
+                {
+                    let args = arguments
+                        .iter()
+                        .map(|x| self.lower_expr(x))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let target = self
+                        .root
+                        .struct_names
+                        .get(owner)
+                        .copied()
+                        .map(|id| Type::Struct(id, vec![]))
+                        .or_else(|| {
+                            self.root
+                                .enum_names
+                                .get(owner)
+                                .copied()
+                                .map(|id| Type::Enum(id, vec![]))
+                        })
+                        .expect("type checking validates nominal JSON decoding");
+                    return Ok(Expr {
+                        kind: ExprKind::Call(Call {
+                            target: CallTarget::Intrinsic("Json.decode".into()),
+                            arguments: args,
+                            receiver: Some(ReceiverMode::Shared),
+                            substitutions: vec![target.clone()],
+                        }),
+                        ty: Type::Result(
+                            Box::new(target),
+                            Box::new(Type::Generic("ConversionError".into())),
+                        ),
                         span,
                     });
                 }
@@ -2141,7 +2191,7 @@ impl FunctionLowering<'_, '_> {
                 }
                 if let Some(enum_id) = self.root.enum_names.get(owner).copied() {
                     let variant_id = self.find_variant_in(enum_id, field).unwrap();
-                    let args = arguments
+                    let mut args = arguments
                         .iter()
                         .map(|x| self.lower_expr(x))
                         .collect::<Result<Vec<_>, _>>()?;
@@ -2164,7 +2214,17 @@ impl FunctionLowering<'_, '_> {
                                 .cloned()
                                 .unwrap_or_else(|| Type::Generic(generic.name.clone()))
                         })
-                        .collect();
+                        .collect::<Vec<_>>();
+                    let substitutions = declaration
+                        .generics
+                        .iter()
+                        .map(|generic| generic.name.clone())
+                        .zip(type_arguments.iter().cloned())
+                        .collect::<HashMap<_, _>>();
+                    for (argument, template) in args.iter_mut().zip(&variant.payload) {
+                        let expected = substitute_type(&self.lower_type(template), &substitutions);
+                        coerce_contextual(argument, &expected);
+                    }
                     return Ok(Expr {
                         kind: ExprKind::EnumConstruct {
                             enum_id,
@@ -3340,7 +3400,7 @@ impl FunctionLowering<'_, '_> {
                             span,
                         };
                     }
-                    coerce_str_view(argument, &expected);
+                    coerce_contextual(argument, &expected);
                 }
                 let substitutions = infer_substitutions(function, &args);
                 let declared = function
@@ -3395,7 +3455,7 @@ impl FunctionLowering<'_, '_> {
                     span: argument.span,
                 };
             }
-            coerce_str_view(&mut argument, expected);
+            coerce_contextual(&mut argument, expected);
             args.push(argument);
         }
         Ok(Expr {
@@ -4216,6 +4276,55 @@ fn coerce_str_view(actual: &mut Expr, expected: &Type) {
             }
         ) if matches!((&**expected, &**source), (Type::Str, Type::String))
     ) {
+        actual.ty = expected.clone();
+    }
+}
+
+fn coerce_contextual(actual: &mut Expr, expected: &Type) {
+    fill_unknown(&mut actual.ty, expected);
+    coerce_str_view(actual, expected);
+    match (&mut actual.kind, expected) {
+        (ExprKind::Array(values), Type::Array(element, _)) => {
+            for value in values {
+                coerce_contextual(value, element);
+            }
+        }
+        (
+            ExprKind::EnumConstruct {
+                enum_id, payload, ..
+            },
+            Type::Option(inner),
+        ) if enum_id.0 == usize::MAX => {
+            if let Some(value) = payload.first_mut() {
+                coerce_contextual(value, inner);
+            }
+        }
+        (
+            ExprKind::EnumConstruct {
+                enum_id,
+                variant_id,
+                payload,
+            },
+            Type::Result(ok, error),
+        ) if enum_id.0 == usize::MAX => {
+            if let Some(value) = payload.first_mut() {
+                let expected = if *variant_id == builtin_variant("Ok") {
+                    ok
+                } else {
+                    error
+                };
+                coerce_contextual(value, expected);
+            }
+        }
+        _ => {}
+    }
+    let numeric = |ty: &Type| matches!(ty, Type::Int { .. } | Type::Float { .. });
+    if numeric(&actual.ty) && numeric(expected)
+        || matches!((&actual.ty, expected), (Type::Array(_, left), Type::Array(_, right)) if left == right)
+    {
+        // Type checking has already proven that this contextual conversion is
+        // lossless. Carry the destination width into MIR so wide literals and
+        // fixed-array elements are never prematurely evaluated in `int`.
         actual.ty = expected.clone();
     }
 }

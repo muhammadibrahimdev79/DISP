@@ -1937,8 +1937,13 @@ impl TypeChecker {
                             )?;
                             return Ok(Type::Result(Box::new(Type::Json), Box::new(conversion())));
                         }
+                        "from" if arguments.len() == 1 => {
+                            let actual = self.check_expression(&arguments[0])?;
+                            self.ensure_json_codec_type(&actual, arguments[0].span, false)?;
+                            return Ok(Type::Result(Box::new(Type::Json), Box::new(conversion())));
+                        }
                         "null" | "bool" | "int" | "uint" | "float" | "string" | "array"
-                        | "object" => {
+                        | "object" | "from" => {
                             return Err(Diagnostic::new(
                                 DiagnosticKind::Type,
                                 format!("`Json.{field}` received the wrong number of arguments"),
@@ -1947,6 +1952,42 @@ impl TypeChecker {
                         }
                         _ => {}
                     }
+                }
+                if let Expression::FieldAccess { object, field, .. } = &callee.node
+                    && field == "from_json"
+                    && let Expression::Identifier(owner) = &object.node
+                    && let Some(target) = self.types.get(owner).cloned()
+                {
+                    if arguments.len() != 1 {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            format!("`{owner}.from_json` expects one Json value"),
+                            expression.span,
+                        ));
+                    }
+                    let target = match target {
+                        Type::Struct(id, _) if self.structs[&id].generics.is_empty() => {
+                            Type::Struct(id, vec![])
+                        }
+                        Type::Enum(id, _) if self.enums[&id].generics.is_empty() => {
+                            Type::Enum(id, vec![])
+                        }
+                        _ => {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Type,
+                                "generic nominal JSON decoding requires a concrete wrapper type",
+                                object.span,
+                            )
+                            .with_help("decode through a non-generic struct or enum whose fields use concrete generic arguments"));
+                        }
+                    };
+                    let source = self.check_expression(&arguments[0])?;
+                    self.require_same(&Type::Json, &source, arguments[0].span, "JSON source")?;
+                    self.ensure_json_codec_type(&target, object.span, true)?;
+                    return Ok(Type::Result(
+                        Box::new(target),
+                        Box::new(Type::ConversionError),
+                    ));
                 }
                 if let Expression::FieldAccess { object, field, .. } = &callee.node
                     && matches!(&object.node, Expression::Identifier(name) if name == "Dns")
@@ -4573,6 +4614,119 @@ impl TypeChecker {
                 send
             }
             _ => true,
+        }
+    }
+
+    fn ensure_json_codec_type(
+        &self,
+        ty: &Type,
+        span: Span,
+        decoding: bool,
+    ) -> Result<(), Diagnostic> {
+        fn visit(
+            checker: &TypeChecker,
+            ty: &Type,
+            decoding: bool,
+            visiting: &mut HashSet<TypeId>,
+        ) -> bool {
+            fn may_encode_as_json_null(ty: &Type) -> bool {
+                matches!(ty, Type::Json | Type::Unit | Type::Option(_))
+            }
+            match ty {
+                Type::Int
+                | Type::IntLiteral(_)
+                | Type::NegativeIntLiteral(_)
+                | Type::UInt
+                | Type::Signed(_)
+                | Type::Unsigned(_)
+                | Type::Float
+                | Type::Float32
+                | Type::FloatLiteral
+                | Type::String
+                | Type::Json
+                | Type::Char
+                | Type::Bool
+                | Type::Unit => true,
+                Type::Str => !decoding,
+                Type::Array(element, _) | Type::List(element) => {
+                    visit(checker, element, decoding, visiting)
+                }
+                Type::Option(element) => {
+                    !may_encode_as_json_null(element) && visit(checker, element, decoding, visiting)
+                }
+                Type::Map(key, value) => {
+                    matches!(key.as_ref(), Type::String)
+                        && visit(checker, value, decoding, visiting)
+                }
+                Type::Result(ok, error) => {
+                    visit(checker, ok, decoding, visiting)
+                        && visit(checker, error, decoding, visiting)
+                }
+                Type::Struct(id, arguments) => {
+                    if !visiting.insert(*id) {
+                        return true;
+                    }
+                    let info = &checker.structs[id];
+                    let substitutions = info
+                        .generics
+                        .iter()
+                        .cloned()
+                        .zip(arguments.iter().cloned())
+                        .collect();
+                    let supported = info.fields.values().all(|field| {
+                        visit(
+                            checker,
+                            &substitute(field, &substitutions),
+                            decoding,
+                            visiting,
+                        )
+                    });
+                    visiting.remove(id);
+                    supported
+                }
+                Type::Enum(id, arguments) => {
+                    if !visiting.insert(*id) {
+                        return true;
+                    }
+                    let info = &checker.enums[id];
+                    let substitutions = info
+                        .generics
+                        .iter()
+                        .cloned()
+                        .zip(arguments.iter().cloned())
+                        .collect();
+                    let supported = info.variants.values().all(|variant| {
+                        variant.payload.iter().all(|payload| {
+                            visit(
+                                checker,
+                                &substitute(payload, &substitutions),
+                                decoding,
+                                visiting,
+                            )
+                        })
+                    });
+                    visiting.remove(id);
+                    supported
+                }
+                _ => false,
+            }
+        }
+
+        if visit(self, ty, decoding, &mut HashSet::new()) {
+            Ok(())
+        } else {
+            let operation = if decoding { "decode from" } else { "encode as" };
+            Err(Diagnostic::new(
+                DiagnosticKind::Type,
+                format!(
+                    "{} cannot be used with automatic JSON conversion",
+                    self.format_type(ty)
+                ),
+                span,
+            )
+            .with_help(format!(
+                "automatic JSON conversion cannot {operation} borrowed views, handles, pointers, synchronization values, or unsupported map keys"
+            )))
         }
     }
 

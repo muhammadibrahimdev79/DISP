@@ -34,6 +34,8 @@ pub fn generate(
     output.push_str(declarations);
     emit_source_map(program, &mut output);
     output.push_str(C_RUNTIME);
+    let (json_encoders, json_decoders) = json_codec_types(program, instances);
+    emit_json_codecs(program, &json_encoders, &json_decoders, &mut output);
     for instance in &instances.instances {
         writeln!(
             output,
@@ -80,6 +82,452 @@ pub fn generate(
         .unwrap();
     }
     Ok(Some(output))
+}
+
+fn json_codec_types(
+    program: &mir::Program,
+    instances: &mono::MonoProgram,
+) -> (BTreeSet<hir::Type>, BTreeSet<hir::Type>) {
+    let mut encoders = BTreeSet::new();
+    let mut decoders = BTreeSet::new();
+    for instance in &instances.instances {
+        let function = &program.functions[instance.function.0];
+        let mapping = mono::mapping(function, instance);
+        for block in &function.blocks {
+            if let mir::Terminator::Call {
+                target: hir::CallTarget::Intrinsic(name),
+                substitutions,
+                ..
+            } = &block.terminator
+                && let Some(ty) = substitutions.first()
+            {
+                let ty = substitute(ty, &mapping);
+                match name.as_str() {
+                    "Json.from" => collect_json_codec_types(program, &ty, &mut encoders),
+                    "Json.decode" => collect_json_codec_types(program, &ty, &mut decoders),
+                    _ => {}
+                }
+            }
+        }
+    }
+    (encoders, decoders)
+}
+
+fn collect_json_codec_types(
+    program: &mir::Program,
+    ty: &hir::Type,
+    types: &mut BTreeSet<hir::Type>,
+) {
+    if !types.insert(ty.clone()) {
+        return;
+    }
+    match ty {
+        hir::Type::Array(element, _) | hir::Type::List(element) | hir::Type::Option(element) => {
+            collect_json_codec_types(program, element, types)
+        }
+        hir::Type::Map(key, value) | hir::Type::Result(key, value) => {
+            collect_json_codec_types(program, key, types);
+            collect_json_codec_types(program, value, types);
+        }
+        hir::Type::Struct(id, arguments) => {
+            let declaration = &program.structs[id.0];
+            let substitutions = declaration
+                .generic_parameters
+                .iter()
+                .cloned()
+                .zip(arguments.iter().cloned())
+                .collect();
+            for field in &declaration.fields {
+                collect_json_codec_types(program, &substitute(&field.ty, &substitutions), types);
+            }
+        }
+        hir::Type::Enum(id, arguments) => {
+            let declaration = &program.enums[id.0];
+            let substitutions = declaration
+                .generic_parameters
+                .iter()
+                .cloned()
+                .zip(arguments.iter().cloned())
+                .collect();
+            for variant in &declaration.variants {
+                for payload in &variant.payload {
+                    collect_json_codec_types(program, &substitute(payload, &substitutions), types);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn json_encoder_name(ty: &hir::Type) -> String {
+    format!("disp_json_encode_{}", mono::type_code(ty))
+}
+
+fn json_decoder_name(ty: &hir::Type) -> String {
+    format!("disp_json_decode_{}", mono::type_code(ty))
+}
+
+fn emit_json_codecs(
+    program: &mir::Program,
+    encoders: &BTreeSet<hir::Type>,
+    decoders: &BTreeSet<hir::Type>,
+    output: &mut String,
+) {
+    if !encoders.is_empty() || !decoders.is_empty() {
+        output.push_str("static bool disp_json_codec_error(disp_native_string *error,const char *message){*error=disp_owned_bytes(message,strlen(message));return false;}\n");
+    }
+    for ty in encoders {
+        writeln!(
+            output,
+            "static bool {}(const {} *value,disp_native_json *json,disp_native_string *error);",
+            json_encoder_name(ty),
+            native_types::c_type(ty)
+        )
+        .unwrap();
+    }
+    for ty in decoders {
+        writeln!(
+            output,
+            "static bool {}(const disp_native_json *json,{} *value,disp_native_string *error);",
+            json_decoder_name(ty),
+            native_types::c_type(ty)
+        )
+        .unwrap();
+    }
+    for ty in encoders {
+        emit_json_encoder(program, ty, output);
+    }
+    for ty in decoders {
+        emit_json_decoder(program, ty, output);
+    }
+}
+
+fn emit_json_encoder(program: &mir::Program, ty: &hir::Type, output: &mut String) {
+    let name = json_encoder_name(ty);
+    let c_ty = native_types::c_type(ty);
+    write!(
+        output,
+        "static bool {name}(const {c_ty} *value,disp_native_json *json,disp_native_string *error){{"
+    )
+    .unwrap();
+    match ty {
+        hir::Type::Bool => output.push_str(
+            "(void)error;*json=*value?disp_json_literal(\"true\",4):disp_json_literal(\"false\",5);return true;",
+        ),
+        hir::Type::Int { signed: true, .. } => output.push_str(
+            "(void)error;*json=disp_json_from_i128((__int128)*value);return true;",
+        ),
+        hir::Type::Int { signed: false, .. } => output.push_str(
+            "(void)error;*json=disp_json_from_u128((unsigned __int128)*value);return true;",
+        ),
+        hir::Type::Float { .. } => {
+            output.push_str("return disp_json_from_f64((double)*value,json,error);")
+        }
+        hir::Type::String | hir::Type::Str => {
+            output.push_str("return disp_json_from_string(value->data,value->len,json,error);")
+        }
+        hir::Type::Json => output.push_str(
+            "(void)error;*json=disp_json_copy_range(value->data,value->data+value->len);return true;",
+        ),
+        hir::Type::Char => {
+            output.push_str("return disp_json_from_char(*value,json,error);")
+        }
+        hir::Type::Unit => output.push_str(
+            "(void)value;(void)error;*json=disp_json_literal(\"null\",4);return true;",
+        ),
+        hir::Type::Array(element, length) => emit_json_encode_sequence(
+            element,
+            "value->values",
+            &length.to_string(),
+            output,
+        ),
+        hir::Type::List(element) => {
+            emit_json_encode_sequence(element, "value->data", "value->len", output)
+        }
+        hir::Type::Map(key, mapped) => {
+            debug_assert!(matches!(key.as_ref(), hir::Type::String));
+            let mapped_name = json_encoder_name(mapped);
+            output.push_str("disp_native_json *_items=value->len?(disp_native_json*)disp_alloc_zeroed(value->len,sizeof(disp_native_json),_Alignof(disp_native_json)):NULL;size_t _done=0;for(size_t _i=0;_i<value->len;_i++){if(!");
+            write!(output, "{mapped_name}(&value->values[_i],&_items[_i],error)").unwrap();
+            output.push_str("){for(size_t _j=0;_j<_done;_j++)disp_json_drop(&_items[_j]);disp_dealloc(_items);return false;}_done++;}bool _ok=disp_json_from_object(value->keys,_items,value->len,json,error);for(size_t _i=0;_i<_done;_i++)disp_json_drop(&_items[_i]);disp_dealloc(_items);return _ok;");
+        }
+        hir::Type::Option(inner) => {
+            let inner_name = json_encoder_name(inner);
+            write!(
+                output,
+                "if(value->tag==0){{(void)error;*json=disp_json_literal(\"null\",4);return true;}}return {inner_name}(&value->payload.v1.f0,json,error);"
+            )
+            .unwrap();
+        }
+        hir::Type::Result(ok, error_ty) => {
+            let ok_name = json_encoder_name(ok);
+            let error_name = json_encoder_name(error_ty);
+            write!(output,"disp_native_json _payload={{0}};const char *_key=NULL;size_t _key_len=0;bool _ok=false;if(value->tag==0){{_key=\"Ok\";_key_len=2;_ok={ok_name}(&value->payload.v0.f0,&_payload,error);}}else{{_key=\"Err\";_key_len=3;_ok={error_name}(&value->payload.v1.f0,&_payload,error);}}if(!_ok)return false;disp_native_string _name={{.data=(char*)_key,.len=_key_len,.cap=0}};_ok=disp_json_from_object(&_name,&_payload,1,json,error);disp_json_drop(&_payload);return _ok;").unwrap();
+        }
+        hir::Type::Struct(id, arguments) => {
+            let declaration = &program.structs[id.0];
+            let substitutions = declaration
+                .generic_parameters
+                .iter()
+                .cloned()
+                .zip(arguments.iter().cloned())
+                .collect();
+            let count = declaration.fields.len();
+            if count == 0 {
+                output.push_str("(void)value;return disp_json_from_object(NULL,NULL,0,json,error);");
+            } else {
+                write!(output, "disp_native_string _keys[{count}]={{").unwrap();
+                for field in &declaration.fields {
+                    write!(
+                        output,
+                        "{{.data=(char*)\"{}\",.len={},.cap=0}},",
+                        escape(&field.name),
+                        field.name.len()
+                    )
+                    .unwrap();
+                }
+                write!(output, "}};disp_native_json _items[{count}]={{{{0}}}};size_t _done=0;")
+                    .unwrap();
+                for field in &declaration.fields {
+                    let field_ty = substitute(&field.ty, &substitutions);
+                    write!(
+                        output,
+                        "if(!{}(&value->f{},&_items[{}],error))goto fail;_done++;",
+                        json_encoder_name(&field_ty),
+                        field.index,
+                        field.index
+                    )
+                    .unwrap();
+                }
+                write!(output,"{{bool _ok=disp_json_from_object(_keys,_items,{count},json,error);for(size_t _i=0;_i<_done;_i++)disp_json_drop(&_items[_i]);return _ok;}}fail:for(size_t _i=0;_i<_done;_i++)disp_json_drop(&_items[_i]);return false;").unwrap();
+            }
+        }
+        hir::Type::Enum(id, arguments) => {
+            let declaration = &program.enums[id.0];
+            let substitutions = declaration
+                .generic_parameters
+                .iter()
+                .cloned()
+                .zip(arguments.iter().cloned())
+                .collect::<HashMap<_, _>>();
+            output.push_str("switch(value->tag){");
+            for variant in &declaration.variants {
+                write!(output, "case {}:", variant.index).unwrap();
+                if variant.payload.is_empty() {
+                    write!(
+                        output,
+                        "return disp_json_from_string(\"{}\",{},json,error);",
+                        escape(&variant.name),
+                        variant.name.len()
+                    )
+                    .unwrap();
+                } else {
+                    output.push_str("{disp_native_json _payload={0};bool _ok=false;");
+                    if variant.payload.len() == 1 {
+                        let payload_ty = substitute(&variant.payload[0], &substitutions);
+                        write!(
+                            output,
+                            "_ok={}(&value->payload.v{}.f0,&_payload,error);",
+                            json_encoder_name(&payload_ty),
+                            variant.index
+                        )
+                        .unwrap();
+                    } else {
+                        let count = variant.payload.len();
+                        write!(output, "disp_native_json _parts[{count}]={{{{0}}}};size_t _done=0;")
+                            .unwrap();
+                        for (index, payload) in variant.payload.iter().enumerate() {
+                            let payload_ty = substitute(payload, &substitutions);
+                            write!(output,"if(!{}(&value->payload.v{}.f{},&_parts[{}],error))goto variant_fail_{};_done++;",json_encoder_name(&payload_ty),variant.index,index,index,variant.index).unwrap();
+                        }
+                        write!(output,"_ok=disp_json_from_array(_parts,{count},&_payload,error);for(size_t _i=0;_i<_done;_i++)disp_json_drop(&_parts[_i]);if(!_ok)return false;goto variant_ready_{};variant_fail_{}:for(size_t _i=0;_i<_done;_i++)disp_json_drop(&_parts[_i]);return false;variant_ready_{}:;",variant.index,variant.index,variant.index).unwrap();
+                    }
+                    write!(output,"if(!_ok)return false;disp_native_string _key={{.data=(char*)\"{}\",.len={},.cap=0}};_ok=disp_json_from_object(&_key,&_payload,1,json,error);disp_json_drop(&_payload);return _ok;}}",escape(&variant.name),variant.name.len()).unwrap();
+                }
+            }
+            output.push_str("default:return false;}");
+        }
+        _ => output.push_str("(void)value;(void)json;const char *_message=\"unsupported automatic JSON encoder\";*error=disp_owned_bytes(_message,strlen(_message));return false;"),
+    }
+    output.push_str("}\n");
+}
+
+fn emit_json_encode_sequence(element: &hir::Type, data: &str, length: &str, output: &mut String) {
+    let encode = json_encoder_name(element);
+    write!(output,"size_t _length=(size_t)({length});disp_native_json *_items=_length?(disp_native_json*)disp_alloc_zeroed(_length,sizeof(disp_native_json),_Alignof(disp_native_json)):NULL;size_t _done=0;for(size_t _i=0;_i<_length;_i++){{if(!{encode}(&({data})[_i],&_items[_i],error)){{for(size_t _j=0;_j<_done;_j++)disp_json_drop(&_items[_j]);disp_dealloc(_items);return false;}}_done++;}}bool _ok=disp_json_from_array(_items,_length,json,error);for(size_t _i=0;_i<_done;_i++)disp_json_drop(&_items[_i]);disp_dealloc(_items);return _ok;").unwrap();
+}
+
+fn emit_json_decoder(program: &mir::Program, ty: &hir::Type, output: &mut String) {
+    let name = json_decoder_name(ty);
+    let c_ty = native_types::c_type(ty);
+    write!(output,"static bool {name}(const disp_native_json *json,{c_ty} *value,disp_native_string *error){{*value=({c_ty}){{0}};").unwrap();
+    match ty {
+        hir::Type::Bool => output.push_str("return disp_json_as_bool(json,value,error);"),
+        hir::Type::Int { signed: true, width } => {
+            let bits = width.unwrap_or(64);
+            write!(output,"__int128 _parsed=0;if(!disp_json_as_i128(json,&_parsed,error))return false;").unwrap();
+            if bits < 128 {
+                write!(output,"{{__int128 _minimum=-((__int128)1<<{}),_maximum=((__int128)1<<{})-1;if(_parsed<_minimum||_parsed>_maximum)return disp_json_codec_error(error,\"JSON integer is outside the destination type range\");}}",bits-1,bits-1).unwrap();
+            }
+            output.push_str("*value=(_Bool)0+(");
+            write!(output, "{c_ty}").unwrap();
+            output.push_str(")_parsed;return true;");
+        }
+        hir::Type::Int {
+            signed: false,
+            width,
+        } => {
+            let bits = width.unwrap_or(64);
+            output.push_str("unsigned __int128 _parsed=0;if(!disp_json_as_u128(json,&_parsed,error))return false;");
+            if bits < 128 {
+                write!(output,"if(_parsed>(((unsigned __int128)1<<{bits})-1))return disp_json_codec_error(error,\"JSON integer is outside the destination type range\");").unwrap();
+            }
+            write!(output, "*value=({c_ty})_parsed;return true;").unwrap();
+        }
+        hir::Type::Float { width } => {
+            output.push_str("double _parsed=0;if(!disp_json_as_f64(json,&_parsed,error))return false;");
+            if *width == 32 {
+                output.push_str("if(!isfinite((float)_parsed))return disp_json_codec_error(error,\"JSON number is outside the f32 range\");");
+            }
+            write!(output, "*value=({c_ty})_parsed;return true;").unwrap();
+        }
+        hir::Type::String => output.push_str("return disp_json_as_text(json,value,error);"),
+        hir::Type::Json => output.push_str("(void)error;*value=disp_json_copy_range(json->data,json->data+json->len);return true;"),
+        hir::Type::Char => output.push_str("return disp_json_as_char(json,value,error);"),
+        hir::Type::Unit => output.push_str("if(!disp_json_is_kind(json,\"null\"))return disp_json_codec_error(error,\"expected JSON null\");return true;"),
+        hir::Type::Array(element, length) => {
+            write!(output,"size_t _length=0;if(!disp_json_collection_len(json,&_length)||_length!={length})return disp_json_codec_error(error,\"JSON array length does not match the fixed array type\");size_t _done=0;for(size_t _i=0;_i<_length;_i++){{disp_native_json _item={{0}};if(!disp_json_at(json,_i,&_item))goto fail;if(!{}(&_item,&value->values[_i],error)){{disp_json_drop(&_item);goto fail;}}disp_json_drop(&_item);_done++;}}return true;fail:for(size_t _i=0;_i<_done;_i++){{{}}}return false;",json_decoder_name(element),drop_value(program,"value->values[_i]",element)).unwrap();
+        }
+        hir::Type::List(element) => {
+            let element_c = native_types::c_type(element);
+            write!(output,"size_t _length=0;if(!disp_json_collection_len(json,&_length)||strcmp(disp_json_kind_name(json),\"array\"))return disp_json_codec_error(error,\"expected JSON array\");if(_length)value->data=({element_c}*)disp_alloc_zeroed(_length,sizeof({element_c}),_Alignof({element_c}));value->cap=_length;for(size_t _i=0;_i<_length;_i++){{disp_native_json _item={{0}};if(!disp_json_at(json,_i,&_item))goto fail;if(!{}(&_item,&value->data[_i],error)){{disp_json_drop(&_item);goto fail;}}disp_json_drop(&_item);value->len++;}}return true;fail:for(size_t _i=0;_i<value->len;_i++){{{}}}disp_dealloc(value->data);*value=({c_ty}){{0}};return false;",json_decoder_name(element),drop_value(program,"value->data[_i]",element)).unwrap();
+        }
+        hir::Type::Map(key, mapped) => {
+            debug_assert!(matches!(key.as_ref(), hir::Type::String));
+            let mapped_c = native_types::c_type(mapped);
+            write!(output,"size_t _length=0;if(!disp_json_collection_len(json,&_length)||strcmp(disp_json_kind_name(json),\"object\"))return disp_json_codec_error(error,\"expected JSON object\");if(_length){{value->keys=(disp_native_string*)disp_alloc_zeroed(_length,sizeof(disp_native_string),_Alignof(disp_native_string));value->values=({mapped_c}*)disp_alloc_zeroed(_length,sizeof({mapped_c}),_Alignof({mapped_c}));value->states=(uint8_t*)disp_alloc_zeroed(_length,1,1);value->cap=_length;}}for(size_t _i=0;_i<_length;_i++){{disp_native_json _item={{0}};if(!disp_json_object_entry_at(json,_i,&value->keys[_i],&_item))goto fail;if(!{}(&_item,&value->values[_i],error)){{disp_json_drop(&_item);disp_string_drop(&value->keys[_i]);goto fail;}}disp_json_drop(&_item);value->len++;}}return true;fail:for(size_t _i=0;_i<value->len;_i++){{disp_string_drop(&value->keys[_i]);{}}}disp_dealloc(value->keys);disp_dealloc(value->values);disp_dealloc(value->states);*value=({c_ty}){{0}};return false;",json_decoder_name(mapped),drop_value(program,"value->values[_i]",mapped)).unwrap();
+        }
+        hir::Type::Option(inner) => {
+            write!(output,"if(disp_json_is_kind(json,\"null\")){{value->tag=0;return true;}}value->tag=1;if(!{}(json,&value->payload.v1.f0,error)){{*value=({c_ty}){{0}};return false;}}return true;",json_decoder_name(inner)).unwrap();
+        }
+        hir::Type::Result(ok, error_ty) => {
+            write!(output,"size_t _length=0;if(!disp_json_collection_len(json,&_length)||_length!=1||strcmp(disp_json_kind_name(json),\"object\"))return disp_json_codec_error(error,\"JSON Result must contain exactly one Ok or Err member\");disp_native_json _payload={{0}};if(disp_json_get(json,\"Ok\",2,&_payload)){{value->tag=0;bool _ok={}(&_payload,&value->payload.v0.f0,error);disp_json_drop(&_payload);if(!_ok)*value=({c_ty}){{0}};return _ok;}}if(disp_json_get(json,\"Err\",3,&_payload)){{value->tag=1;bool _ok={}(&_payload,&value->payload.v1.f0,error);disp_json_drop(&_payload);if(!_ok)*value=({c_ty}){{0}};return _ok;}}return disp_json_codec_error(error,\"JSON Result member must be named Ok or Err\");",json_decoder_name(ok),json_decoder_name(error_ty)).unwrap();
+        }
+        hir::Type::Struct(id, arguments) => emit_json_decode_struct(program, *id, arguments, c_ty.as_str(), output),
+        hir::Type::Enum(id, arguments) => emit_json_decode_enum(program, *id, arguments, c_ty.as_str(), output),
+        _ => output.push_str("(void)json;return disp_json_codec_error(error,\"unsupported automatic JSON decoder\");"),
+    }
+    output.push_str("}\n");
+}
+
+fn emit_json_decode_struct(
+    program: &mir::Program,
+    id: hir::StructId,
+    arguments: &[hir::Type],
+    c_ty: &str,
+    output: &mut String,
+) {
+    let declaration = &program.structs[id.0];
+    let substitutions = declaration
+        .generic_parameters
+        .iter()
+        .cloned()
+        .zip(arguments.iter().cloned())
+        .collect::<HashMap<_, _>>();
+    write!(output,"size_t _length=0;if(!disp_json_collection_len(json,&_length)||strcmp(disp_json_kind_name(json),\"object\")||_length!={})return disp_json_codec_error(error,\"JSON object does not exactly match struct {}\");size_t _done=0;disp_native_json _field={{0}};",declaration.fields.len(),escape(&declaration.name)).unwrap();
+    for field in &declaration.fields {
+        let field_ty = substitute(&field.ty, &substitutions);
+        write!(output,"if(!disp_json_get(json,\"{}\",{},&_field)){{disp_json_codec_error(error,\"JSON object is missing field {}\");goto fail;}}if(!{}(&_field,&value->f{},error)){{disp_json_drop(&_field);goto fail;}}disp_json_drop(&_field);_done++;",escape(&field.name),field.name.len(),escape(&field.name),json_decoder_name(&field_ty),field.index).unwrap();
+    }
+    output.push_str("return true;fail:switch(_done){");
+    for done in (1..=declaration.fields.len()).rev() {
+        let field = &declaration.fields[done - 1];
+        let field_ty = substitute(&field.ty, &substitutions);
+        write!(
+            output,
+            "case {done}:{}",
+            drop_value(program, &format!("value->f{}", field.index), &field_ty)
+        )
+        .unwrap();
+    }
+    write!(output, "default:break;}}*value=({c_ty}){{0}};return false;").unwrap();
+}
+
+fn emit_json_decode_enum(
+    program: &mir::Program,
+    id: hir::EnumId,
+    arguments: &[hir::Type],
+    c_ty: &str,
+    output: &mut String,
+) {
+    let declaration = &program.enums[id.0];
+    let substitutions = declaration
+        .generic_parameters
+        .iter()
+        .cloned()
+        .zip(arguments.iter().cloned())
+        .collect::<HashMap<_, _>>();
+    output.push_str("if(disp_json_is_kind(json,\"string\")){disp_native_string _name={0};if(!disp_json_as_text(json,&_name,error))return false;");
+    for variant in declaration
+        .variants
+        .iter()
+        .filter(|variant| variant.payload.is_empty())
+    {
+        write!(output,"if(_name.len=={}&&!memcmp(_name.data,\"{}\",{})){{disp_string_drop(&_name);value->tag={};return true;}}",variant.name.len(),escape(&variant.name),variant.name.len(),variant.index).unwrap();
+    }
+    write!(output,"disp_string_drop(&_name);return disp_json_codec_error(error,\"unknown unit variant for enum {}\");}}size_t _length=0;if(!disp_json_collection_len(json,&_length)||_length!=1||strcmp(disp_json_kind_name(json),\"object\"))return disp_json_codec_error(error,\"JSON enum must contain exactly one variant member\");disp_native_json _payload={{0}};",escape(&declaration.name)).unwrap();
+    for variant in declaration
+        .variants
+        .iter()
+        .filter(|variant| !variant.payload.is_empty())
+    {
+        write!(
+            output,
+            "if(disp_json_get(json,\"{}\",{},&_payload)){{value->tag={};",
+            escape(&variant.name),
+            variant.name.len(),
+            variant.index
+        )
+        .unwrap();
+        if variant.payload.len() == 1 {
+            let payload_ty = substitute(&variant.payload[0], &substitutions);
+            write!(output,"bool _ok={}(&_payload,&value->payload.v{}.f0,error);disp_json_drop(&_payload);if(!_ok)*value=({c_ty}){{0}};return _ok;",json_decoder_name(&payload_ty),variant.index).unwrap();
+        } else {
+            write!(output,"size_t _parts=0;if(!disp_json_collection_len(&_payload,&_parts)||_parts!={}){{disp_json_drop(&_payload);*value=({c_ty}){{0}};return disp_json_codec_error(error,\"JSON enum payload has the wrong length\");}}size_t _done=0;",variant.payload.len()).unwrap();
+            for (index, payload) in variant.payload.iter().enumerate() {
+                let payload_ty = substitute(payload, &substitutions);
+                write!(output,"{{disp_native_json _part={{0}};if(!disp_json_at(&_payload,{index},&_part))goto enum_fail_{};if(!{}(&_part,&value->payload.v{}.f{index},error)){{disp_json_drop(&_part);goto enum_fail_{};}}disp_json_drop(&_part);_done++;}}",variant.index,json_decoder_name(&payload_ty),variant.index,variant.index).unwrap();
+            }
+            output.push_str("disp_json_drop(&_payload);return true;");
+            write!(
+                output,
+                "enum_fail_{}:disp_json_drop(&_payload);switch(_done){{",
+                variant.index
+            )
+            .unwrap();
+            for done in (1..=variant.payload.len()).rev() {
+                let payload_ty = substitute(&variant.payload[done - 1], &substitutions);
+                write!(
+                    output,
+                    "case {done}:{}",
+                    drop_value(
+                        program,
+                        &format!("value->payload.v{}.f{}", variant.index, done - 1),
+                        &payload_ty
+                    )
+                )
+                .unwrap();
+            }
+            write!(output, "default:break;}}*value=({c_ty}){{0}};return false;").unwrap();
+        }
+        output.push('}');
+    }
+    write!(
+        output,
+        "return disp_json_codec_error(error,\"unknown payload variant for enum {}\");",
+        escape(&declaration.name)
+    )
+    .unwrap();
 }
 
 fn callable_targets(
@@ -1533,6 +1981,40 @@ fn terminator(
                     format!(
                         "({{{result_c} _r={{0}};disp_native_json _json={{0}};disp_native_string _error={{0}};if(disp_json_parse(({source})->data,({source})->len,&_json,&_error)){{_r.tag=0;_r.payload.v0.f0=_json;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
                     )
+                }
+                hir::CallTarget::Intrinsic(name)
+                    if matches!(name.as_str(), "Json.from" | "Json.decode") =>
+                {
+                    let codec_ty = substitute(
+                        call_substitutions
+                            .first()
+                            .expect("JSON codec call carries its concrete type"),
+                        substitutions,
+                    );
+                    let (source, _) =
+                        system_argument(program, function, &arguments[0], substitutions);
+                    let result_c = native_types::c_type(&destination_ty);
+                    let value_c = native_types::c_type(&codec_ty);
+                    let call = if name == "Json.from" {
+                        format!(
+                            "{}(({value_c}*){source},&_value,&_error)",
+                            json_encoder_name(&codec_ty)
+                        )
+                    } else {
+                        format!(
+                            "{}((const disp_native_json*){source},&_value,&_error)",
+                            json_decoder_name(&codec_ty)
+                        )
+                    };
+                    if name == "Json.from" {
+                        format!(
+                            "({{{result_c} _r={{0}};disp_native_json _value={{0}};disp_native_string _error={{0}};if({call}){{_r.tag=0;_r.payload.v0.f0=_value;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                        )
+                    } else {
+                        format!(
+                            "({{{result_c} _r={{0}};{value_c} _value={{0}};disp_native_string _error={{0}};if({call}){{_r.tag=0;_r.payload.v0.f0=_value;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                        )
+                    }
                 }
                 hir::CallTarget::Intrinsic(name)
                     if matches!(
@@ -3136,6 +3618,17 @@ fn rvalue(
             )
         }
         mir::Rvalue::UnaryOp(operator, value) => {
+            if *operator == ast::UnaryOperator::Negate
+                && let mir::Operand::Constant(mir::Constant::Unsigned(magnitude, _)) = value
+                && matches!(expected, hir::Type::Int { signed: true, .. })
+            {
+                let high = (*magnitude >> 64) as u64;
+                let low = *magnitude as u64;
+                return format!(
+                    "({{unsigned __int128 _m=((unsigned __int128){high}ULL<<64)|{low}ULL;({})(_m?(-((__int128)(_m-1))-1):0);}})",
+                    native_types::c_type(expected)
+                );
+            }
             let input_ty = operand_ty(program, function, value, substitutions);
             from_dv(
                 &format!(

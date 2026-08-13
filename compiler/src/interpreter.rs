@@ -1,6 +1,6 @@
 use crate::ast::{
     AssignmentOperator, BinaryOperator, Block, EnumDeclaration, Expr, Expression, Function,
-    Pattern, Program, Statement, UnaryOperator, VariantDeclaration,
+    Pattern, Program, Statement, TypeName, TypeQualifier, UnaryOperator, VariantDeclaration,
 };
 use crate::diagnostics::{Diagnostic, DiagnosticKind, Span};
 use native_tls::{Protocol, TlsConnector, TlsStream as NativeTlsStream};
@@ -756,6 +756,568 @@ fn json_get(json: &RuntimeJson, wanted: &str) -> io::Result<Option<RuntimeJson>>
 
 fn json_conversion_error(message: &str) -> io::Error {
     http_error(io::ErrorKind::InvalidData, message)
+}
+
+fn json_array_values(json: &RuntimeJson) -> io::Result<Vec<RuntimeJson>> {
+    if json.kind != "array" {
+        return Err(json_conversion_error("JSON value is not an array"));
+    }
+    let mut values = Vec::new();
+    let mut parser = JsonParser {
+        bytes: json.text.as_bytes(),
+        at: 0,
+        depth: 0,
+    };
+    parser.space();
+    parser.at += 1;
+    parser.space();
+    while parser.bytes.get(parser.at) != Some(&b']') {
+        let start = parser.at;
+        parser
+            .value()
+            .map_err(|message| http_error(io::ErrorKind::InvalidData, message))?;
+        values.push(json_fragment(&json.text, start, parser.at)?);
+        parser.space();
+        if parser.bytes.get(parser.at) == Some(&b']') {
+            break;
+        }
+        parser.at += 1;
+        parser.space();
+    }
+    Ok(values)
+}
+
+fn json_object_entries(json: &RuntimeJson) -> io::Result<Vec<(String, RuntimeJson)>> {
+    if json.kind != "object" {
+        return Err(json_conversion_error("JSON value is not an object"));
+    }
+    let mut entries = Vec::new();
+    let mut parser = JsonParser {
+        bytes: json.text.as_bytes(),
+        at: 0,
+        depth: 0,
+    };
+    parser.space();
+    parser.at += 1;
+    parser.space();
+    while parser.bytes.get(parser.at) != Some(&b'}') {
+        let key_start = parser.at;
+        parser
+            .string()
+            .map_err(|message| http_error(io::ErrorKind::InvalidData, message))?;
+        let key = json_string_value(&json.text[key_start..parser.at])?;
+        parser.space();
+        parser.at += 1;
+        parser.space();
+        let start = parser.at;
+        parser
+            .value()
+            .map_err(|message| http_error(io::ErrorKind::InvalidData, message))?;
+        entries.push((key, json_fragment(&json.text, start, parser.at)?));
+        parser.space();
+        if parser.bytes.get(parser.at) == Some(&b'}') {
+            break;
+        }
+        parser.at += 1;
+        parser.space();
+    }
+    Ok(entries)
+}
+
+fn json_push(target: &mut String, source: &str) -> io::Result<()> {
+    if target
+        .len()
+        .checked_add(source.len())
+        .is_none_or(|length| length > HTTP_BODY_LIMIT)
+    {
+        return Err(json_conversion_error(
+            "JSON document exceeds the 16 MiB limit",
+        ));
+    }
+    target.push_str(source);
+    Ok(())
+}
+
+fn encode_json_value(program: &Program, value: &Value) -> io::Result<RuntimeJson> {
+    let mut text = String::new();
+    match value {
+        Value::Int(value) => text = value.to_string(),
+        Value::UInt(value) => text = value.to_string(),
+        Value::Signed(value, _) => text = value.to_string(),
+        Value::Unsigned(value, _) => text = value.to_string(),
+        Value::Float(value) => {
+            if !value.is_finite() {
+                return Err(json_conversion_error(
+                    "JSON cannot represent NaN or infinity",
+                ));
+            }
+            text = value.to_string();
+        }
+        Value::Float32(value) => {
+            if !value.is_finite() {
+                return Err(json_conversion_error(
+                    "JSON cannot represent NaN or infinity",
+                ));
+            }
+            text = value.to_string();
+        }
+        Value::String(value) => text = json_escape_string(&value.text)?,
+        Value::Char(value) => text = json_escape_string(&value.to_string())?,
+        Value::Bool(value) => text = if *value { "true" } else { "false" }.into(),
+        Value::Json(value) => return Ok(value.clone()),
+        Value::Unit => text = "null".into(),
+        Value::Array(values) | Value::Slice(values) => {
+            text.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    text.push(',');
+                }
+                json_push(&mut text, &encode_json_value(program, value)?.text)?;
+            }
+            text.push(']');
+        }
+        Value::List { values, .. } | Value::Set { values, .. } => {
+            text.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    text.push(',');
+                }
+                json_push(&mut text, &encode_json_value(program, value)?.text)?;
+            }
+            text.push(']');
+        }
+        Value::Map { entries, .. } => {
+            text.push('{');
+            for (index, (key, value)) in entries.iter().enumerate() {
+                let Value::String(key) = key else {
+                    return Err(json_conversion_error(
+                        "automatic JSON object keys must be String",
+                    ));
+                };
+                if index != 0 {
+                    text.push(',');
+                }
+                json_push(&mut text, &json_escape_string(&key.text)?)?;
+                text.push(':');
+                json_push(&mut text, &encode_json_value(program, value)?.text)?;
+            }
+            text.push('}');
+        }
+        Value::Struct { type_name, fields } => {
+            let declaration = program
+                .structs
+                .iter()
+                .find(|declaration| declaration.name == *type_name)
+                .ok_or_else(|| json_conversion_error("unknown struct type during JSON encoding"))?;
+            text.push('{');
+            for (index, field) in declaration.fields.iter().enumerate() {
+                if index != 0 {
+                    text.push(',');
+                }
+                json_push(&mut text, &json_escape_string(&field.name)?)?;
+                text.push(':');
+                let value = fields.get(&field.name).ok_or_else(|| {
+                    json_conversion_error("struct field is missing during JSON encoding")
+                })?;
+                json_push(&mut text, &encode_json_value(program, value)?.text)?;
+            }
+            text.push('}');
+        }
+        Value::Enum {
+            type_name,
+            variant,
+            payload,
+        } if type_name == "Option" => {
+            if variant == "None" {
+                text = "null".into();
+            } else {
+                return encode_json_value(program, &payload[0]);
+            }
+        }
+        Value::Enum {
+            type_name,
+            variant,
+            payload,
+        } if type_name == "Result" => {
+            text.push('{');
+            json_push(&mut text, &json_escape_string(variant)?)?;
+            text.push(':');
+            json_push(&mut text, &encode_json_value(program, &payload[0])?.text)?;
+            text.push('}');
+        }
+        Value::Enum {
+            variant, payload, ..
+        } if payload.is_empty() => text = json_escape_string(variant)?,
+        Value::Enum {
+            variant, payload, ..
+        } => {
+            text.push('{');
+            json_push(&mut text, &json_escape_string(variant)?)?;
+            text.push(':');
+            if payload.len() == 1 {
+                json_push(&mut text, &encode_json_value(program, &payload[0])?.text)?;
+            } else {
+                text.push('[');
+                for (index, value) in payload.iter().enumerate() {
+                    if index != 0 {
+                        text.push(',');
+                    }
+                    json_push(&mut text, &encode_json_value(program, value)?.text)?;
+                }
+                text.push(']');
+            }
+            text.push('}');
+        }
+        _ => return Err(json_conversion_error("value cannot be encoded as JSON")),
+    }
+    runtime_json(text)
+}
+
+fn concrete_json_type(ty: &TypeName, bindings: &HashMap<String, TypeName>) -> TypeName {
+    if ty.arguments.is_empty()
+        && let Some(bound) = bindings.get(&ty.name)
+    {
+        return bound.clone();
+    }
+    let mut concrete = ty.clone();
+    concrete.arguments = ty
+        .arguments
+        .iter()
+        .map(|argument| concrete_json_type(argument, bindings))
+        .collect();
+    concrete
+}
+
+fn decode_json_value(
+    program: &Program,
+    ty: &TypeName,
+    bindings: &HashMap<String, TypeName>,
+    json: &RuntimeJson,
+) -> io::Result<Value> {
+    let ty = concrete_json_type(ty, bindings);
+    let wrong = |expected: &str| {
+        json_conversion_error(&format!("expected {expected}, found JSON {}", json.kind))
+    };
+    match ty.name.as_str() {
+        "Json" if ty.arguments.is_empty() => Ok(Value::Json(json.clone())),
+        "String" if ty.arguments.is_empty() => json_string_value(json.text.trim())
+            .map(|value| Value::String(RuntimeString::literal(value))),
+        "char" if ty.arguments.is_empty() => {
+            let text = json_string_value(json.text.trim())?;
+            let mut characters = text.chars();
+            let value = characters
+                .next()
+                .filter(|_| characters.next().is_none())
+                .ok_or_else(|| {
+                    json_conversion_error("JSON char must contain one Unicode scalar")
+                })?;
+            Ok(Value::Char(value))
+        }
+        "bool" if ty.arguments.is_empty() => match json.text.trim() {
+            "true" => Ok(Value::Bool(true)),
+            "false" => Ok(Value::Bool(false)),
+            _ => Err(wrong("bool")),
+        },
+        "Unit" if ty.arguments.is_empty() => {
+            if json.kind == "null" {
+                Ok(Value::Unit)
+            } else {
+                Err(wrong("null"))
+            }
+        }
+        "int" | "i8" | "i16" | "i32" | "i64" | "i128" if ty.arguments.is_empty() => {
+            if json.kind != "number" {
+                return Err(wrong("signed integer"));
+            }
+            let value = json.text.trim().parse::<i128>().map_err(|_| {
+                json_conversion_error("JSON number is not a representable signed integer")
+            })?;
+            let width = match ty.name.as_str() {
+                "i8" => 8,
+                "i16" => 16,
+                "i32" => 32,
+                "i64" | "int" => 64,
+                _ => 128,
+            };
+            if width < 128 {
+                let minimum = -(1_i128 << (width - 1));
+                let maximum = (1_i128 << (width - 1)) - 1;
+                if !(minimum..=maximum).contains(&value) {
+                    return Err(json_conversion_error(
+                        "JSON integer is outside the destination type range",
+                    ));
+                }
+            }
+            if ty.name == "int" {
+                Ok(Value::Int(value as i64))
+            } else {
+                Ok(Value::Signed(value, width))
+            }
+        }
+        "uint" | "u8" | "u16" | "u32" | "u64" | "u128" if ty.arguments.is_empty() => {
+            if json.kind != "number" {
+                return Err(wrong("unsigned integer"));
+            }
+            let value = json.text.trim().parse::<u128>().map_err(|_| {
+                json_conversion_error("JSON number is not a representable unsigned integer")
+            })?;
+            let width = match ty.name.as_str() {
+                "u8" => 8,
+                "u16" => 16,
+                "u32" => 32,
+                "u64" | "uint" => 64,
+                _ => 128,
+            };
+            if width < 128 && value >= (1_u128 << width) {
+                return Err(json_conversion_error(
+                    "JSON integer is outside the destination type range",
+                ));
+            }
+            if ty.name == "uint" {
+                Ok(Value::UInt(value as u64))
+            } else {
+                Ok(Value::Unsigned(value, width))
+            }
+        }
+        "f32" | "f64" if ty.arguments.is_empty() => {
+            if json.kind != "number" {
+                return Err(wrong("number"));
+            }
+            let value = json
+                .text
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| json_conversion_error("JSON number is not representable"))?;
+            if !value.is_finite() {
+                return Err(json_conversion_error("JSON number is not finite"));
+            }
+            if ty.name == "f32" {
+                let narrowed = value as f32;
+                if !narrowed.is_finite() {
+                    return Err(json_conversion_error(
+                        "JSON number is outside the f32 range",
+                    ));
+                }
+                Ok(Value::Float32(narrowed))
+            } else {
+                Ok(Value::Float(value))
+            }
+        }
+        "Option" if ty.arguments.len() == 1 => {
+            if json.kind == "null" {
+                Ok(Value::Enum {
+                    type_name: "Option".into(),
+                    variant: "None".into(),
+                    payload: vec![],
+                })
+            } else {
+                Ok(Value::Enum {
+                    type_name: "Option".into(),
+                    variant: "Some".into(),
+                    payload: vec![decode_json_value(
+                        program,
+                        &ty.arguments[0],
+                        bindings,
+                        json,
+                    )?],
+                })
+            }
+        }
+        "Result" if ty.arguments.len() == 2 => {
+            let entries = json_object_entries(json)?;
+            if entries.len() != 1 {
+                return Err(json_conversion_error(
+                    "JSON Result must contain exactly one `Ok` or `Err` member",
+                ));
+            }
+            let (variant, payload) = &entries[0];
+            let index = match variant.as_str() {
+                "Ok" => 0,
+                "Err" => 1,
+                _ => {
+                    return Err(json_conversion_error(
+                        "JSON Result member must be named `Ok` or `Err`",
+                    ));
+                }
+            };
+            Ok(Value::Enum {
+                type_name: "Result".into(),
+                variant: variant.clone(),
+                payload: vec![decode_json_value(
+                    program,
+                    &ty.arguments[index],
+                    bindings,
+                    payload,
+                )?],
+            })
+        }
+        "List" if ty.arguments.len() == 1 => {
+            let values = json_array_values(json)?;
+            let values = values
+                .iter()
+                .map(|value| decode_json_value(program, &ty.arguments[0], bindings, value))
+                .collect::<io::Result<Vec<_>>>()?;
+            Ok(Value::List {
+                capacity: values.len(),
+                values,
+            })
+        }
+        "Map" if ty.arguments.len() == 2 && ty.arguments[0].name == "String" => {
+            let entries = json_object_entries(json)?;
+            let entries = entries
+                .iter()
+                .map(|(key, value)| {
+                    Ok((
+                        Value::String(RuntimeString::literal(key.clone())),
+                        decode_json_value(program, &ty.arguments[1], bindings, value)?,
+                    ))
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            Ok(Value::Map {
+                capacity: entries.len(),
+                entries,
+            })
+        }
+        name if name.starts_with("[;") && name.ends_with(']') && ty.arguments.len() == 1 => {
+            let expected = name[2..name.len() - 1]
+                .parse::<usize>()
+                .map_err(|_| json_conversion_error("invalid fixed array type"))?;
+            let values = json_array_values(json)?;
+            if values.len() != expected {
+                return Err(json_conversion_error(
+                    "JSON array length does not match the fixed array type",
+                ));
+            }
+            values
+                .iter()
+                .map(|value| decode_json_value(program, &ty.arguments[0], bindings, value))
+                .collect::<io::Result<Vec<_>>>()
+                .map(Value::Array)
+        }
+        name => {
+            if let Some(declaration) = program
+                .structs
+                .iter()
+                .find(|declaration| declaration.name == name)
+            {
+                if declaration.generics.len() != ty.arguments.len() {
+                    return Err(json_conversion_error(
+                        "nominal JSON type arguments are incomplete",
+                    ));
+                }
+                let nested = declaration
+                    .generics
+                    .iter()
+                    .map(|parameter| parameter.name.clone())
+                    .zip(ty.arguments.iter().cloned())
+                    .collect::<HashMap<_, _>>();
+                let entries = json_object_entries(json)?;
+                if entries.len() != declaration.fields.len()
+                    || entries
+                        .iter()
+                        .any(|(key, _)| !declaration.fields.iter().any(|field| field.name == *key))
+                {
+                    return Err(json_conversion_error(&format!(
+                        "JSON object does not exactly match struct `{name}`"
+                    )));
+                }
+                let mut fields = HashMap::new();
+                for field in &declaration.fields {
+                    let value = entries
+                        .iter()
+                        .find(|(key, _)| key == &field.name)
+                        .map(|(_, value)| value)
+                        .ok_or_else(|| {
+                            json_conversion_error(&format!(
+                                "JSON object is missing field `{}`",
+                                field.name
+                            ))
+                        })?;
+                    fields.insert(
+                        field.name.clone(),
+                        decode_json_value(program, &field.ty, &nested, value)?,
+                    );
+                }
+                return Ok(Value::Struct {
+                    type_name: name.into(),
+                    fields,
+                });
+            }
+            if let Some(declaration) = program
+                .enums
+                .iter()
+                .find(|declaration| declaration.name == name)
+            {
+                if declaration.generics.len() != ty.arguments.len() {
+                    return Err(json_conversion_error(
+                        "nominal JSON type arguments are incomplete",
+                    ));
+                }
+                let nested = declaration
+                    .generics
+                    .iter()
+                    .map(|parameter| parameter.name.clone())
+                    .zip(ty.arguments.iter().cloned())
+                    .collect::<HashMap<_, _>>();
+                if json.kind == "string" {
+                    let variant = json_string_value(json.text.trim())?;
+                    let declaration_variant = declaration
+                        .variants
+                        .iter()
+                        .find(|candidate| candidate.name == variant && candidate.payload.is_empty())
+                        .ok_or_else(|| {
+                            json_conversion_error(&format!(
+                                "unknown unit variant `{variant}` for enum `{name}`"
+                            ))
+                        })?;
+                    return Ok(Value::Enum {
+                        type_name: name.into(),
+                        variant: declaration_variant.name.clone(),
+                        payload: vec![],
+                    });
+                }
+                let entries = json_object_entries(json)?;
+                if entries.len() != 1 {
+                    return Err(json_conversion_error(&format!(
+                        "JSON enum `{name}` must contain exactly one variant member"
+                    )));
+                }
+                let (variant, value) = &entries[0];
+                let declaration_variant = declaration
+                    .variants
+                    .iter()
+                    .find(|candidate| candidate.name == *variant && !candidate.payload.is_empty())
+                    .ok_or_else(|| {
+                        json_conversion_error(&format!(
+                            "unknown payload variant `{variant}` for enum `{name}`"
+                        ))
+                    })?;
+                let payload_json = if declaration_variant.payload.len() == 1 {
+                    vec![value.clone()]
+                } else {
+                    let values = json_array_values(value)?;
+                    if values.len() != declaration_variant.payload.len() {
+                        return Err(json_conversion_error(&format!(
+                            "JSON payload for `{name}.{variant}` has the wrong length"
+                        )));
+                    }
+                    values
+                };
+                let payload = declaration_variant
+                    .payload
+                    .iter()
+                    .zip(&payload_json)
+                    .map(|(ty, value)| decode_json_value(program, ty, &nested, value))
+                    .collect::<io::Result<Vec<_>>>()?;
+                return Ok(Value::Enum {
+                    type_name: name.into(),
+                    variant: variant.clone(),
+                    payload,
+                });
+            }
+            Err(json_conversion_error("type cannot be decoded from JSON"))
+        }
+    }
 }
 
 struct RuntimeTcpStreamState {
@@ -3729,8 +4291,42 @@ impl Interpreter {
                             text.push('}');
                             Ok(runtime_result(make(text)))
                         }
+                        "from" => {
+                            let value = self.evaluate(program, &arguments[0])?;
+                            Ok(runtime_result(
+                                encode_json_value(program, &value).map(Value::Json),
+                            ))
+                        }
                         _ => Err(self.error("unknown Json constructor", expression.span)),
                     };
+                }
+                if let Expression::FieldAccess { object, field, .. } = &callee.node
+                    && field == "from_json"
+                    && let Expression::Identifier(owner) = &object.node
+                    && (program
+                        .structs
+                        .iter()
+                        .any(|declaration| declaration.name == *owner)
+                        || program
+                            .enums
+                            .iter()
+                            .any(|declaration| declaration.name == *owner))
+                {
+                    let Value::Json(json) = self.evaluate(program, &arguments[0])? else {
+                        unreachable!("type checking validates nominal JSON source")
+                    };
+                    let target = TypeName {
+                        name: owner.clone(),
+                        arguments: vec![],
+                        qualifier: TypeQualifier::Owned,
+                        span: object.span,
+                    };
+                    return Ok(runtime_result(decode_json_value(
+                        program,
+                        &target,
+                        &HashMap::new(),
+                        &json,
+                    )));
                 }
                 if let Expression::FieldAccess { object, field, .. } = &callee.node
                     && matches!(&object.node, Expression::Identifier(name) if name == "String")

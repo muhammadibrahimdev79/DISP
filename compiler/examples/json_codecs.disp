@@ -1,0 +1,39 @@
+struct Project {
+    name: String
+    passes: uint
+    stable: bool
+    tags: List<String>
+}
+
+enum Event {
+    Started
+    Progress(uint, String)
+}
+
+fn demonstrate() -> Result<bool, ConversionError> {
+    project = Project {
+        name: "DISP"
+        passes: 25
+        stable: false
+        tags: List.of("safe", "native")
+    }
+    document = Json.from(project)?
+    print(document.as_string())
+
+    restored = Project.from_json(document)?
+    print(restored.name)
+    print(restored.tags.len())
+
+    event = Event.Progress(25, "typed JSON")
+    encoded_event = Json.from(event)?
+    restored_event = Event.from_json(encoded_event)?
+    print(match restored_event {
+        Event.Started => "started"
+        Event.Progress(pass, message) => message
+    })
+    return Ok(true)
+}
+
+fn main() {
+    print(demonstrate())
+}

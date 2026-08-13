@@ -512,6 +512,12 @@ impl Resolver {
                 if let Expression::Identifier(type_name) = &object.node
                     && self.types.contains_key(type_name)
                 {
+                    // Nominal types expose one compiler-provided static operation.
+                    // It is resolved here instead of being mistaken for an enum
+                    // variant; the type checker validates its availability.
+                    if field == "from_json" {
+                        return Ok(());
+                    }
                     let candidates = self.variants.get(field).ok_or_else(|| {
                         Diagnostic::new(
                             DiagnosticKind::Resolve,

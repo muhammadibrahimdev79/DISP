@@ -836,6 +836,7 @@ impl<'a> Builder<'a> {
                 for (_, field) in fields {
                     values.push(self.lower_expr(field)?);
                 }
+                let consumed = values.clone();
                 let result = self.temp(expr.ty.clone(), expr.span);
                 self.push(
                     StatementKind::Assign(
@@ -844,6 +845,9 @@ impl<'a> Builder<'a> {
                     ),
                     expr.span,
                 );
+                for value in &consumed {
+                    self.consume_operand(value, expr.span);
+                }
                 self.set_initialized(result, true, expr.span);
                 Ok(Operand::Move(self.place(result)))
             }

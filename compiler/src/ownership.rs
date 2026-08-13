@@ -1452,12 +1452,34 @@ impl<'a> Analyzer<'a> {
                 }
                 return Ok(match field.as_str() {
                     "null" | "bool" | "int" | "uint" => Ty::Json,
-                    "float" | "string" | "array" | "object" => Ty::Result(
+                    "float" | "string" | "array" | "object" | "from" => Ty::Result(
                         Box::new(Ty::Json),
                         Box::new(Ty::Owned("ConversionError".into())),
                     ),
                     _ => Ty::Unit,
                 });
+            }
+            if field == "from_json"
+                && let Expression::Identifier(owner) = &object.node
+                && (self
+                    .program
+                    .structs
+                    .iter()
+                    .any(|declaration| declaration.name == *owner)
+                    || self
+                        .program
+                        .enums
+                        .iter()
+                        .any(|declaration| declaration.name == *owner))
+            {
+                self.check_expr(&arguments[0], UseMode::Read)?;
+                let Expression::Identifier(owner) = &object.node else {
+                    unreachable!()
+                };
+                return Ok(Ty::Result(
+                    Box::new(Ty::Owned(owner.clone())),
+                    Box::new(Ty::Owned("ConversionError".into())),
+                ));
             }
             if matches!(&object.node, Expression::Identifier(name) if name == "String") {
                 for argument in arguments {

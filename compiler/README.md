@@ -24,7 +24,7 @@ Implemented executable subset:
 - owned `UdpSocket` datagram I/O with local-port discovery, sender-address metadata, synchronous and lazy deadline-aware operations, explicit truncation errors, serialized directions, and cancellation-safe native cleanup
 - owned `TlsStream` transport with lazy consuming handshakes, system trust and host-name verification, SNI, TLS 1.2 minimum, certificate revocation checks, bounded plaintext reads, deadline-aware encrypted I/O, and deterministic close/drop cleanup
 - lazy safe HTTP GET/POST/PUT/PATCH/DELETE operations plus linear owned `HttpRequest` values for custom methods, headers and text/byte bodies, with non-Copy responses, typed errors, bounded input/output and connection reuse, non-replay redirects, verified system TLS, and deterministic cleanup
-- nominal owned `Url` values with injection-safe path/query builders, plus bounded validated `Json` documents with safe object/array navigation, checked scalar extraction, structured construction, and native JSON HTTP integration without a dynamic parser dependency
+- nominal owned `Url` values with injection-safe path/query builders, plus bounded validated `Json` documents with safe object/array navigation, checked scalar extraction, structured construction, compile-time specialized nominal codecs, and native JSON HTTP integration without reflection or a dynamic parser dependency
 - explicitly shared `Mutex<T>`, owning lock guards, and checked sequentially consistent `AtomicInt`
 - defined `extern C` declarations, fixed C ABI aliases, checked `CString`, borrowed `CStr`, and native library linking
 - owned aligned `Memory`, bounds-checked byte operations, raw pointer views, and explicit unsafe pointer arithmetic/read/write

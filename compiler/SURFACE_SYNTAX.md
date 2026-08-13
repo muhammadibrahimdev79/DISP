@@ -323,6 +323,33 @@ Map keys and Set elements currently accept integers, `bool`, `char`, `String`, a
 `str`. This makes equality deterministic without exposing hashing or allocator details
 in ordinary code.
 
+## Automatic JSON conversion
+
+Ordinary nominal data can be converted without reflection, annotations, or handwritten
+field plumbing:
+
+```disp
+struct User { id: uint, name: String }
+
+document = Json.from(User { id: 7, name: "Ada" })?
+user = User.from_json(document)?
+```
+
+Both operations return `Result<_, ConversionError>`. The compiler generates a concrete
+codec for the exact native type. Structs are JSON objects with exactly their declared
+fields; decoding rejects missing and unknown fields. Unit enum variants are strings,
+one-field payload variants are single-member objects, and multi-field payloads use an
+array inside that member. `Result` uses `{"Ok": value}` or `{"Err": value}`.
+`Option<T>` uses `null` for `None` and the ordinary value for `Some`; element types that
+can themselves encode as `null` are rejected so decoding is never ambiguous.
+
+Fixed arrays, `List<T>`, `Map<String, T>`, integers, finite floats, `bool`, `char`,
+`String`, `Json`, and nested nominal types participate recursively. Integer widths,
+fixed-array lengths, Unicode scalar validity, JSON depth/size limits, and schema shape
+remain checked. Generic types can be nested with concrete arguments; a generic nominal
+type cannot yet be named as the static decoding owner, so a concrete wrapper supplies
+that boundary.
+
 ## Concise functions and data
 
 ```disp
