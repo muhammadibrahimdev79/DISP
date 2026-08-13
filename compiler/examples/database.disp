@@ -1,0 +1,32 @@
+fn database_works() -> Result<bool, DataError> {
+    var database = Database.memory()?
+    var none: List<Json> = List.new()
+    database.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, score REAL)", none)?
+
+    name = match Json.string("Alice") {
+        Ok(value) => value
+        Err(error) => Json.null()
+    }
+    parameters = List.of(name, Json.int(42))
+    inserted = database.execute("INSERT INTO users (name, score) VALUES (?, ?)", parameters)?
+
+    minimum = List.of(Json.int(40))
+    var rows = database.query("SELECT id, name, score FROM users WHERE score > ?", minimum)?
+    row = rows.remove(0)
+    name_ok = match row.get("name") {
+        Some(value) => match value.as_text() {
+            Ok(text) => text == "Alice"
+            Err(error) => false
+        }
+        None => false
+    }
+    database.close()?
+    return Ok(inserted == 1 && rows.is_empty() && name_ok)
+}
+
+fn main() {
+    print(match database_works() {
+        Ok(value) => value
+        Err(error) => false
+    })
+}

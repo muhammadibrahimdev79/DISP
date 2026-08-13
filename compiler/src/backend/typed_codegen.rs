@@ -1052,6 +1052,7 @@ pub fn supported(program: &mir::Program, ty: &hir::Type) -> bool {
         | hir::Type::ProcessCommand
         | hir::Type::ChildProcess
         | hir::Type::ProcessOutput
+        | hir::Type::Database
         | hir::Type::Int { .. }
         | hir::Type::Float { .. } => true,
         hir::Type::AtomicInt => true,
@@ -1104,7 +1105,7 @@ pub fn supported(program: &mir::Program, ty: &hir::Type) -> bool {
         hir::Type::Generic(name) => {
             matches!(
                 name.as_str(),
-                "ConversionError" | "IoError" | "NetworkError" | "HttpError"
+                "ConversionError" | "IoError" | "NetworkError" | "HttpError" | "DataError"
             )
         }
         _ => false,
@@ -2954,6 +2955,72 @@ fn terminator(
                         _ => unreachable!(),
                     }
                 }
+                hir::CallTarget::Intrinsic(name)
+                    if matches!(name.as_str(), "Database.open" | "Database.memory") =>
+                {
+                    let result_c = native_types::c_type(&destination_ty);
+                    if name == "Database.open" {
+                        let (path, _) =
+                            system_argument(program, function, &arguments[0], substitutions);
+                        format!(
+                            "({{{result_c} _r={{0}};disp_native_database _database={{0}};disp_native_string _error={{0}};if(disp_database_open(({path})->data,({path})->len,&_database,&_error)){{_r.tag=0;_r.payload.v0.f0=_database;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                        )
+                    } else {
+                        format!(
+                            "({{{result_c} _r={{0}};disp_native_database _database={{0}};disp_native_string _error={{0}};if(disp_database_memory(&_database,&_error)){{_r.tag=0;_r.payload.v0.f0=_database;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                        )
+                    }
+                }
+                hir::CallTarget::Intrinsic(name) if name.starts_with("Database.") => {
+                    let (database, _) =
+                        system_argument(program, function, &arguments[0], substitutions);
+                    match name.as_str() {
+                        "Database.execute" | "Database.query" => {
+                            let (sql, _) =
+                                system_argument(program, function, &arguments[1], substitutions);
+                            let (parameters, _) =
+                                system_argument(program, function, &arguments[2], substitutions);
+                            let result_c = native_types::c_type(&destination_ty);
+                            if name == "Database.execute" {
+                                format!(
+                                    "({{{result_c} _r={{0}};uint64_t _changes=0;disp_native_string _error={{0}};if(disp_database_execute(({database})->state,({sql})->data,({sql})->len,({parameters})->data,({parameters})->len,&_changes,&_error)){{_r.tag=0;_r.payload.v0.f0=_changes;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                                )
+                            } else {
+                                let hir::Type::Result(ok, _) = &destination_ty else {
+                                    unreachable!()
+                                };
+                                let list_c = native_types::c_type(ok);
+                                format!(
+                                    "({{{result_c} _r={{0}};disp_native_json *_rows=NULL;size_t _len=0,_cap=0;disp_native_string _error={{0}};if(disp_database_query(({database})->state,({sql})->data,({sql})->len,({parameters})->data,({parameters})->len,&_rows,&_len,&_cap,&_error)){{_r.tag=0;_r.payload.v0.f0=({list_c}){{.data=_rows,.len=_len,.cap=_cap}};}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                                )
+                            }
+                        }
+                        "Database.begin" | "Database.commit" | "Database.rollback" => {
+                            let result_c = native_types::c_type(&destination_ty);
+                            let (sql, active) = match name.as_str() {
+                                "Database.begin" => ("BEGIN IMMEDIATE", false),
+                                "Database.commit" => ("COMMIT", true),
+                                _ => ("ROLLBACK", true),
+                            };
+                            format!(
+                                "({{{result_c} _r={{0}};disp_native_string _error={{0}};if(disp_database_control(({database})->state,\"{sql}\",{active},&_error)){{_r.tag=0;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                            )
+                        }
+                        "Database.close" => {
+                            let result_c = native_types::c_type(&destination_ty);
+                            format!(
+                                "({{{result_c} _r={{0}};disp_native_string _error={{0}};if(disp_database_close({database},&_error)){{_r.tag=0;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                            )
+                        }
+                        "Database.changes" => {
+                            format!("(uint64_t)sqlite3_changes(({database})->state->handle)")
+                        }
+                        "Database.last_insert_id" => format!(
+                            "(int64_t)sqlite3_last_insert_rowid(({database})->state->handle)"
+                        ),
+                        _ => unreachable!(),
+                    }
+                }
                 hir::CallTarget::Intrinsic(name) if name == "Process.command" => {
                     let path_ty = operand_ty(program, function, &arguments[0], substitutions);
                     let path = operand(program, function, &arguments[0], &path_ty, substitutions);
@@ -4557,6 +4624,7 @@ fn to_dv(value: &str, ty: &hir::Type) -> String {
         hir::Type::ProcessOutput => "dv_string(\"<ProcessOutput>\",15)".into(),
         hir::Type::ProcessCommand => "dv_string(\"<ProcessCommand>\",16)".into(),
         hir::Type::ChildProcess => "dv_string(\"<ChildProcess>\",14)".into(),
+        hir::Type::Database => "dv_string(\"<Database>\",10)".into(),
         hir::Type::Str => format!("dv_string(({value}).data,({value}).len)"),
         hir::Type::Int {
             signed: true,
@@ -4795,6 +4863,7 @@ fn drop_value_depth(program: &mir::Program, value: &str, ty: &hir::Type, depth: 
         ),
         hir::Type::ProcessCommand => format!("disp_process_command_drop(&({value}));"),
         hir::Type::ChildProcess => format!("disp_child_drop(&({value}));"),
+        hir::Type::Database => format!("disp_database_drop(&({value}));"),
         hir::Type::SocketAddress => format!("disp_socket_address_drop(&({value}));"),
         hir::Type::TcpStream => format!("disp_tcp_stream_drop(&({value}));"),
         hir::Type::TlsStream => format!("disp_tls_stream_drop(&({value}));"),

@@ -982,7 +982,7 @@ impl<'a> Builder<'a> {
                 && matches!(&call.target, hir::CallTarget::Intrinsic(name) if matches!(name.as_str(), "String.push_str" | "String.contains" | "String.starts_with" | "String.ends_with" | "Map.has" | "Map.get" | "Map.get_mut" | "Map.remove" | "Set.has" | "Set.remove")))
                 || (index == 2
                     && matches!(&call.target, hir::CallTarget::Intrinsic(name) if name == "Memory.copy_from"))
-                || matches!(&call.target, hir::CallTarget::Intrinsic(name) if name == "Path.new" || name == "Path.join" || name.starts_with("File.") || name.starts_with("Directory."))
+                || matches!(&call.target, hir::CallTarget::Intrinsic(name) if name == "Path.new" || name == "Path.join" || name.starts_with("File.") || name.starts_with("Directory.") || name == "Database.open" || ((name == "Database.execute" || name == "Database.query") && (index == 1 || index == 2)))
             {
                 Some(hir::ReceiverMode::Shared)
             } else {

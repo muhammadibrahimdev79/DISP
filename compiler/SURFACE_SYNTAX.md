@@ -343,6 +343,37 @@ sent across thread boundaries, and owned DISP values never become raw allocation
 implicitly. Once code enters `unsafe`, it is responsible for pointer lifetime,
 alignment, and bounds; safe `Memory` methods remain the preferred interface.
 
+## SQLite data foundation
+
+`Database` is an owned non-Copy SQLite connection. File paths remain nominal, while an
+in-memory database needs no configuration:
+
+```disp
+fn store() -> Result<uint, DataError> {
+    var database = Database.memory()?
+    var none: List<Json> = List.new()
+    database.execute("CREATE TABLE notes(id INTEGER PRIMARY KEY, text TEXT)", none)?
+    values = List.of(Json.string("safe input")?)
+    inserted = database.execute("INSERT INTO notes(text) VALUES(?)", values)?
+    rows = database.query("SELECT id, text FROM notes", none)?
+    database.close()?
+    return Ok(inserted)
+}
+```
+
+`Database.open(Path)` and `Database.memory()` return `Result<Database, DataError>`.
+`execute` and `query` require a mutable connection and a `List<Json>` of bound values;
+ordinary code never has to concatenate data into SQL. `query` returns one owned `Json`
+object per row. SQL `NULL`, integers, finite floats, and UTF-8 text map directly to JSON.
+Duplicate column names and BLOB columns are rejected until an explicit byte-column API
+can represent them without guessing.
+
+Only one prepared statement is accepted per operation. SQL is bounded to 1 MiB, results
+to 100,000 rows, 4096 columns, and 16 MiB of JSON. `begin`, `commit`, and `rollback`
+track one explicit transaction and reject nesting or completion without an active
+transaction. `close()` consumes the connection. Dropping a live connection first rolls
+back an active transaction and then closes it, including compiler-generated error paths.
+
 ## Collection loops
 
 ```disp

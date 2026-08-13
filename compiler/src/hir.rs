@@ -48,6 +48,7 @@ pub enum Type {
     ProcessCommand,
     ChildProcess,
     ProcessOutput,
+    Database,
     Array(Box<Type>, usize),
     Slice(Box<Type>),
     List(Box<Type>),
@@ -119,6 +120,7 @@ impl Type {
             | Self::ProcessCommand
             | Self::ChildProcess
             | Self::ProcessOutput
+            | Self::Database
             | Self::Generic(_)
             | Self::Function(_, _)
             | Self::Unknown => false,
@@ -786,6 +788,7 @@ impl<'a> Lowering<'a> {
             "ProcessOutput" => Type::ProcessOutput,
             "ProcessCommand" => Type::ProcessCommand,
             "ChildProcess" => Type::ChildProcess,
+            "Database" => Type::Database,
             "Url" => Type::Url,
             "Json" => Type::Json,
             "IpAddress" => Type::IpAddress,
@@ -802,6 +805,7 @@ impl<'a> Lowering<'a> {
             "IoError" => Type::Generic("IoError".into()),
             "NetworkError" => Type::Generic("NetworkError".into()),
             "HttpError" => Type::Generic("HttpError".into()),
+            "DataError" => Type::Generic("DataError".into()),
             "[]" => Type::Slice(Box::new(
                 ty.arguments
                     .first()
@@ -2147,7 +2151,14 @@ impl FunctionLowering<'_, '_> {
                 }
                 if matches!(
                     owner.as_str(),
-                    "Path" | "File" | "Directory" | "Time" | "Duration" | "Environment" | "Process"
+                    "Path"
+                        | "File"
+                        | "Directory"
+                        | "Time"
+                        | "Duration"
+                        | "Environment"
+                        | "Process"
+                        | "Database"
                 ) {
                     let args = arguments
                         .iter()
@@ -2191,6 +2202,10 @@ impl FunctionLowering<'_, '_> {
                         ("Process", "run") => {
                             Type::Result(Box::new(Type::ProcessOutput), Box::new(io))
                         }
+                        ("Database", "open" | "memory") => Type::Result(
+                            Box::new(Type::Database),
+                            Box::new(Type::Generic("DataError".into())),
+                        ),
                         _ => Type::Unknown,
                     };
                     return Ok(Expr {
@@ -2617,6 +2632,54 @@ impl FunctionLowering<'_, '_> {
                             ReceiverMode::Move
                         } else {
                             ReceiverMode::Mutable
+                        }),
+                        substitutions: vec![],
+                    }),
+                    ty,
+                    span,
+                });
+            }
+            if matches!(receiver.ty, Type::Database) {
+                let mut args = vec![receiver];
+                args.extend(
+                    arguments
+                        .iter()
+                        .map(|value| self.lower_expr(value))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+                let error = Type::Generic("DataError".into());
+                let ty = match field.as_str() {
+                    "execute" => Type::Result(
+                        Box::new(Type::Int {
+                            signed: false,
+                            width: None,
+                        }),
+                        Box::new(error),
+                    ),
+                    "query" => {
+                        Type::Result(Box::new(Type::List(Box::new(Type::Json))), Box::new(error))
+                    }
+                    "begin" | "commit" | "rollback" | "close" => {
+                        Type::Result(Box::new(Type::Unit), Box::new(error))
+                    }
+                    "changes" => Type::Int {
+                        signed: false,
+                        width: None,
+                    },
+                    "last_insert_id" => Type::Int {
+                        signed: true,
+                        width: None,
+                    },
+                    _ => Type::Unknown,
+                };
+                return Ok(Expr {
+                    kind: ExprKind::Call(Call {
+                        target: CallTarget::Intrinsic(format!("Database.{field}")),
+                        arguments: args,
+                        receiver: Some(match field.as_str() {
+                            "close" => ReceiverMode::Move,
+                            "changes" | "last_insert_id" => ReceiverMode::Shared,
+                            _ => ReceiverMode::Mutable,
                         }),
                         substitutions: vec![],
                     }),
@@ -4052,6 +4115,7 @@ fn surface_type_is_copy(ty: &Type) -> bool {
         | Type::ProcessCommand
         | Type::ChildProcess
         | Type::ProcessOutput
+        | Type::Database
         | Type::Url
         | Type::Json
         | Type::IpAddress

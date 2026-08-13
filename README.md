@@ -49,7 +49,9 @@ also includes nominal structured HTTP URLs with injection-safe path/query builde
 validated JSON documents with safe navigation, checked scalar extraction, array/object
 construction, automatic type-safe struct/enum conversion, native HTTP body integration,
 deterministic cleanup, and matching interpreter
-semantics. The implementation
+semantics. An owned SQLite `Database` foundation provides prepared parameter binding, bounded
+JSON-object query rows, explicit transactions, typed failures, and deterministic rollback/close
+in both native execution and the interpreter. The implementation
 remains under active development and should not
 yet be treated as a stable production language.
 

@@ -39,6 +39,8 @@ pub fn generate(
          typedef struct disp_child_state disp_child_state;\n\
          typedef struct { disp_child_state *state; } disp_native_child_process;\n\
          typedef struct { int64_t status; uint8_t *stdout_data; size_t stdout_len; uint8_t *stderr_data; size_t stderr_len; } disp_native_process_output;\n\
+         typedef struct disp_database_state disp_database_state;\n\
+         typedef struct { disp_database_state *state; } disp_native_database;\n\
          typedef struct { uintptr_t handle; void *result; } disp_native_thread;\n\
          typedef struct { void *context; _Bool (*poll)(void *, void *); void (*drop)(void *); } disp_native_future;\n\
          typedef struct disp_task_state disp_task_state;\n\
@@ -357,6 +359,7 @@ pub fn c_type(ty: &hir::Type) -> String {
         hir::Type::ProcessCommand => "disp_native_process_command".into(),
         hir::Type::ChildProcess => "disp_native_child_process".into(),
         hir::Type::ProcessOutput => "disp_native_process_output".into(),
+        hir::Type::Database => "disp_native_database".into(),
         hir::Type::Thread(_) => "disp_native_thread".into(),
         hir::Type::Future(_) => "disp_native_future".into(),
         hir::Type::Task(_) => "disp_native_task".into(),

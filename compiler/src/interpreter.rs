@@ -24,6 +24,94 @@ use std::{
 };
 use url::{Host, Position, Url};
 
+#[repr(C)]
+struct Sqlite3 {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+struct SqliteStatement {
+    _private: [u8; 0],
+}
+
+type SqliteCallback = unsafe extern "C" fn(
+    context: *mut std::ffi::c_void,
+    columns: std::ffi::c_int,
+    values: *mut *mut std::ffi::c_char,
+    names: *mut *mut std::ffi::c_char,
+) -> std::ffi::c_int;
+
+#[cfg_attr(windows, link(name = "winsqlite3"))]
+#[cfg_attr(not(windows), link(name = "sqlite3"))]
+unsafe extern "C" {
+    fn sqlite3_open_v2(
+        filename: *const std::ffi::c_char,
+        database: *mut *mut Sqlite3,
+        flags: std::ffi::c_int,
+        vfs: *const std::ffi::c_char,
+    ) -> std::ffi::c_int;
+    fn sqlite3_close_v2(database: *mut Sqlite3) -> std::ffi::c_int;
+    fn sqlite3_errmsg(database: *mut Sqlite3) -> *const std::ffi::c_char;
+    fn sqlite3_busy_timeout(database: *mut Sqlite3, millis: std::ffi::c_int) -> std::ffi::c_int;
+    fn sqlite3_prepare_v2(
+        database: *mut Sqlite3,
+        sql: *const std::ffi::c_char,
+        bytes: std::ffi::c_int,
+        statement: *mut *mut SqliteStatement,
+        tail: *mut *const std::ffi::c_char,
+    ) -> std::ffi::c_int;
+    fn sqlite3_finalize(statement: *mut SqliteStatement) -> std::ffi::c_int;
+    fn sqlite3_step(statement: *mut SqliteStatement) -> std::ffi::c_int;
+    fn sqlite3_bind_parameter_count(statement: *mut SqliteStatement) -> std::ffi::c_int;
+    fn sqlite3_bind_null(
+        statement: *mut SqliteStatement,
+        index: std::ffi::c_int,
+    ) -> std::ffi::c_int;
+    fn sqlite3_bind_int64(
+        statement: *mut SqliteStatement,
+        index: std::ffi::c_int,
+        value: i64,
+    ) -> std::ffi::c_int;
+    fn sqlite3_bind_double(
+        statement: *mut SqliteStatement,
+        index: std::ffi::c_int,
+        value: f64,
+    ) -> std::ffi::c_int;
+    fn sqlite3_bind_text(
+        statement: *mut SqliteStatement,
+        index: std::ffi::c_int,
+        value: *const std::ffi::c_char,
+        bytes: std::ffi::c_int,
+        destructor: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
+    ) -> std::ffi::c_int;
+    fn sqlite3_column_count(statement: *mut SqliteStatement) -> std::ffi::c_int;
+    fn sqlite3_column_name(
+        statement: *mut SqliteStatement,
+        column: std::ffi::c_int,
+    ) -> *const std::ffi::c_char;
+    fn sqlite3_column_type(
+        statement: *mut SqliteStatement,
+        column: std::ffi::c_int,
+    ) -> std::ffi::c_int;
+    fn sqlite3_column_int64(statement: *mut SqliteStatement, column: std::ffi::c_int) -> i64;
+    fn sqlite3_column_double(statement: *mut SqliteStatement, column: std::ffi::c_int) -> f64;
+    fn sqlite3_column_text(statement: *mut SqliteStatement, column: std::ffi::c_int) -> *const u8;
+    fn sqlite3_column_bytes(
+        statement: *mut SqliteStatement,
+        column: std::ffi::c_int,
+    ) -> std::ffi::c_int;
+    fn sqlite3_changes(database: *mut Sqlite3) -> std::ffi::c_int;
+    fn sqlite3_last_insert_rowid(database: *mut Sqlite3) -> i64;
+    fn sqlite3_get_autocommit(database: *mut Sqlite3) -> std::ffi::c_int;
+    fn sqlite3_exec(
+        database: *mut Sqlite3,
+        sql: *const std::ffi::c_char,
+        callback: Option<SqliteCallback>,
+        context: *mut std::ffi::c_void,
+        error: *mut *mut std::ffi::c_char,
+    ) -> std::ffi::c_int;
+}
+
 #[derive(Clone)]
 struct RuntimeThread(Arc<ThreadState>);
 
@@ -2585,6 +2673,7 @@ enum Value {
     ProcessCommand(Box<RuntimeProcessCommand>),
     ChildProcess(RuntimeChildProcess),
     ProcessOutput(RuntimeProcessOutput),
+    Database(RuntimeDatabase),
     Thread(RuntimeThread),
     Future(RuntimeFuture),
     Task(RuntimeTask),
@@ -2643,6 +2732,487 @@ struct RuntimeProcessCommand {
     clear_environment: bool,
     input: Vec<u8>,
     timeout: Option<StdDuration>,
+}
+
+const SQLITE_OK: i32 = 0;
+const SQLITE_ROW: i32 = 100;
+const SQLITE_DONE: i32 = 101;
+const SQLITE_INTEGER: i32 = 1;
+const SQLITE_FLOAT: i32 = 2;
+const SQLITE_TEXT: i32 = 3;
+const SQLITE_BLOB: i32 = 4;
+const SQLITE_NULL: i32 = 5;
+const DATABASE_SQL_LIMIT: usize = 1024 * 1024;
+const DATABASE_ROW_LIMIT: usize = 100_000;
+
+struct RuntimeDatabaseState {
+    handle: *mut Sqlite3,
+    closed: bool,
+}
+
+// SQLite is opened in FULLMUTEX mode, and every access is additionally serialized
+// through RuntimeDatabase's mutex before the raw connection is touched.
+unsafe impl Send for RuntimeDatabaseState {}
+
+#[derive(Clone)]
+struct RuntimeDatabase(Arc<StdMutex<RuntimeDatabaseState>>);
+
+impl std::fmt::Debug for RuntimeDatabase {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_tuple("Database").finish()
+    }
+}
+
+impl PartialEq for RuntimeDatabase {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+struct RuntimeStatement(*mut SqliteStatement);
+
+impl Drop for RuntimeStatement {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: this wrapper uniquely owns the prepared statement.
+            unsafe { sqlite3_finalize(self.0) };
+            self.0 = std::ptr::null_mut();
+        }
+    }
+}
+
+fn database_error(handle: *mut Sqlite3, fallback: &str) -> io::Error {
+    if handle.is_null() {
+        return io::Error::other(fallback.to_owned());
+    }
+    // SAFETY: SQLite keeps the error string valid until the next API call on this handle.
+    let message = unsafe {
+        let pointer = sqlite3_errmsg(handle);
+        (!pointer.is_null()).then(|| {
+            std::ffi::CStr::from_ptr(pointer)
+                .to_string_lossy()
+                .into_owned()
+        })
+    };
+    io::Error::other(message.unwrap_or_else(|| fallback.to_owned()))
+}
+
+impl RuntimeDatabase {
+    fn open(path: &str) -> io::Result<Self> {
+        if path.is_empty() || path.len() > 32_768 || path.contains('\0') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "database path must be non-empty UTF-8 without NUL",
+            ));
+        }
+        let path = std::ffi::CString::new(path).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "database path contains NUL")
+        })?;
+        let mut handle = std::ptr::null_mut();
+        // SAFETY: all pointers are valid for this call and SQLite initializes handle.
+        let code = unsafe {
+            sqlite3_open_v2(
+                path.as_ptr(),
+                &mut handle,
+                0x2 | 0x4 | 0x1_0000,
+                std::ptr::null(),
+            )
+        };
+        if code != SQLITE_OK {
+            let error = database_error(handle, "could not open database");
+            if !handle.is_null() {
+                // SAFETY: handle came from sqlite3_open_v2 and is not retained.
+                unsafe { sqlite3_close_v2(handle) };
+            }
+            return Err(error);
+        }
+        // SAFETY: handle is a live SQLite connection and the command is static.
+        let configured = unsafe {
+            sqlite3_busy_timeout(handle, 5_000) == SQLITE_OK
+                && sqlite3_exec(
+                    handle,
+                    c"PRAGMA foreign_keys=ON".as_ptr(),
+                    None,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ) == SQLITE_OK
+        };
+        if !configured {
+            let error = database_error(handle, "could not configure database safety defaults");
+            // SAFETY: handle is live and has not been retained.
+            unsafe { sqlite3_close_v2(handle) };
+            return Err(error);
+        }
+        Ok(Self(Arc::new(StdMutex::new(RuntimeDatabaseState {
+            handle,
+            closed: false,
+        }))))
+    }
+
+    fn with_state<T>(
+        &self,
+        operation: impl FnOnce(&mut RuntimeDatabaseState) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("database state is poisoned"))?;
+        if state.closed || state.handle.is_null() {
+            return Err(io::Error::other("database is closed"));
+        }
+        operation(&mut state)
+    }
+
+    fn prepare(state: &RuntimeDatabaseState, sql: &str) -> io::Result<RuntimeStatement> {
+        if sql.is_empty() || sql.len() > DATABASE_SQL_LIMIT || sql.contains('\0') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SQL must be non-empty, at most 1 MiB, and contain no NUL",
+            ));
+        }
+        let bytes = i32::try_from(sql.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "SQL is too large"))?;
+        let mut statement = std::ptr::null_mut();
+        let mut tail = std::ptr::null();
+        // SAFETY: SQL is valid memory for bytes bytes; SQLite returns owned statement/tail.
+        let code = unsafe {
+            sqlite3_prepare_v2(
+                state.handle,
+                sql.as_ptr().cast(),
+                bytes,
+                &mut statement,
+                &mut tail,
+            )
+        };
+        if code != SQLITE_OK || statement.is_null() {
+            if !statement.is_null() {
+                // SAFETY: statement was initialized by SQLite and is not retained.
+                unsafe { sqlite3_finalize(statement) };
+            }
+            return Err(database_error(state.handle, "could not prepare SQL"));
+        }
+        let start = sql.as_ptr() as usize;
+        let tail_offset = (tail as usize)
+            .checked_sub(start)
+            .filter(|offset| *offset <= sql.len())
+            .ok_or_else(|| {
+                // SAFETY: statement is live and not retained.
+                unsafe { sqlite3_finalize(statement) };
+                io::Error::other("SQLite returned an invalid SQL tail")
+            })?;
+        if tail_offset > sql.len() || !sql[tail_offset..].trim().is_empty() {
+            // SAFETY: statement is live and not retained.
+            unsafe { sqlite3_finalize(statement) };
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "exactly one SQL statement is allowed",
+            ));
+        }
+        Ok(RuntimeStatement(statement))
+    }
+
+    fn bind(
+        statement: *mut SqliteStatement,
+        parameters: &[RuntimeJson],
+    ) -> io::Result<Vec<String>> {
+        // SAFETY: statement is live for the duration of this function.
+        let expected = unsafe { sqlite3_bind_parameter_count(statement) };
+        if expected < 0 || expected as usize != parameters.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SQL parameter count does not match bound values",
+            ));
+        }
+        let mut decoded = Vec::new();
+        for (offset, value) in parameters.iter().enumerate() {
+            let index = i32::try_from(offset + 1).expect("parameter limit is bounded by SQL size");
+            let text = value.text.trim();
+            // SAFETY: statement is live and each value pointer remains valid through stepping.
+            let code = unsafe {
+                match value.kind {
+                    "null" => sqlite3_bind_null(statement, index),
+                    "bool" => sqlite3_bind_int64(statement, index, i64::from(text == "true")),
+                    "number" if text.contains(['.', 'e', 'E']) => {
+                        let number = text.parse::<f64>().map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "invalid numeric parameter")
+                        })?;
+                        if !number.is_finite() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "database parameter is not finite",
+                            ));
+                        }
+                        sqlite3_bind_double(statement, index, number)
+                    }
+                    "number" => {
+                        let number = text.parse::<i64>().map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "database integer parameter does not fit int",
+                            )
+                        })?;
+                        sqlite3_bind_int64(statement, index, number)
+                    }
+                    "string" => {
+                        decoded.push(json_string_value(text)?);
+                        let value = decoded.last().expect("just pushed");
+                        sqlite3_bind_text(
+                            statement,
+                            index,
+                            value.as_ptr().cast(),
+                            i32::try_from(value.len()).map_err(|_| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "database parameter is too large",
+                                )
+                            })?,
+                            None,
+                        )
+                    }
+                    _ => sqlite3_bind_text(
+                        statement,
+                        index,
+                        text.as_ptr().cast(),
+                        i32::try_from(text.len()).map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "database parameter is too large",
+                            )
+                        })?,
+                        None,
+                    ),
+                }
+            };
+            if code != SQLITE_OK {
+                return Err(io::Error::other("could not bind SQL parameter"));
+            }
+        }
+        Ok(decoded)
+    }
+
+    fn execute(&self, sql: &str, parameters: &[RuntimeJson]) -> io::Result<u64> {
+        self.with_state(|state| {
+            let statement = Self::prepare(state, sql)?;
+            let _decoded = Self::bind(statement.0, parameters)?;
+            // SAFETY: statement and all bound static data remain live.
+            let code = unsafe { sqlite3_step(statement.0) };
+            if code == SQLITE_ROW {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "execute cannot discard query rows; use query",
+                ));
+            }
+            if code != SQLITE_DONE {
+                return Err(database_error(state.handle, "SQL execution failed"));
+            }
+            // SAFETY: state owns a live handle.
+            Ok(unsafe { sqlite3_changes(state.handle) }.max(0) as u64)
+        })
+    }
+
+    fn query(&self, sql: &str, parameters: &[RuntimeJson]) -> io::Result<Vec<RuntimeJson>> {
+        self.with_state(|state| {
+            let statement = Self::prepare(state, sql)?;
+            let _decoded = Self::bind(statement.0, parameters)?;
+            // SAFETY: statement is live.
+            let columns = unsafe { sqlite3_column_count(statement.0) };
+            if !(0..=4096).contains(&columns) {
+                return Err(io::Error::other("query column count exceeds 4096"));
+            }
+            let mut rows = Vec::new();
+            let mut total = 0usize;
+            loop {
+                // SAFETY: statement and bound input remain live.
+                let code = unsafe { sqlite3_step(statement.0) };
+                if code == SQLITE_DONE {
+                    break;
+                }
+                if code != SQLITE_ROW {
+                    return Err(database_error(state.handle, "SQL query failed"));
+                }
+                if rows.len() >= DATABASE_ROW_LIMIT {
+                    return Err(io::Error::other("query exceeds the 100000-row limit"));
+                }
+                let mut names = std::collections::HashSet::new();
+                let mut row = String::from("{");
+                for column in 0..columns {
+                    // SAFETY: column is in range for the current row.
+                    let name_pointer = unsafe { sqlite3_column_name(statement.0, column) };
+                    if name_pointer.is_null() {
+                        return Err(io::Error::other("SQLite column name is unavailable"));
+                    }
+                    // SAFETY: SQLite returns a NUL-terminated column name.
+                    let name = unsafe { std::ffi::CStr::from_ptr(name_pointer) }
+                        .to_str()
+                        .map_err(|_| io::Error::other("SQLite column name is not valid UTF-8"))?;
+                    if !names.insert(name.to_owned()) {
+                        return Err(io::Error::other("query contains duplicate column names"));
+                    }
+                    if column != 0 {
+                        row.push(',');
+                    }
+                    row.push_str(&json_escape_string(name)?);
+                    row.push(':');
+                    // SAFETY: column is in range for the current row.
+                    let kind = unsafe { sqlite3_column_type(statement.0, column) };
+                    match kind {
+                        SQLITE_NULL => row.push_str("null"),
+                        SQLITE_INTEGER => {
+                            // SAFETY: SQLite converts the current value to int64.
+                            row.push_str(
+                                &unsafe { sqlite3_column_int64(statement.0, column) }.to_string(),
+                            );
+                        }
+                        SQLITE_FLOAT => {
+                            // SAFETY: SQLite converts the current value to f64.
+                            let value = unsafe { sqlite3_column_double(statement.0, column) };
+                            if !value.is_finite() {
+                                return Err(io::Error::other(
+                                    "SQLite floating column is not finite",
+                                ));
+                            }
+                            row.push_str(&value.to_string());
+                        }
+                        SQLITE_TEXT => {
+                            // SAFETY: pointer and length are valid until the next step.
+                            let pointer = unsafe { sqlite3_column_text(statement.0, column) };
+                            let length = unsafe { sqlite3_column_bytes(statement.0, column) };
+                            if length < 0 || (pointer.is_null() && length != 0) {
+                                return Err(io::Error::other("could not read SQLite text column"));
+                            }
+                            let text = if length == 0 {
+                                ""
+                            } else {
+                                // SAFETY: SQLite guarantees length readable bytes here.
+                                std::str::from_utf8(unsafe {
+                                    std::slice::from_raw_parts(pointer, length as usize)
+                                })
+                                .map_err(|_| {
+                                    io::Error::other("SQLite text column is not valid UTF-8")
+                                })?
+                            };
+                            row.push_str(&json_escape_string(text)?);
+                        }
+                        SQLITE_BLOB => {
+                            return Err(io::Error::other(
+                                "SQLite BLOB columns require an explicit byte API",
+                            ));
+                        }
+                        _ => return Err(io::Error::other("unsupported SQLite column type")),
+                    }
+                }
+                row.push('}');
+                total = total
+                    .checked_add(row.len())
+                    .ok_or_else(|| io::Error::other("query output size overflow"))?;
+                if total > 16 * 1024 * 1024 {
+                    return Err(io::Error::other(
+                        "query JSON output exceeds the 16 MiB limit",
+                    ));
+                }
+                rows.push(runtime_json(row)?);
+            }
+            Ok(rows)
+        })
+    }
+
+    fn control(&self, sql: &'static [u8], expected_transaction: bool) -> io::Result<()> {
+        self.with_state(|state| {
+            // SAFETY: state owns a live connection. SQLite returns zero inside a transaction.
+            let transaction = unsafe { sqlite3_get_autocommit(state.handle) } == 0;
+            if transaction != expected_transaction {
+                return Err(io::Error::other(if expected_transaction {
+                    "database has no active transaction"
+                } else {
+                    "database transaction is already active"
+                }));
+            }
+            // SAFETY: sql is a static NUL-terminated command and state is live.
+            let code = unsafe {
+                sqlite3_exec(
+                    state.handle,
+                    sql.as_ptr().cast(),
+                    None,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if code != SQLITE_OK {
+                return Err(database_error(state.handle, "transaction command failed"));
+            }
+            Ok(())
+        })
+    }
+
+    fn changes(&self) -> io::Result<u64> {
+        self.with_state(|state| {
+            // SAFETY: state owns a live handle.
+            Ok(unsafe { sqlite3_changes(state.handle) }.max(0) as u64)
+        })
+    }
+
+    fn last_insert_id(&self) -> io::Result<i64> {
+        self.with_state(|state| {
+            // SAFETY: state owns a live handle.
+            Ok(unsafe { sqlite3_last_insert_rowid(state.handle) })
+        })
+    }
+
+    fn close(&self) -> io::Result<()> {
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("database state is poisoned"))?;
+        if state.closed || state.handle.is_null() {
+            return Ok(());
+        }
+        // SAFETY: state owns a live connection. SQLite returns zero inside a transaction.
+        if unsafe { sqlite3_get_autocommit(state.handle) } == 0 {
+            // SAFETY: command is static and the handle is live.
+            unsafe {
+                sqlite3_exec(
+                    state.handle,
+                    c"ROLLBACK".as_ptr(),
+                    None,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+        }
+        // SAFETY: no prepared statements escape an operation, so the handle can close.
+        let code = unsafe { sqlite3_close_v2(state.handle) };
+        if code != SQLITE_OK {
+            return Err(database_error(state.handle, "could not close database"));
+        }
+        state.handle = std::ptr::null_mut();
+        state.closed = true;
+        Ok(())
+    }
+}
+
+impl Drop for RuntimeDatabaseState {
+    fn drop(&mut self) {
+        if self.closed || self.handle.is_null() {
+            return;
+        }
+        // SAFETY: self owns a live connection. SQLite returns zero inside a transaction.
+        if unsafe { sqlite3_get_autocommit(self.handle) } == 0 {
+            // SAFETY: this is best-effort rollback of a live connection during final cleanup.
+            unsafe {
+                sqlite3_exec(
+                    self.handle,
+                    c"ROLLBACK".as_ptr(),
+                    None,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+        }
+        // SAFETY: RuntimeDatabaseState uniquely owns this handle.
+        unsafe { sqlite3_close_v2(self.handle) };
+        self.handle = std::ptr::null_mut();
+        self.closed = true;
+    }
 }
 
 const PROCESS_STREAM_LIMIT: usize = 16 * 1024 * 1024;
@@ -5197,6 +5767,7 @@ impl Interpreter {
                             | "Duration"
                             | "Environment"
                             | "Process"
+                            | "Database"
                     )
                 {
                     if owner == "Environment" {
@@ -5283,6 +5854,26 @@ impl Interpreter {
                             input: Vec::new(),
                             timeout: None,
                         })));
+                    }
+                    if owner == "Database" {
+                        let result = match field.as_str() {
+                            "memory" => RuntimeDatabase::open(":memory:"),
+                            "open" => {
+                                let Value::Path(path) = self.evaluate(program, &arguments[0])?
+                                else {
+                                    unreachable!("type checking validates database paths")
+                                };
+                                let path = path.to_str().ok_or_else(|| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidInput,
+                                        "database path is not valid UTF-8",
+                                    )
+                                });
+                                path.and_then(RuntimeDatabase::open)
+                            }
+                            _ => unreachable!("type checking validates Database constructors"),
+                        };
+                        return Ok(runtime_result(result.map(Value::Database)));
                     }
                     if owner == "Path" {
                         let value = self.evaluate(program, &arguments[0])?;
@@ -6415,6 +7006,85 @@ impl Interpreter {
                             )),
                             _ => Err(self.error("unknown Path operation", expression.span)),
                         };
+                    }
+                    if matches!(
+                        field.as_str(),
+                        "execute"
+                            | "query"
+                            | "begin"
+                            | "commit"
+                            | "rollback"
+                            | "close"
+                            | "changes"
+                            | "last_insert_id"
+                    ) {
+                        let database = if field == "close" {
+                            self.consume(program, object)?
+                        } else {
+                            self.evaluate(program, object)?
+                        };
+                        if let Value::Database(database) = database {
+                            if matches!(field.as_str(), "execute" | "query") {
+                                let Value::String(sql) = self.evaluate(program, &arguments[0])?
+                                else {
+                                    unreachable!("type checking validates database SQL")
+                                };
+                                let Value::List { values, .. } =
+                                    self.evaluate(program, &arguments[1])?
+                                else {
+                                    unreachable!("type checking validates database parameters")
+                                };
+                                let parameters = values
+                                    .into_iter()
+                                    .map(|value| match value {
+                                        Value::Json(json) => json,
+                                        _ => unreachable!(
+                                            "type checking validates database parameters"
+                                        ),
+                                    })
+                                    .collect::<Vec<_>>();
+                                return Ok(if field == "execute" {
+                                    runtime_result(
+                                        database.execute(&sql.text, &parameters).map(Value::UInt),
+                                    )
+                                } else {
+                                    runtime_result(database.query(&sql.text, &parameters).map(
+                                        |rows| {
+                                            let capacity = rows.len();
+                                            Value::List {
+                                                values: rows.into_iter().map(Value::Json).collect(),
+                                                capacity,
+                                            }
+                                        },
+                                    ))
+                                });
+                            }
+                            return match field.as_str() {
+                                "begin" => Ok(runtime_result(
+                                    database
+                                        .control(b"BEGIN IMMEDIATE\0", false)
+                                        .map(|()| Value::Unit),
+                                )),
+                                "commit" => Ok(runtime_result(
+                                    database.control(b"COMMIT\0", true).map(|()| Value::Unit),
+                                )),
+                                "rollback" => Ok(runtime_result(
+                                    database.control(b"ROLLBACK\0", true).map(|()| Value::Unit),
+                                )),
+                                "close" => {
+                                    Ok(runtime_result(database.close().map(|()| Value::Unit)))
+                                }
+                                "changes" => database.changes().map(Value::UInt).map_err(|error| {
+                                    self.error(error.to_string(), expression.span)
+                                }),
+                                "last_insert_id" => {
+                                    database.last_insert_id().map(Value::Int).map_err(|error| {
+                                        self.error(error.to_string(), expression.span)
+                                    })
+                                }
+                                _ => unreachable!(),
+                            };
+                        }
                     }
                     if let Value::ProcessOutput(output) = self.evaluate(program, object)? {
                         let bytes = |values: Vec<u8>| Value::List {
@@ -8077,6 +8747,7 @@ fn value_type_name(value: &Value) -> &str {
         Value::ProcessOutput(_) => "ProcessOutput",
         Value::ProcessCommand(_) => "ProcessCommand",
         Value::ChildProcess(_) => "ChildProcess",
+        Value::Database(_) => "Database",
         Value::Thread(_) => "Thread",
         Value::Future(_) => "Future",
         Value::Task(_) => "Task",
@@ -8145,6 +8816,7 @@ fn value_is_copy(program: &Program, value: &Value) -> bool {
         | Value::ProcessOutput(_)
         | Value::ProcessCommand(_)
         | Value::ChildProcess(_)
+        | Value::Database(_)
         | Value::Url(_)
         | Value::Json(_)
         | Value::SocketAddress(_)
@@ -8542,6 +9214,7 @@ fn display_value(value: Value) -> String {
         Value::ProcessOutput(value) => format!("<ProcessOutput:{}>", value.status),
         Value::ProcessCommand(_) => "<ProcessCommand>".into(),
         Value::ChildProcess(_) => "<ChildProcess>".into(),
+        Value::Database(_) => "<Database>".into(),
         Value::Thread(_) => "<Thread>".into(),
         Value::Future(_) => "<Future>".into(),
         Value::Task(_) => "<Task>".into(),

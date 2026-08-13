@@ -1412,7 +1412,14 @@ impl<'a> Analyzer<'a> {
             if let Expression::Identifier(owner) = &object.node
                 && matches!(
                     owner.as_str(),
-                    "Path" | "File" | "Directory" | "Time" | "Duration" | "Environment" | "Process"
+                    "Path"
+                        | "File"
+                        | "Directory"
+                        | "Time"
+                        | "Duration"
+                        | "Environment"
+                        | "Process"
+                        | "Database"
                 )
             {
                 for argument in arguments {
@@ -1457,6 +1464,10 @@ impl<'a> Analyzer<'a> {
                         Box::new(Ty::Owned("IoError".into())),
                     ),
                     ("Process", "command") => Ty::Owned("ProcessCommand".into()),
+                    ("Database", "open" | "memory") => Ty::Result(
+                        Box::new(Ty::Owned("Database".into())),
+                        Box::new(Ty::Owned("DataError".into())),
+                    ),
                     _ => Ty::Unit,
                 });
             }
@@ -1653,6 +1664,35 @@ impl<'a> Analyzer<'a> {
                         Box::new(Ty::Owned("IoError".into())),
                     ),
                     _ => Ty::Result(Box::new(Ty::Unit), Box::new(Ty::Owned("IoError".into()))),
+                });
+            }
+            if matches!(self.expr_ty(object), Ok(Ty::Owned(ref name)) if name == "Database") {
+                if field == "close" {
+                    self.check_expr(object, UseMode::Consume)?;
+                } else {
+                    let place = self.place(object)?;
+                    self.check_borrow(
+                        &place,
+                        !matches!(field.as_str(), "changes" | "last_insert_id"),
+                        object.span,
+                    )?;
+                    self.use_place(&place, UseMode::Read, object.span)?;
+                }
+                for argument in arguments {
+                    self.check_expr(argument, UseMode::Read)?;
+                }
+                return Ok(match field.as_str() {
+                    "execute" => {
+                        Ty::Result(Box::new(Ty::Copy), Box::new(Ty::Owned("DataError".into())))
+                    }
+                    "query" => Ty::Result(
+                        Box::new(Ty::List(Box::new(Ty::Json))),
+                        Box::new(Ty::Owned("DataError".into())),
+                    ),
+                    "begin" | "commit" | "rollback" | "close" => {
+                        Ty::Result(Box::new(Ty::Unit), Box::new(Ty::Owned("DataError".into())))
+                    }
+                    _ => Ty::Copy,
                 });
             }
             if matches!(self.expr_ty(object), Ok(Ty::Url)) {
@@ -2536,6 +2576,14 @@ impl<'a> Analyzer<'a> {
                 {
                     return Ok(Ty::Owned("ProcessCommand".into()));
                 }
+                if matches!(&object.node, Expression::Identifier(owner) if owner == "Database")
+                    && matches!(field.as_str(), "open" | "memory")
+                {
+                    return Ok(Ty::Result(
+                        Box::new(Ty::Owned("Database".into())),
+                        Box::new(Ty::Owned("DataError".into())),
+                    ));
+                }
                 if matches!(self.expr_ty(object), Ok(Ty::Owned(ref name)) if name == "ProcessCommand")
                 {
                     return Ok(if field == "run" {
@@ -2568,6 +2616,21 @@ impl<'a> Analyzer<'a> {
                             Box::new(Ty::Owned("IoError".into())),
                         ),
                         _ => Ty::Result(Box::new(Ty::Unit), Box::new(Ty::Owned("IoError".into()))),
+                    });
+                }
+                if matches!(self.expr_ty(object), Ok(Ty::Owned(ref name)) if name == "Database") {
+                    return Ok(match field.as_str() {
+                        "execute" => {
+                            Ty::Result(Box::new(Ty::Copy), Box::new(Ty::Owned("DataError".into())))
+                        }
+                        "query" => Ty::Result(
+                            Box::new(Ty::List(Box::new(Ty::Json))),
+                            Box::new(Ty::Owned("DataError".into())),
+                        ),
+                        "begin" | "commit" | "rollback" | "close" => {
+                            Ty::Result(Box::new(Ty::Unit), Box::new(Ty::Owned("DataError".into())))
+                        }
+                        _ => Ty::Copy,
                     });
                 }
                 Ok(Ty::Owned("expression".into()))

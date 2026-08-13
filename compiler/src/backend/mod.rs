@@ -75,6 +75,21 @@ pub fn build(
                 )
             })
     });
+    let database = mir.functions.iter().any(|function| {
+        function
+            .locals
+            .iter()
+            .any(|local| type_uses_database(&local.ty))
+            || function.blocks.iter().any(|block| {
+                matches!(
+                    &block.terminator,
+                    mir::Terminator::Call {
+                        target: hir::CallTarget::Intrinsic(name),
+                        ..
+                    } if name.starts_with("Database.")
+                )
+            })
+    });
     let project_root;
     let (stem, parent) = if source_path.is_dir() {
         project_root = if source_path.is_absolute() {
@@ -131,8 +146,11 @@ pub fn build(
         &object_path,
         &executable_path,
         options.optimized,
-        networking,
-        http,
+        linker::RuntimeFeatures {
+            networking,
+            http,
+            database,
+        },
         &libraries,
     )?;
     if !options.emit_c {
@@ -146,6 +164,34 @@ pub fn build(
         object: options.emit_object.then_some(object_path),
         backend_ir: options.emit_c.then_some(c_path),
     })
+}
+
+fn type_uses_database(ty: &hir::Type) -> bool {
+    match ty {
+        hir::Type::Database => true,
+        hir::Type::Array(inner, _)
+        | hir::Type::Slice(inner)
+        | hir::Type::List(inner)
+        | hir::Type::Set(inner)
+        | hir::Type::Thread(inner)
+        | hir::Type::Future(inner)
+        | hir::Type::Task(inner)
+        | hir::Type::Mutex(inner)
+        | hir::Type::MutexGuard(inner)
+        | hir::Type::Option(inner)
+        | hir::Type::Reference { inner, .. }
+        | hir::Type::RawPointer { inner, .. } => type_uses_database(inner),
+        hir::Type::Map(key, value) | hir::Type::Result(key, value) => {
+            type_uses_database(key) || type_uses_database(value)
+        }
+        hir::Type::Struct(_, arguments) | hir::Type::Enum(_, arguments) => {
+            arguments.iter().any(type_uses_database)
+        }
+        hir::Type::Function(arguments, result) => {
+            arguments.iter().any(type_uses_database) || type_uses_database(result)
+        }
+        _ => false,
+    }
 }
 
 fn type_uses_http(ty: &hir::Type) -> bool {

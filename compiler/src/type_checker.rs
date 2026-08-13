@@ -38,6 +38,7 @@ pub enum Type {
     ProcessCommand,
     ChildProcess,
     ProcessOutput,
+    Database,
     Array(Box<Type>, usize),
     Slice(Box<Type>),
     List(Box<Type>),
@@ -55,6 +56,7 @@ pub enum Type {
     IoError,
     NetworkError,
     HttpError,
+    DataError,
     Unit,
     Struct(TypeId, Vec<Type>),
     Enum(TypeId, Vec<Type>),
@@ -2201,6 +2203,35 @@ impl TypeChecker {
                     ));
                 }
                 if let Expression::FieldAccess { object, field, .. } = &callee.node
+                    && matches!(&object.node, Expression::Identifier(name) if name == "Database")
+                {
+                    match field.as_str() {
+                        "open" if arguments.len() == 1 => {
+                            self.require_path(&arguments[0])?;
+                            return Ok(Type::Result(
+                                Box::new(Type::Database),
+                                Box::new(Type::DataError),
+                            ));
+                        }
+                        "memory" if arguments.is_empty() => {
+                            return Ok(Type::Result(
+                                Box::new(Type::Database),
+                                Box::new(Type::DataError),
+                            ));
+                        }
+                        _ => {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Type,
+                                format!(
+                                    "no Database constructor `{field}` with {} arguments",
+                                    arguments.len()
+                                ),
+                                expression.span,
+                            ));
+                        }
+                    }
+                }
+                if let Expression::FieldAccess { object, field, .. } = &callee.node
                     && let Expression::Identifier(owner) = &object.node
                     && matches!(
                         owner.as_str(),
@@ -3271,6 +3302,46 @@ impl TypeChecker {
                                     Box::new(Type::IoError),
                                 ));
                             }
+                            _ => {}
+                        }
+                    }
+                    if matches!(receiver, Type::Database) {
+                        match field.as_str() {
+                            "execute" | "query" if arguments.len() == 2 => {
+                                let sql = self.check_expression(&arguments[0])?;
+                                if !matches!(sql, Type::String | Type::Str) {
+                                    return Err(Diagnostic::new(
+                                        DiagnosticKind::Type,
+                                        "database SQL must be String or str",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                let parameters = self.check_expression(&arguments[1])?;
+                                if !matches!(parameters, Type::List(ref value) if matches!(**value, Type::Json))
+                                {
+                                    return Err(Diagnostic::new(
+                                        DiagnosticKind::Type,
+                                        "database parameters must be List<Json>",
+                                        arguments[1].span,
+                                    ));
+                                }
+                                return Ok(Type::Result(
+                                    Box::new(if field == "execute" {
+                                        Type::UInt
+                                    } else {
+                                        Type::List(Box::new(Type::Json))
+                                    }),
+                                    Box::new(Type::DataError),
+                                ));
+                            }
+                            "begin" | "commit" | "rollback" | "close" if arguments.is_empty() => {
+                                return Ok(Type::Result(
+                                    Box::new(Type::Unit),
+                                    Box::new(Type::DataError),
+                                ));
+                            }
+                            "changes" if arguments.is_empty() => return Ok(Type::UInt),
+                            "last_insert_id" if arguments.is_empty() => return Ok(Type::Int),
                             _ => {}
                         }
                     }
@@ -4576,6 +4647,7 @@ impl TypeChecker {
             "ProcessOutput" if ty.arguments.is_empty() => Type::ProcessOutput,
             "ProcessCommand" if ty.arguments.is_empty() => Type::ProcessCommand,
             "ChildProcess" if ty.arguments.is_empty() => Type::ChildProcess,
+            "Database" if ty.arguments.is_empty() => Type::Database,
             "Url" if ty.arguments.is_empty() => Type::Url,
             "Json" if ty.arguments.is_empty() => Type::Json,
             "IpAddress" if ty.arguments.is_empty() => Type::IpAddress,
@@ -4592,6 +4664,7 @@ impl TypeChecker {
             "IoError" if ty.arguments.is_empty() => Type::IoError,
             "NetworkError" if ty.arguments.is_empty() => Type::NetworkError,
             "HttpError" if ty.arguments.is_empty() => Type::HttpError,
+            "DataError" if ty.arguments.is_empty() => Type::DataError,
             "AtomicInt" if ty.arguments.is_empty() => Type::AtomicInt,
             "[]" if ty.arguments.len() == 1 => {
                 Type::Slice(Box::new(self.resolve_type(&ty.arguments[0])?))
@@ -5040,6 +5113,7 @@ impl TypeChecker {
             Type::ProcessOutput => "ProcessOutput".into(),
             Type::ProcessCommand => "ProcessCommand".into(),
             Type::ChildProcess => "ChildProcess".into(),
+            Type::Database => "Database".into(),
             Type::Url => "Url".into(),
             Type::Json => "Json".into(),
             Type::IpAddress => "IpAddress".into(),
@@ -5075,6 +5149,7 @@ impl TypeChecker {
             Type::IoError => "IoError".into(),
             Type::NetworkError => "NetworkError".into(),
             Type::HttpError => "HttpError".into(),
+            Type::DataError => "DataError".into(),
             Type::Unit => "Unit".into(),
             Type::Struct(id, arguments) => self.format_nominal(&self.structs[id].name, arguments),
             Type::Enum(id, arguments) => self.format_nominal(&self.enums[id].name, arguments),

@@ -1,13 +1,19 @@
 use crate::diagnostics::{Diagnostic, DiagnosticKind, Span};
 use std::{path::Path, process::Command};
 
+#[derive(Clone, Copy)]
+pub struct RuntimeFeatures {
+    pub networking: bool,
+    pub http: bool,
+    pub database: bool,
+}
+
 pub fn compile_and_link(
     c_source: &Path,
     object: &Path,
     executable: &Path,
     optimized: bool,
-    networking: bool,
-    http: bool,
+    features: RuntimeFeatures,
     libraries: &[String],
 ) -> Result<(), Diagnostic> {
     let mut compile = vec![
@@ -20,11 +26,14 @@ pub fn compile_and_link(
     if !cfg!(windows) {
         compile.push("-pthread".into());
     }
-    if networking {
+    if features.networking {
         compile.push("-DDISP_NETWORKING".into());
     }
-    if http {
+    if features.http {
         compile.push("-DDISP_HTTP".into());
+    }
+    if features.database {
+        compile.push("-DDISP_DATABASE".into());
     }
     compile.extend([
         "-c".into(),
@@ -44,19 +53,38 @@ pub fn compile_and_link(
         link.push("-pthread".into());
     } else {
         link.push("-lshell32".into());
-        if networking {
+        if features.networking {
             link.push("-lws2_32".into());
             link.push("-lsecur32".into());
             link.push("-lcrypt32".into());
-            if http {
+            if features.http {
                 link.push("-lwinhttp".into());
             }
         }
+        if features.database {
+            link.push(windows_sqlite_library()?);
+        }
+    }
+    if features.database && !cfg!(windows) {
+        link.push("-lsqlite3".into());
     }
     for library in libraries {
         link.push(format!("-l{library}"));
     }
     run_gcc(&link, "native linking")
+}
+
+fn windows_sqlite_library() -> Result<String, Diagnostic> {
+    let windows = std::env::var_os("WINDIR")
+        .ok_or_else(|| error("WINDIR is unavailable for Windows SQLite linking"))?;
+    let library = Path::new(&windows).join("System32").join("winsqlite3.dll");
+    if !library.is_file() {
+        return Err(error(&format!(
+            "Windows system SQLite is unavailable at `{}`",
+            library.display()
+        )));
+    }
+    path(&library).map(str::to_owned)
 }
 
 fn path(path: &Path) -> Result<&str, Diagnostic> {
