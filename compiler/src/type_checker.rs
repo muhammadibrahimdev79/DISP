@@ -1849,6 +1849,106 @@ impl TypeChecker {
                     ));
                 }
                 if let Expression::FieldAccess { object, field, .. } = &callee.node
+                    && matches!(&object.node, Expression::Identifier(name) if name == "Json")
+                {
+                    let conversion = || Type::ConversionError;
+                    match field.as_str() {
+                        "null" if arguments.is_empty() => return Ok(Type::Json),
+                        "bool" if arguments.len() == 1 => {
+                            let actual = self.check_expression(&arguments[0])?;
+                            self.require_same(
+                                &Type::Bool,
+                                &actual,
+                                arguments[0].span,
+                                "Json.bool value",
+                            )?;
+                            return Ok(Type::Json);
+                        }
+                        "int" if arguments.len() == 1 => {
+                            let actual = self.check_expression(&arguments[0])?;
+                            if !matches!(
+                                actual,
+                                Type::Int
+                                    | Type::Signed(_)
+                                    | Type::IntLiteral(_)
+                                    | Type::NegativeIntLiteral(_)
+                            ) {
+                                return Err(Diagnostic::new(
+                                    DiagnosticKind::Type,
+                                    "Json.int expects a signed integer",
+                                    arguments[0].span,
+                                ));
+                            }
+                            return Ok(Type::Json);
+                        }
+                        "uint" if arguments.len() == 1 => {
+                            let actual = self.check_expression(&arguments[0])?;
+                            if !matches!(
+                                actual,
+                                Type::UInt | Type::Unsigned(_) | Type::IntLiteral(_)
+                            ) {
+                                return Err(Diagnostic::new(
+                                    DiagnosticKind::Type,
+                                    "Json.uint expects an unsigned integer",
+                                    arguments[0].span,
+                                ));
+                            }
+                            return Ok(Type::Json);
+                        }
+                        "float" if arguments.len() == 1 => {
+                            let actual = self.check_expression(&arguments[0])?;
+                            if !matches!(actual, Type::Float | Type::Float32 | Type::FloatLiteral) {
+                                return Err(Diagnostic::new(
+                                    DiagnosticKind::Type,
+                                    "Json.float expects a floating-point value",
+                                    arguments[0].span,
+                                ));
+                            }
+                            return Ok(Type::Result(Box::new(Type::Json), Box::new(conversion())));
+                        }
+                        "string" if arguments.len() == 1 => {
+                            let actual = self.check_expression(&arguments[0])?;
+                            if !matches!(actual, Type::String | Type::Str) {
+                                return Err(Diagnostic::new(
+                                    DiagnosticKind::Type,
+                                    "Json.string expects String or str",
+                                    arguments[0].span,
+                                ));
+                            }
+                            return Ok(Type::Result(Box::new(Type::Json), Box::new(conversion())));
+                        }
+                        "array" if arguments.len() == 1 => {
+                            let actual = self.check_expression(&arguments[0])?;
+                            self.require_same(
+                                &Type::List(Box::new(Type::Json)),
+                                &actual,
+                                arguments[0].span,
+                                "Json.array values",
+                            )?;
+                            return Ok(Type::Result(Box::new(Type::Json), Box::new(conversion())));
+                        }
+                        "object" if arguments.len() == 1 => {
+                            let actual = self.check_expression(&arguments[0])?;
+                            self.require_same(
+                                &Type::Map(Box::new(Type::String), Box::new(Type::Json)),
+                                &actual,
+                                arguments[0].span,
+                                "Json.object entries",
+                            )?;
+                            return Ok(Type::Result(Box::new(Type::Json), Box::new(conversion())));
+                        }
+                        "null" | "bool" | "int" | "uint" | "float" | "string" | "array"
+                        | "object" => {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Type,
+                                format!("`Json.{field}` received the wrong number of arguments"),
+                                expression.span,
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                if let Expression::FieldAccess { object, field, .. } = &callee.node
                     && matches!(&object.node, Expression::Identifier(name) if name == "Dns")
                     && field == "resolve"
                     && arguments.len() == 1
@@ -2921,6 +3021,36 @@ impl TypeChecker {
                                 return Ok(Type::Option(Box::new(Type::UInt)));
                             }
                             "is_secure" if arguments.is_empty() => return Ok(Type::Bool),
+                            "join_path" if arguments.len() == 1 => {
+                                let segment = self.check_expression(&arguments[0])?;
+                                if !matches!(segment, Type::String | Type::Str) {
+                                    return Err(Diagnostic::new(
+                                        DiagnosticKind::Type,
+                                        "Url.join_path expects a String or str segment",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                return Ok(Type::Result(
+                                    Box::new(Type::Url),
+                                    Box::new(Type::NetworkError),
+                                ));
+                            }
+                            "query_param" if arguments.len() == 2 => {
+                                for argument in arguments {
+                                    let actual = self.check_expression(argument)?;
+                                    if !matches!(actual, Type::String | Type::Str) {
+                                        return Err(Diagnostic::new(
+                                            DiagnosticKind::Type,
+                                            "Url.query_param expects String or str name and value",
+                                            argument.span,
+                                        ));
+                                    }
+                                }
+                                return Ok(Type::Result(
+                                    Box::new(Type::Url),
+                                    Box::new(Type::NetworkError),
+                                ));
+                            }
                             _ => {}
                         }
                     }
@@ -2935,6 +3065,58 @@ impl TypeChecker {
                                 if arguments.is_empty() =>
                             {
                                 return Ok(Type::Bool);
+                            }
+                            "get" if arguments.len() == 1 => {
+                                let key = self.check_expression(&arguments[0])?;
+                                if !matches!(key, Type::String | Type::Str) {
+                                    return Err(Diagnostic::new(
+                                        DiagnosticKind::Type,
+                                        "Json.get expects a String or str key",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                return Ok(Type::Option(Box::new(Type::Json)));
+                            }
+                            "at" if arguments.len() == 1 => {
+                                let index = self.check_expression(&arguments[0])?;
+                                if !is_integer(&index) {
+                                    return Err(Diagnostic::new(
+                                        DiagnosticKind::Type,
+                                        "Json.at expects an integer index",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                return Ok(Type::Option(Box::new(Type::Json)));
+                            }
+                            "as_bool" if arguments.is_empty() => {
+                                return Ok(Type::Result(
+                                    Box::new(Type::Bool),
+                                    Box::new(Type::ConversionError),
+                                ));
+                            }
+                            "as_int" if arguments.is_empty() => {
+                                return Ok(Type::Result(
+                                    Box::new(Type::Int),
+                                    Box::new(Type::ConversionError),
+                                ));
+                            }
+                            "as_uint" if arguments.is_empty() => {
+                                return Ok(Type::Result(
+                                    Box::new(Type::UInt),
+                                    Box::new(Type::ConversionError),
+                                ));
+                            }
+                            "as_f64" if arguments.is_empty() => {
+                                return Ok(Type::Result(
+                                    Box::new(Type::Float),
+                                    Box::new(Type::ConversionError),
+                                ));
+                            }
+                            "as_text" if arguments.is_empty() => {
+                                return Ok(Type::Result(
+                                    Box::new(Type::String),
+                                    Box::new(Type::ConversionError),
+                                ));
                             }
                             _ => {}
                         }

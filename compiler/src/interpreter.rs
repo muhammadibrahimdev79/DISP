@@ -168,6 +168,8 @@ struct RuntimeUrl {
     text: String,
 }
 
+const HTTP_URL_LIMIT: usize = 8192;
+
 impl RuntimeUrl {
     fn scheme(&self) -> &str {
         self.text.split_once(':').map_or("", |(scheme, _)| scheme)
@@ -216,6 +218,116 @@ impl RuntimeUrl {
     fn query(&self) -> Option<&str> {
         self.text.split_once('?').map(|(_, query)| query)
     }
+
+    fn encoded_component_len(value: &str) -> Option<usize> {
+        value.bytes().try_fold(0usize, |length, byte| {
+            length.checked_add(
+                if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+                    1
+                } else {
+                    3
+                },
+            )
+        })
+    }
+
+    fn encoded_component(value: &str, length: usize) -> String {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        let mut encoded = String::with_capacity(length);
+        for byte in value.bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+                encoded.push(char::from(byte));
+            } else {
+                encoded.push('%');
+                encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+                encoded.push(char::from(HEX[usize::from(byte & 15)]));
+            }
+        }
+        encoded
+    }
+
+    fn join_path(&self, segment: &str) -> io::Result<Self> {
+        if segment.is_empty() || matches!(segment, "." | "..") {
+            return Err(http_error(
+                io::ErrorKind::InvalidInput,
+                "URL path segment must be non-empty and cannot be '.' or '..'",
+            ));
+        }
+        let (base, query) = self
+            .text
+            .split_once('?')
+            .map_or((self.text.as_str(), None), |(base, query)| {
+                (base, Some(query))
+            });
+        let encoded_len = Self::encoded_component_len(segment)
+            .ok_or_else(|| http_error(io::ErrorKind::InvalidInput, "URL size overflow"))?;
+        let needed = self
+            .text
+            .len()
+            .checked_add(usize::from(!base.ends_with('/')))
+            .and_then(|length| length.checked_add(encoded_len))
+            .ok_or_else(|| http_error(io::ErrorKind::InvalidInput, "URL size overflow"))?;
+        if needed > HTTP_URL_LIMIT {
+            return Err(http_error(
+                io::ErrorKind::InvalidInput,
+                "URL exceeds the 8192-byte safety limit",
+            ));
+        }
+        let encoded = Self::encoded_component(segment, encoded_len);
+        let mut text = String::with_capacity(needed);
+        text.push_str(base);
+        if !base.ends_with('/') {
+            text.push('/');
+        }
+        text.push_str(&encoded);
+        if let Some(query) = query {
+            text.push('?');
+            text.push_str(query);
+        }
+        parse_http_url(&text)?;
+        Ok(Self { text })
+    }
+
+    fn query_param(&self, name: &str, value: &str) -> io::Result<Self> {
+        if name.is_empty() {
+            return Err(http_error(
+                io::ErrorKind::InvalidInput,
+                "URL query parameter name must not be empty",
+            ));
+        }
+        let has_query = self.text.contains('?');
+        let separator = usize::from(!has_query || !self.text.ends_with(['?', '&']));
+        let name_len = Self::encoded_component_len(name)
+            .ok_or_else(|| http_error(io::ErrorKind::InvalidInput, "URL size overflow"))?;
+        let value_len = Self::encoded_component_len(value)
+            .ok_or_else(|| http_error(io::ErrorKind::InvalidInput, "URL size overflow"))?;
+        let needed = self
+            .text
+            .len()
+            .checked_add(separator)
+            .and_then(|length| length.checked_add(name_len))
+            .and_then(|length| length.checked_add(1))
+            .and_then(|length| length.checked_add(value_len))
+            .ok_or_else(|| http_error(io::ErrorKind::InvalidInput, "URL size overflow"))?;
+        if needed > HTTP_URL_LIMIT {
+            return Err(http_error(
+                io::ErrorKind::InvalidInput,
+                "URL exceeds the 8192-byte safety limit",
+            ));
+        }
+        let mut text = String::with_capacity(needed);
+        text.push_str(&self.text);
+        if !has_query {
+            text.push('?');
+        } else if !text.ends_with(['?', '&']) {
+            text.push('&');
+        }
+        text.push_str(&Self::encoded_component(name, name_len));
+        text.push('=');
+        text.push_str(&Self::encoded_component(value, value_len));
+        parse_http_url(&text)?;
+        Ok(Self { text })
+    }
 }
 
 struct JsonParser<'a> {
@@ -257,11 +369,38 @@ impl JsonParser<'_> {
                     if escape != b'u' {
                         return Err("JSON escape is invalid");
                     }
+                    let start = self.at;
                     for _ in 0..4 {
                         if !self.bytes.get(self.at).is_some_and(u8::is_ascii_hexdigit) {
                             return Err("JSON Unicode escape is invalid");
                         }
                         self.at += 1;
+                    }
+                    let code = std::str::from_utf8(&self.bytes[start..self.at])
+                        .ok()
+                        .and_then(|digits| u16::from_str_radix(digits, 16).ok())
+                        .ok_or("JSON Unicode escape is invalid")?;
+                    if (0xd800..=0xdbff).contains(&code) {
+                        if self.bytes.get(self.at..self.at + 2) != Some(b"\\u") {
+                            return Err("JSON Unicode surrogate pair is incomplete");
+                        }
+                        self.at += 2;
+                        let low_start = self.at;
+                        for _ in 0..4 {
+                            if !self.bytes.get(self.at).is_some_and(u8::is_ascii_hexdigit) {
+                                return Err("JSON Unicode surrogate pair is invalid");
+                            }
+                            self.at += 1;
+                        }
+                        let low = std::str::from_utf8(&self.bytes[low_start..self.at])
+                            .ok()
+                            .and_then(|digits| u16::from_str_radix(digits, 16).ok())
+                            .ok_or("JSON Unicode surrogate pair is invalid")?;
+                        if !(0xdc00..=0xdfff).contains(&low) {
+                            return Err("JSON Unicode surrogate pair is invalid");
+                        }
+                    } else if (0xdc00..=0xdfff).contains(&code) {
+                        return Err("JSON Unicode surrogate pair is invalid");
                     }
                 }
                 _ => {}
@@ -352,9 +491,23 @@ impl JsonParser<'_> {
                     self.depth -= 1;
                     return Ok(if open == b'[' { "array" } else { "object" });
                 }
+                let mut object_keys = Vec::new();
                 loop {
                     if open == b'{' {
+                        let key_start = self.at;
                         self.string()?;
+                        let key_end = self.at;
+                        let source = std::str::from_utf8(&self.bytes[key_start..key_end])
+                            .map_err(|_| "JSON object key is not valid UTF-8")?;
+                        let key = json_string_value(source)
+                            .map_err(|_| "JSON object key escape is invalid")?;
+                        if object_keys.contains(&key) {
+                            return Err("JSON object contains a duplicate key");
+                        }
+                        if object_keys.len() >= 4096 {
+                            return Err("JSON object exceeds 4096 keys");
+                        }
+                        object_keys.push(key);
                         self.space();
                         if self.bytes.get(self.at) != Some(&b':') {
                             return Err("JSON object key is missing ':'");
@@ -403,6 +556,206 @@ fn runtime_json(source: String) -> io::Result<RuntimeJson> {
         ));
     }
     Ok(RuntimeJson { text: source, kind })
+}
+
+fn json_string_value(source: &str) -> io::Result<String> {
+    let bytes = source.as_bytes();
+    if bytes.len() < 2 || bytes.first() != Some(&b'"') || bytes.last() != Some(&b'"') {
+        return Err(http_error(
+            io::ErrorKind::InvalidData,
+            "JSON value is not a string",
+        ));
+    }
+    let mut result = String::with_capacity(bytes.len().saturating_sub(2));
+    let mut at = 1;
+    while at + 1 < bytes.len() {
+        if bytes[at] != b'\\' {
+            let tail = &source[at..bytes.len() - 1];
+            let next = tail.find('\\').unwrap_or(tail.len());
+            result.push_str(&tail[..next]);
+            at += next;
+            continue;
+        }
+        at += 1;
+        let escape = bytes[at];
+        at += 1;
+        match escape {
+            b'"' => result.push('"'),
+            b'\\' => result.push('\\'),
+            b'/' => result.push('/'),
+            b'b' => result.push('\u{0008}'),
+            b'f' => result.push('\u{000c}'),
+            b'n' => result.push('\n'),
+            b'r' => result.push('\r'),
+            b't' => result.push('\t'),
+            b'u' => {
+                let decode = |digits: &[u8]| -> io::Result<u16> {
+                    let text = std::str::from_utf8(digits).map_err(|_| {
+                        http_error(io::ErrorKind::InvalidData, "JSON Unicode escape is invalid")
+                    })?;
+                    u16::from_str_radix(text, 16).map_err(|_| {
+                        http_error(io::ErrorKind::InvalidData, "JSON Unicode escape is invalid")
+                    })
+                };
+                let first = decode(&bytes[at..at + 4])?;
+                at += 4;
+                let scalar = if (0xd800..=0xdbff).contains(&first) {
+                    if bytes.get(at..at + 2) != Some(b"\\u") {
+                        return Err(http_error(
+                            io::ErrorKind::InvalidData,
+                            "JSON Unicode surrogate pair is incomplete",
+                        ));
+                    }
+                    at += 2;
+                    let second = decode(&bytes[at..at + 4])?;
+                    at += 4;
+                    if !(0xdc00..=0xdfff).contains(&second) {
+                        return Err(http_error(
+                            io::ErrorKind::InvalidData,
+                            "JSON Unicode surrogate pair is invalid",
+                        ));
+                    }
+                    0x10000 + (((u32::from(first) - 0xd800) << 10) | (u32::from(second) - 0xdc00))
+                } else if (0xdc00..=0xdfff).contains(&first) {
+                    return Err(http_error(
+                        io::ErrorKind::InvalidData,
+                        "JSON Unicode surrogate pair is invalid",
+                    ));
+                } else {
+                    u32::from(first)
+                };
+                result.push(char::from_u32(scalar).ok_or_else(|| {
+                    http_error(io::ErrorKind::InvalidData, "JSON Unicode scalar is invalid")
+                })?);
+            }
+            _ => unreachable!("validated JSON contains only valid escapes"),
+        }
+    }
+    Ok(result)
+}
+
+fn json_escape_string(value: &str) -> io::Result<String> {
+    let mut length = 2usize;
+    for character in value.chars() {
+        let additional = match character {
+            '"' | '\\' | '\u{0008}' | '\u{000c}' | '\n' | '\r' | '\t' => 2,
+            character if character < '\u{0020}' => 6,
+            character => character.len_utf8(),
+        };
+        length = length
+            .checked_add(additional)
+            .ok_or_else(|| json_conversion_error("JSON document size overflow"))?;
+        if length > HTTP_BODY_LIMIT {
+            return Err(json_conversion_error(
+                "JSON document exceeds the 16 MiB limit",
+            ));
+        }
+    }
+    let mut escaped = String::with_capacity(length);
+    escaped.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\u{0008}' => escaped.push_str("\\b"),
+            '\u{000c}' => escaped.push_str("\\f"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if character < '\u{0020}' => {
+                use std::fmt::Write;
+                write!(escaped, "\\u{:04x}", character as u32).unwrap();
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped.push('"');
+    Ok(escaped)
+}
+
+fn json_fragment(source: &str, start: usize, end: usize) -> io::Result<RuntimeJson> {
+    runtime_json(source[start..end].trim().to_owned())
+}
+
+fn json_at(json: &RuntimeJson, index: usize) -> io::Result<Option<RuntimeJson>> {
+    if json.kind != "array" {
+        return Ok(None);
+    }
+    let mut parser = JsonParser {
+        bytes: json.text.as_bytes(),
+        at: 0,
+        depth: 0,
+    };
+    parser.space();
+    parser.at += 1;
+    parser.space();
+    if parser.bytes.get(parser.at) == Some(&b']') {
+        return Ok(None);
+    }
+    let mut current = 0;
+    loop {
+        parser.space();
+        let start = parser.at;
+        parser
+            .value()
+            .map_err(|message| http_error(io::ErrorKind::InvalidData, message))?;
+        let end = parser.at;
+        if current == index {
+            return json_fragment(&json.text, start, end).map(Some);
+        }
+        current += 1;
+        parser.space();
+        if parser.bytes.get(parser.at) == Some(&b']') {
+            return Ok(None);
+        }
+        parser.at += 1;
+    }
+}
+
+fn json_get(json: &RuntimeJson, wanted: &str) -> io::Result<Option<RuntimeJson>> {
+    if json.kind != "object" {
+        return Ok(None);
+    }
+    let mut parser = JsonParser {
+        bytes: json.text.as_bytes(),
+        at: 0,
+        depth: 0,
+    };
+    parser.space();
+    parser.at += 1;
+    parser.space();
+    if parser.bytes.get(parser.at) == Some(&b'}') {
+        return Ok(None);
+    }
+    loop {
+        parser.space();
+        let key_start = parser.at;
+        parser
+            .string()
+            .map_err(|message| http_error(io::ErrorKind::InvalidData, message))?;
+        let key_end = parser.at;
+        let key = json_string_value(&json.text[key_start..key_end])?;
+        parser.space();
+        parser.at += 1;
+        parser.space();
+        let start = parser.at;
+        parser
+            .value()
+            .map_err(|message| http_error(io::ErrorKind::InvalidData, message))?;
+        let end = parser.at;
+        if key == wanted {
+            return json_fragment(&json.text, start, end).map(Some);
+        }
+        parser.space();
+        if parser.bytes.get(parser.at) == Some(&b'}') {
+            return Ok(None);
+        }
+        parser.at += 1;
+    }
+}
+
+fn json_conversion_error(message: &str) -> io::Error {
+    http_error(io::ErrorKind::InvalidData, message)
 }
 
 struct RuntimeTcpStreamState {
@@ -961,7 +1314,7 @@ fn http_remaining(deadline: StdInstant) -> io::Result<StdDuration> {
 
 fn parse_http_url(source: &str) -> io::Result<Url> {
     if source.is_empty()
-        || source.len() > 8192
+        || source.len() > HTTP_URL_LIMIT
         || source
             .bytes()
             .any(|byte| byte == 0 || byte <= 0x20 || byte == 0x7f)
@@ -3249,6 +3602,137 @@ impl Interpreter {
                     return Ok(runtime_result(runtime_json(source.text).map(Value::Json)));
                 }
                 if let Expression::FieldAccess { object, field, .. } = &callee.node
+                    && matches!(&object.node, Expression::Identifier(name) if name == "Json")
+                {
+                    let make = |text: String| runtime_json(text).map(Value::Json);
+                    return match field.as_str() {
+                        "null" => Ok(Value::Json(runtime_json("null".into()).unwrap())),
+                        "bool" => {
+                            let Value::Bool(value) = self.evaluate(program, &arguments[0])? else {
+                                unreachable!("type checking validates Json.bool")
+                            };
+                            Ok(Value::Json(
+                                runtime_json(if value { "true" } else { "false" }.into()).unwrap(),
+                            ))
+                        }
+                        "int" => {
+                            let value = self.evaluate(program, &arguments[0])?;
+                            let text = match value {
+                                Value::Int(value) => value.to_string(),
+                                Value::Signed(value, _) => value.to_string(),
+                                _ => unreachable!("type checking validates Json.int"),
+                            };
+                            Ok(Value::Json(runtime_json(text).unwrap()))
+                        }
+                        "uint" => {
+                            let value = self.evaluate(program, &arguments[0])?;
+                            let text = match value {
+                                Value::UInt(value) => value.to_string(),
+                                Value::Unsigned(value, _) => value.to_string(),
+                                _ => unreachable!("type checking validates Json.uint"),
+                            };
+                            Ok(Value::Json(runtime_json(text).unwrap()))
+                        }
+                        "float" => {
+                            let value = self.evaluate(program, &arguments[0])?;
+                            let value = match value {
+                                Value::Float(value) => value,
+                                Value::Float32(value) => f64::from(value),
+                                _ => unreachable!("type checking validates Json.float"),
+                            };
+                            let result = if value.is_finite() {
+                                make(value.to_string())
+                            } else {
+                                Err(json_conversion_error(
+                                    "JSON cannot represent NaN or infinity",
+                                ))
+                            };
+                            Ok(runtime_result(result))
+                        }
+                        "string" => {
+                            let Value::String(value) = self.evaluate(program, &arguments[0])?
+                            else {
+                                unreachable!("type checking validates Json.string")
+                            };
+                            Ok(runtime_result(
+                                json_escape_string(&value.text).and_then(make),
+                            ))
+                        }
+                        "array" => {
+                            let Value::List { values, .. } =
+                                self.evaluate(program, &arguments[0])?
+                            else {
+                                unreachable!("type checking validates Json.array")
+                            };
+                            let mut text = String::from("[");
+                            for (index, value) in values.into_iter().enumerate() {
+                                let Value::Json(value) = value else {
+                                    unreachable!("type checking validates Json.array elements")
+                                };
+                                let additional = usize::from(index != 0)
+                                    .checked_add(value.text.len())
+                                    .and_then(|amount| amount.checked_add(1));
+                                if additional
+                                    .and_then(|amount| text.len().checked_add(amount))
+                                    .is_none_or(|length| length > HTTP_BODY_LIMIT)
+                                {
+                                    return Ok(runtime_result(Err(json_conversion_error(
+                                        "JSON document exceeds the 16 MiB limit",
+                                    ))));
+                                }
+                                if index != 0 {
+                                    text.push(',');
+                                }
+                                text.push_str(&value.text);
+                            }
+                            text.push(']');
+                            Ok(runtime_result(make(text)))
+                        }
+                        "object" => {
+                            let Value::Map { entries, .. } =
+                                self.evaluate(program, &arguments[0])?
+                            else {
+                                unreachable!("type checking validates Json.object")
+                            };
+                            let mut text = String::from("{");
+                            for (index, (key, value)) in entries.into_iter().enumerate() {
+                                let Value::String(key) = key else {
+                                    unreachable!("type checking validates Json.object keys")
+                                };
+                                let Value::Json(value) = value else {
+                                    unreachable!("type checking validates Json.object values")
+                                };
+                                let escaped = match json_escape_string(&key.text) {
+                                    Ok(escaped) => escaped,
+                                    Err(error) => return Ok(runtime_result(Err(error))),
+                                };
+                                let additional = usize::from(index != 0)
+                                    .checked_add(escaped.len())
+                                    .and_then(|amount| amount.checked_add(1))
+                                    .and_then(|amount| amount.checked_add(value.text.len()))
+                                    .and_then(|amount| amount.checked_add(1));
+                                if additional
+                                    .and_then(|amount| text.len().checked_add(amount))
+                                    .is_none_or(|length| length > HTTP_BODY_LIMIT)
+                                {
+                                    return Ok(runtime_result(Err(json_conversion_error(
+                                        "JSON document exceeds the 16 MiB limit",
+                                    ))));
+                                }
+                                if index != 0 {
+                                    text.push(',');
+                                }
+                                text.push_str(&escaped);
+                                text.push(':');
+                                text.push_str(&value.text);
+                            }
+                            text.push('}');
+                            Ok(runtime_result(make(text)))
+                        }
+                        _ => Err(self.error("unknown Json constructor", expression.span)),
+                    };
+                }
+                if let Expression::FieldAccess { object, field, .. } = &callee.node
                     && matches!(&object.node, Expression::Identifier(name) if name == "String")
                 {
                     return match field.as_str() {
@@ -4678,6 +5162,27 @@ impl Interpreter {
                             "is_secure" => {
                                 Ok(Value::Bool(url.scheme().eq_ignore_ascii_case("https")))
                             }
+                            "join_path" => {
+                                let Value::String(segment) =
+                                    self.evaluate(program, &arguments[0])?
+                                else {
+                                    unreachable!("type checking validates Url.join_path")
+                                };
+                                Ok(runtime_result(url.join_path(&segment.text).map(Value::Url)))
+                            }
+                            "query_param" => {
+                                let Value::String(name) = self.evaluate(program, &arguments[0])?
+                                else {
+                                    unreachable!("type checking validates Url.query_param name")
+                                };
+                                let Value::String(value) = self.evaluate(program, &arguments[1])?
+                                else {
+                                    unreachable!("type checking validates Url.query_param value")
+                                };
+                                Ok(runtime_result(
+                                    url.query_param(&name.text, &value.text).map(Value::Url),
+                                ))
+                            }
                             _ => Err(self.error("unknown Url operation", expression.span)),
                         };
                     }
@@ -4692,6 +5197,69 @@ impl Interpreter {
                             "is_string" => Ok(Value::Bool(json.kind == "string")),
                             "is_array" => Ok(Value::Bool(json.kind == "array")),
                             "is_object" => Ok(Value::Bool(json.kind == "object")),
+                            "get" => {
+                                let Value::String(key) = self.evaluate(program, &arguments[0])?
+                                else {
+                                    unreachable!("type checking validates Json.get key")
+                                };
+                                let value = json_get(&json, &key.text).map_err(|error| {
+                                    self.error(error.to_string(), expression.span)
+                                })?;
+                                Ok(option_value(value.map(Value::Json)))
+                            }
+                            "at" => {
+                                let index = self.index_value(program, &arguments[0])?;
+                                let value = json_at(&json, index).map_err(|error| {
+                                    self.error(error.to_string(), expression.span)
+                                })?;
+                                Ok(option_value(value.map(Value::Json)))
+                            }
+                            "as_bool" => Ok(runtime_result(match json.text.trim() {
+                                "true" => Ok(Value::Bool(true)),
+                                "false" => Ok(Value::Bool(false)),
+                                _ => Err(json_conversion_error("JSON value is not a bool")),
+                            })),
+                            "as_int" => Ok(runtime_result(
+                                json.text
+                                    .trim()
+                                    .parse::<i64>()
+                                    .map(Value::Int)
+                                    .map_err(|_| {
+                                        json_conversion_error(
+                                            "JSON value is not an integer representable as int",
+                                        )
+                                    }),
+                            )),
+                            "as_uint" => Ok(runtime_result(
+                                json.text
+                                    .trim()
+                                    .parse::<u64>()
+                                    .map(Value::UInt)
+                                    .map_err(|_| {
+                                        json_conversion_error(
+                                            "JSON value is not an integer representable as uint",
+                                        )
+                                    }),
+                            )),
+                            "as_f64" => Ok(runtime_result(if json.kind != "number" {
+                                Err(json_conversion_error("JSON value is not a number"))
+                            } else {
+                                json.text
+                                    .trim()
+                                    .parse::<f64>()
+                                    .ok()
+                                    .filter(|value| value.is_finite())
+                                    .map(Value::Float)
+                                    .ok_or_else(|| {
+                                        json_conversion_error(
+                                            "JSON number is not representable as f64",
+                                        )
+                                    })
+                            })),
+                            "as_text" => Ok(runtime_result(
+                                json_string_value(json.text.trim())
+                                    .map(|text| Value::String(RuntimeString::literal(text))),
+                            )),
                             _ => Err(self.error("unknown Json operation", expression.span)),
                         };
                     }

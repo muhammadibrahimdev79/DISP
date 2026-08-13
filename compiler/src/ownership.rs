@@ -1446,6 +1446,19 @@ impl<'a> Analyzer<'a> {
                     _ => Ty::Unit,
                 });
             }
+            if matches!(&object.node, Expression::Identifier(name) if name == "Json") {
+                for argument in arguments {
+                    self.check_expr(argument, UseMode::Read)?;
+                }
+                return Ok(match field.as_str() {
+                    "null" | "bool" | "int" | "uint" => Ty::Json,
+                    "float" | "string" | "array" | "object" => Ty::Result(
+                        Box::new(Ty::Json),
+                        Box::new(Ty::Owned("ConversionError".into())),
+                    ),
+                    _ => Ty::Unit,
+                });
+            }
             if matches!(&object.node, Expression::Identifier(name) if name == "String") {
                 for argument in arguments {
                     self.check_expr(argument, UseMode::Read)?;
@@ -1558,6 +1571,10 @@ impl<'a> Analyzer<'a> {
                     "as_string" | "scheme" | "path" => Ty::Owned("String".into()),
                     "host" | "query" => Ty::Option(Box::new(Ty::Owned("String".into()))),
                     "port" => Ty::Option(Box::new(Ty::Copy)),
+                    "join_path" | "query_param" => Ty::Result(
+                        Box::new(Ty::Url),
+                        Box::new(Ty::Owned("NetworkError".into())),
+                    ),
                     _ => Ty::Copy,
                 });
             }
@@ -1568,6 +1585,15 @@ impl<'a> Analyzer<'a> {
                 }
                 return Ok(match field.as_str() {
                     "as_string" | "kind" => Ty::Owned("String".into()),
+                    "get" | "at" => Ty::Option(Box::new(Ty::Json)),
+                    "as_text" => Ty::Result(
+                        Box::new(Ty::Owned("String".into())),
+                        Box::new(Ty::Owned("ConversionError".into())),
+                    ),
+                    "as_bool" | "as_int" | "as_uint" | "as_f64" => Ty::Result(
+                        Box::new(Ty::Copy),
+                        Box::new(Ty::Owned("ConversionError".into())),
+                    ),
                     _ => Ty::Copy,
                 });
             }

@@ -1909,6 +1909,35 @@ impl FunctionLowering<'_, '_> {
                         span,
                     });
                 }
+                if owner == "Json"
+                    && matches!(
+                        field.as_str(),
+                        "null" | "bool" | "int" | "uint" | "float" | "string" | "array" | "object"
+                    )
+                {
+                    let args = arguments
+                        .iter()
+                        .map(|x| self.lower_expr(x))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let ty = if matches!(field.as_str(), "float" | "string" | "array" | "object") {
+                        Type::Result(
+                            Box::new(Type::Json),
+                            Box::new(Type::Generic("ConversionError".into())),
+                        )
+                    } else {
+                        Type::Json
+                    };
+                    return Ok(Expr {
+                        kind: ExprKind::Call(Call {
+                            target: CallTarget::Intrinsic(format!("Json.{field}")),
+                            arguments: args,
+                            receiver: None,
+                            substitutions: vec![],
+                        }),
+                        ty,
+                        span,
+                    });
+                }
                 if owner == "String" {
                     let args = arguments
                         .iter()
@@ -2430,6 +2459,10 @@ impl FunctionLowering<'_, '_> {
                         signed: false,
                         width: None,
                     })),
+                    "join_path" | "query_param" => Type::Result(
+                        Box::new(Type::Url),
+                        Box::new(Type::Generic("NetworkError".into())),
+                    ),
                     _ => Type::Bool,
                 };
                 return Ok(Expr {
@@ -2444,13 +2477,46 @@ impl FunctionLowering<'_, '_> {
                 });
             }
             if matches!(receiver.ty, Type::Json) {
-                let args = vec![receiver];
+                let mut args = vec![receiver];
+                args.extend(
+                    arguments
+                        .iter()
+                        .map(|x| self.lower_expr(x))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
                 let ty = match field.as_str() {
                     "as_string" | "kind" => Type::String,
                     "len" => Type::Int {
                         signed: false,
                         width: None,
                     },
+                    "get" | "at" => Type::Option(Box::new(Type::Json)),
+                    "as_bool" => Type::Result(
+                        Box::new(Type::Bool),
+                        Box::new(Type::Generic("ConversionError".into())),
+                    ),
+                    "as_int" => Type::Result(
+                        Box::new(Type::Int {
+                            signed: true,
+                            width: None,
+                        }),
+                        Box::new(Type::Generic("ConversionError".into())),
+                    ),
+                    "as_uint" => Type::Result(
+                        Box::new(Type::Int {
+                            signed: false,
+                            width: None,
+                        }),
+                        Box::new(Type::Generic("ConversionError".into())),
+                    ),
+                    "as_f64" => Type::Result(
+                        Box::new(Type::Float { width: 64 }),
+                        Box::new(Type::Generic("ConversionError".into())),
+                    ),
+                    "as_text" => Type::Result(
+                        Box::new(Type::String),
+                        Box::new(Type::Generic("ConversionError".into())),
+                    ),
                     _ => Type::Bool,
                 };
                 return Ok(Expr {

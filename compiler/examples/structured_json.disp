@@ -1,0 +1,31 @@
+fn build_document() -> Result<Json, ConversionError> {
+    values = List.of(Json.int(7), Json.string("safe\nUTF-8")?, Json.bool(true))
+    entries = Map.of(
+        "name": Json.string("DISP")?,
+        "values": Json.array(values)?,
+        "nothing": Json.null()
+    )
+    return Json.object(entries)
+}
+
+fn inspect_document() -> Result<bool, ConversionError> {
+    document = build_document()?
+    print(document.as_string())
+    print(match document.get("name") {
+        Some(name) => name.as_text()?,
+        None => "missing",
+    })
+    print(match document.get("values") {
+        Some(values) => match values.at(0) {
+            Some(value) => value.as_int()?,
+            None => 0,
+        },
+        None => 0,
+    })
+    print(document.get("missing"))
+    return Ok(true)
+}
+
+fn main() {
+    print(inspect_document())
+}

@@ -7,6 +7,9 @@ fn inspect() -> Result<bool, NetworkError> {
     print(url.query())
     print(url.is_secure())
     print(url.as_string())
+    joined = url.join_path("year reports/λ")?
+    print(joined.as_string())
+    print(joined.query_param("sort by", "name&date")?)
     return Ok(true)
 }
 

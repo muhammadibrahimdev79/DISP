@@ -168,6 +168,15 @@ print(url.port())
 print(url.path())
 print(url.query())
 print(url.is_secure())
+joined = url.join_path("year reports/λ")?
+print(joined.as_string())
+queried = joined.query_param("sort by", "name&date")?
+print(queried.as_string())
+print(match url.join_path("..") { Ok(value) => false, Err(error) => true })
+print(match url.query_param("", "value") { Ok(value) => false, Err(error) => true })
+var huge = String()
+for index in 0..8200 { huge.push('a') }
+print(match url.join_path(huge) { Ok(value) => false, Err(error) => true })
 spelled = Url("HTTPS://EXAMPLE.COM:443")?
 print(spelled.scheme())
 print(spelled.host())
@@ -189,6 +198,14 @@ print(inspect())
     assert!(generated.contains("disp_native_json"));
     assert!(generated.contains("disp_json_parse"));
     assert!(generated.contains("JSON nesting exceeds 128 levels"));
+    assert!(generated.contains("disp_url_join_path"));
+    assert!(generated.contains("disp_url_query_param"));
+    assert!(
+        expected.contains("https://example.com:8443/api/items/year%20reports%2F%CE%BB?limit=10\n")
+    );
+    assert!(expected.contains(
+        "https://example.com:8443/api/items/year%20reports%2F%CE%BB?limit=10&sort%20by=name%26date\n"
+    ));
 }
 
 #[test]
@@ -265,11 +282,29 @@ print(match Json("01") { Ok(value) => false, Err(error) => true })
 fn json_grammar_and_nesting_limits_match_across_engines() {
     let nested_128 = format!("{}0{}", "[".repeat(128), "]".repeat(128));
     let nested_129 = format!("{}0{}", "[".repeat(129), "]".repeat(129));
+    let object_4096 = format!(
+        "{{{}}}",
+        (0..4096)
+            .map(|index| format!("\"k{index}\":0"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let object_4097 = format!(
+        "{{{}}}",
+        (0..4097)
+            .map(|index| format!("\"k{index}\":0"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     let cases = [
         ("null".to_owned(), true),
         (" true \n".to_owned(), true),
         ("-12.5e+3".to_owned(), true),
         (r#""escaped\n\u0041""#.to_owned(), true),
+        (r#""\uD83D\uDE80""#.to_owned(), true),
+        (r#""\uD83D""#.to_owned(), false),
+        (r#""\uDE80""#.to_owned(), false),
+        (r#""\uD83D\u0041""#.to_owned(), false),
         (r#"{"a":[1,false,null],"b":{}}"#.to_owned(), true),
         ("".to_owned(), false),
         ("01".to_owned(), false),
@@ -277,8 +312,13 @@ fn json_grammar_and_nesting_limits_match_across_engines() {
         ("[1,]".to_owned(), false),
         (r#"{"a":1"#.to_owned(), false),
         ("true false".to_owned(), false),
-        (nested_128, true),
+        (r#"{"a":1,"a":2}"#.to_owned(), false),
+        (r#"{"a":1,"\u0061":2}"#.to_owned(), false),
+        (r#"{"outer":{"x":1,"x":2}}"#.to_owned(), false),
+        (nested_128.clone(), true),
         (nested_129, false),
+        (object_4096, true),
+        (object_4097, false),
     ];
     let mut source = String::from("fn main() {\n");
     for (document, valid) in &cases {
@@ -297,4 +337,111 @@ fn json_grammar_and_nesting_limits_match_across_engines() {
     let expected = vec!["true"; cases.len()].join("\n") + "\n";
     assert_eq!(run_source(&source).unwrap().join("\n") + "\n", expected);
     assert_eq!(native("grammar", &source, false).0, expected);
+
+    let construction = format!(
+        "fn build() -> Result<bool, ConversionError> {{ child = Json(\"{nested_128}\")? values = List.of(child) return Ok(match Json.array(values) {{ Ok(value) => false, Err(error) => true }}) }} fn main() {{ print(build()) }}"
+    );
+    assert_eq!(run_source(&construction).unwrap(), ["Result.Ok(true)"]);
+    assert_eq!(
+        native("construction-depth", &construction, false).0,
+        "Result.Ok(true)\n"
+    );
+}
+
+#[test]
+fn structured_json_navigation_and_typed_extraction_are_differential() {
+    let source = r#"fn inspect() -> Result<bool, ConversionError> {
+document = Json("{\"name\":\"DISP\",\"escaped\":\"line\\nA\\u03bb\",\"enabled\":true,\"signed\":-42,\"unsigned\":42,\"ratio\":1.25,\"items\":[null,{\"answer\":7}]}")?
+print(match document.get("name") { Some(value) => value.as_text()?, None => "missing" })
+print(match document.get("escaped") { Some(value) => value.as_text()?, None => "missing" })
+print(match document.get("enabled") { Some(value) => value.as_bool()?, None => false })
+print(match document.get("signed") { Some(value) => value.as_int()?, None => 0 })
+print(match document.get("unsigned") { Some(value) => value.as_uint()?, None => uint(0) })
+print(match document.get("ratio") { Some(value) => value.as_f64()?, None => 0.0 })
+print(match document.get("items") { Some(items) => match items.at(1) { Some(item) => match item.get("answer") { Some(answer) => answer.as_int()?, None => 0 }, None => 0 }, None => 0 })
+print(document.get("absent"))
+print(match document.as_bool() { Ok(value) => false, Err(error) => true })
+huge = Json("1e9999")?
+print(match huge.as_f64() { Ok(value) => false, Err(error) => true })
+return Ok(true)
+}
+fn main() { print(inspect()) }"#;
+    let expected = run_source(source).unwrap().join("\n") + "\n";
+    assert_eq!(
+        expected,
+        "DISP\nline\nAλ\ntrue\n-42\n42\n1.25\n7\nOption.None\ntrue\ntrue\nResult.Ok(true)\n"
+    );
+    let (actual, generated) = native("structured-navigation", source, true);
+    assert_eq!(actual, expected);
+    let generated = generated.unwrap();
+    assert!(generated.contains("disp_json_get"));
+    assert!(generated.contains("disp_json_at"));
+    assert!(generated.contains("disp_json_as_text"));
+}
+
+#[test]
+fn safe_json_construction_is_native_interpreter_differential() {
+    let source = r#"fn build() -> Result<Json, ConversionError> {
+values = List.of(Json.int(-7), Json.uint(uint(8)), Json.float(1.5)?, Json.string("safe\nλ")?)
+array = Json.array(values)?
+print(values.len())
+entries = Map.of("array": array, "enabled": Json.bool(true), "nothing": Json.null())
+document = Json.object(entries)?
+print(entries.len())
+return Ok(document)
+}
+fn main() {
+print(build())
+print(Json.int(-9223372036854775807))
+print(Json.uint(uint(18446744073709551615)))
+print(match Json.float(1e308 * 1e308) { Ok(value) => false, Err(error) => true })
+}"#;
+    let expected = run_source(source).unwrap().join("\n") + "\n";
+    assert_eq!(
+        expected,
+        "4\n3\nResult.Ok({\"array\":[-7,8,1.5,\"safe\\nλ\"],\"enabled\":true,\"nothing\":null})\n-9223372036854775807\n18446744073709551615\ntrue\n"
+    );
+    let (actual, generated) = native("structured-construction", source, true);
+    assert_eq!(actual, expected);
+    let generated = generated.unwrap();
+    assert!(generated.contains("disp_json_from_array"));
+    assert!(generated.contains("disp_json_from_object"));
+    assert!(generated.contains("disp_json_from_i128"));
+}
+
+#[test]
+fn structured_json_api_rejects_invalid_types_with_exact_spans() {
+    let invalid = [
+        (
+            "fn main() { value = Json.null() value.get(1) }",
+            "Json.get expects a String or str key",
+            43,
+        ),
+        (
+            "fn main() { value = Json.int(1.5) }",
+            "Json.int expects a signed integer",
+            30,
+        ),
+        (
+            "fn main() { values = List.of(Json.null()) value = Json.array(1) }",
+            "Json.array values",
+            62,
+        ),
+        (
+            "fn main() { entries = Map.of(1: Json.null()) value = Json.object(entries) }",
+            "Json.object entries",
+            66,
+        ),
+        (
+            "fn misuse(url: Url) { value = url.query_param(1, \"x\") } fn main() {}",
+            "Url.query_param expects String or str name and value",
+            47,
+        ),
+    ];
+    for (source, message, column) in invalid {
+        let error = check_source(source).unwrap_err();
+        assert!(error.message.contains(message), "{}", error.message);
+        assert_eq!(error.span.start.line, 1);
+        assert_eq!(error.span.start.column, column);
+    }
 }

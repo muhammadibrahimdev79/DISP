@@ -843,11 +843,21 @@ redirects, chunked
 bodies, invalid UTF-8, malformed framing, typed failures, laziness, and zero deadlines.
 
 `Url` and `Json` use concrete owned three-word native layouts. URL parsing shares the safe HTTP
-URL policy and can feed requests without converting back through an ordinary string. JSON is
+URL policy and can feed requests without converting back through an ordinary string. Functional
+path-segment and query-parameter builders percent-encode UTF-8 bytes, reject traversal/empty-name
+ambiguities, preflight overflow and the 8192-byte bound, and preserve their source URL. JSON is
 validated before ownership is established, with a 16 MiB document bound and a 128-level nesting
 bound in both runtimes. Generated native code contains its own bounded parser, avoiding a dynamic
 JSON runtime dependency. HTTP JSON builders snapshot validated bytes and response conversion
-validates the full document before returning `Json`.
+validates the full document before returning `Json`. Unicode escape validation rejects malformed
+surrogate pairs, and a bounded second validation pass rejects decoded duplicate object keys;
+the 4096-key-per-object limit bounds its worst-case work.
+Structured access reparses only the bounded owned document and copies the selected
+fragment into an independent three-word `Json` allocation. Typed scalar extraction uses checked
+integer and finite-float conversions. Array/object construction serializes concrete
+`List<Json>`/`Map<String, Json>` storage through the allocator boundary, enforces the same document
+limit during growth, and leaves source ownership unchanged; all partially built buffers follow one
+cleanup path on failure.
 
 ---
 

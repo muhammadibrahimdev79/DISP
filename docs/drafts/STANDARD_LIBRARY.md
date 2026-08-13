@@ -838,12 +838,41 @@ print(url.query())
 and no control characters or spaces. It exposes `as_string`, `scheme`, `host`, `port`, `path`,
 `query`, and `is_secure`. Parsing returns `Result<Url, NetworkError>`; the type is non-Copy so its
 owned serialization has one deterministic cleanup path. The validated serialization is preserved
-exactly; component methods expose the spelling present in that serialization.
+exactly; component methods expose the spelling present in that serialization. `join_path(segment)`
+adds exactly one percent-encoded path segment and rejects empty, `.` and `..` traversal segments.
+`query_param(name, value)` appends one percent-encoded query pair, rejects empty names, and cannot
+inject `&`, `=`, `#`, spaces, or control characters into the URL structure. Both operations return
+a new `Result<Url, NetworkError>`, preserve the original value, and enforce the same 8192-byte URL
+limit before allocation.
 
 `Json(text)` validates a complete UTF-8 JSON document before producing a nominal owned `Json`.
 Documents are limited to 16 MiB and 128 nesting levels. `kind`, `is_null`, `is_bool`, `is_number`,
 `is_string`, `is_array`, `is_object`, `len`, and `as_string` are available without exposing parser
-state. `Http.post_json`, `HttpRequest.json`, and `HttpResponse.json` apply and validate
+state. Escaped Unicode must decode to scalar values; malformed or unpaired UTF-16 surrogate
+escapes are rejected. Duplicate object keys—including differently escaped spellings of the same
+decoded key—are rejected, avoiding ambiguous first-key/last-key security behavior.
+Each object is limited to 4096 keys, bounding duplicate detection and lookup work.
+
+Objects and arrays can be navigated without introducing a dynamic value type:
+
+```disp
+document = Json("{\"name\":\"DISP\",\"items\":[7,true]}")?
+name = document.get("name")       // Option<Json>
+first = match document.get("items") {
+    Some(items) => items.at(0),
+    None => None,
+}
+```
+
+`get` and `at` return owned `Option<Json>` fragments, so a fragment cannot outlive its source and
+does not retain the complete source allocation. `as_bool`, `as_int`, `as_uint`, `as_f64`, and
+`as_text` return `Result<value, ConversionError>` and never silently coerce JSON kinds or truncate
+numbers. `Json.null`, `Json.bool`, `Json.int`, and `Json.uint` construct bounded primitive values.
+`Json.float` rejects non-finite values, `Json.string` performs correct JSON escaping, and
+`Json.array(List<Json>)` and `Json.object(Map<String, Json>)` build validated documents while
+leaving their source collections available to the caller.
+
+`Http.post_json`, `HttpRequest.json`, and `HttpResponse.json` apply and validate
 `application/json` bodies in both native and interpreter execution.
 
 ---

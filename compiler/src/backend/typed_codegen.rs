@@ -1534,6 +1534,104 @@ fn terminator(
                         "({{{result_c} _r={{0}};disp_native_json _json={{0}};disp_native_string _error={{0}};if(disp_json_parse(({source})->data,({source})->len,&_json,&_error)){{_r.tag=0;_r.payload.v0.f0=_json;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
                     )
                 }
+                hir::CallTarget::Intrinsic(name)
+                    if matches!(
+                        name.as_str(),
+                        "Json.null"
+                            | "Json.bool"
+                            | "Json.int"
+                            | "Json.uint"
+                            | "Json.float"
+                            | "Json.string"
+                            | "Json.array"
+                            | "Json.object"
+                    ) =>
+                {
+                    match name.as_str() {
+                        "Json.null" => "disp_json_literal(\"null\",4)".into(),
+                        "Json.bool" => {
+                            let actual =
+                                operand_ty(program, function, &arguments[0], substitutions);
+                            let value =
+                                operand(program, function, &arguments[0], &actual, substitutions);
+                            format!(
+                                "({value})?disp_json_literal(\"true\",4):disp_json_literal(\"false\",5)"
+                            )
+                        }
+                        "Json.int" | "Json.uint" => {
+                            let actual =
+                                operand_ty(program, function, &arguments[0], substitutions);
+                            let value =
+                                operand(program, function, &arguments[0], &actual, substitutions);
+                            if name == "Json.int" {
+                                format!("disp_json_from_i128((__int128)({value}))")
+                            } else {
+                                format!("disp_json_from_u128((unsigned __int128)({value}))")
+                            }
+                        }
+                        "Json.float" | "Json.string" | "Json.array" | "Json.object" => {
+                            let result_c = native_types::c_type(&destination_ty);
+                            let call = match name.as_str() {
+                                "Json.float" => {
+                                    let actual =
+                                        operand_ty(program, function, &arguments[0], substitutions);
+                                    let value = operand(
+                                        program,
+                                        function,
+                                        &arguments[0],
+                                        &actual,
+                                        substitutions,
+                                    );
+                                    format!("disp_json_from_f64((double)({value}),&_value,&_error)")
+                                }
+                                "Json.string" => {
+                                    let (value, _) = system_argument(
+                                        program,
+                                        function,
+                                        &arguments[0],
+                                        substitutions,
+                                    );
+                                    format!(
+                                        "disp_json_from_string(({value})->data,({value})->len,&_value,&_error)"
+                                    )
+                                }
+                                "Json.array" => {
+                                    let actual =
+                                        operand_ty(program, function, &arguments[0], substitutions);
+                                    let value = operand(
+                                        program,
+                                        function,
+                                        &arguments[0],
+                                        &actual,
+                                        substitutions,
+                                    );
+                                    format!(
+                                        "disp_json_from_array(({value}).data,({value}).len,&_value,&_error)"
+                                    )
+                                }
+                                "Json.object" => {
+                                    let actual =
+                                        operand_ty(program, function, &arguments[0], substitutions);
+                                    let value = operand(
+                                        program,
+                                        function,
+                                        &arguments[0],
+                                        &actual,
+                                        substitutions,
+                                    );
+                                    format!(
+                                        "disp_json_from_object(({value}).keys,({value}).values,({value}).len,&_value,&_error)"
+                                    )
+                                }
+                                _ => unreachable!(),
+                            };
+                            format!(
+                                "({{{result_c} _r={{0}};disp_native_json _value={{0}};disp_native_string _error={{0}};if({call}){{_r.tag=0;_r.payload.v0.f0=_value;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                            )
+                        }
+                        _ => unreachable!(),
+                    }
+                }
                 hir::CallTarget::Intrinsic(name) if name == "SocketAddress.new" => {
                     let host_ty = operand_ty(program, function, &arguments[0], substitutions);
                     let port_ty = operand_ty(program, function, &arguments[1], substitutions);
@@ -2170,6 +2268,29 @@ fn terminator(
                         }
                         "Url.path" => format!("disp_url_path({url})"),
                         "Url.is_secure" => format!("disp_url_is_secure({url})"),
+                        "Url.join_path" | "Url.query_param" => {
+                            let result_c = native_types::c_type(&destination_ty);
+                            let (first, _) =
+                                system_argument(program, function, &arguments[1], substitutions);
+                            let call = if name == "Url.join_path" {
+                                format!(
+                                    "disp_url_join_path({url},({first})->data,({first})->len,&_value,&_error)"
+                                )
+                            } else {
+                                let (second, _) = system_argument(
+                                    program,
+                                    function,
+                                    &arguments[2],
+                                    substitutions,
+                                );
+                                format!(
+                                    "disp_url_query_param({url},({first})->data,({first})->len,({second})->data,({second})->len,&_value,&_error)"
+                                )
+                            };
+                            format!(
+                                "({{{result_c} _r={{0}};disp_native_url _value={{0}};disp_native_string _error={{0}};if({call}){{_r.tag=0;_r.payload.v0.f0=_value;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                            )
+                        }
                         _ => unreachable!(),
                     }
                 }
@@ -2186,6 +2307,48 @@ fn terminator(
                         "Json.is_string" => format!("disp_json_is_kind({json},\"string\")"),
                         "Json.is_array" => format!("disp_json_is_kind({json},\"array\")"),
                         "Json.is_object" => format!("disp_json_is_kind({json},\"object\")"),
+                        "Json.get" => {
+                            let (key, _) =
+                                system_argument(program, function, &arguments[1], substitutions);
+                            let option_c = native_types::c_type(&destination_ty);
+                            format!(
+                                "({{{option_c} _r={{0}};disp_native_json _value={{0}};if(disp_json_get({json},({key})->data,({key})->len,&_value)){{_r.tag=1;_r.payload.v1.f0=_value;}}_r;}})"
+                            )
+                        }
+                        "Json.at" => {
+                            let actual =
+                                operand_ty(program, function, &arguments[1], substitutions);
+                            let index =
+                                operand(program, function, &arguments[1], &actual, substitutions);
+                            let negative = if matches!(actual, hir::Type::Int { signed: true, .. })
+                            {
+                                format!(
+                                    "if(({index})<0)dv_panic(\"JSON index cannot be negative\",{},{});",
+                                    span.start.line, span.start.column
+                                )
+                            } else {
+                                String::new()
+                            };
+                            let option_c = native_types::c_type(&destination_ty);
+                            format!(
+                                "({{{negative}{option_c} _r={{0}};disp_native_json _value={{0}};if(disp_json_at({json},(size_t)({index}),&_value)){{_r.tag=1;_r.payload.v1.f0=_value;}}_r;}})"
+                            )
+                        }
+                        "Json.as_bool" | "Json.as_int" | "Json.as_uint" | "Json.as_f64"
+                        | "Json.as_text" => {
+                            let result_c = native_types::c_type(&destination_ty);
+                            let (value_c, helper) = match name.as_str() {
+                                "Json.as_bool" => ("bool", "disp_json_as_bool"),
+                                "Json.as_int" => ("int64_t", "disp_json_as_int"),
+                                "Json.as_uint" => ("uint64_t", "disp_json_as_uint"),
+                                "Json.as_f64" => ("double", "disp_json_as_f64"),
+                                "Json.as_text" => ("disp_native_string", "disp_json_as_text"),
+                                _ => unreachable!(),
+                            };
+                            format!(
+                                "({{{result_c} _r={{0}};{value_c} _value={{0}};disp_native_string _error={{0}};if({helper}({json},&_value,&_error)){{_r.tag=0;_r.payload.v0.f0=_value;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                            )
+                        }
                         _ => unreachable!(),
                     }
                 }

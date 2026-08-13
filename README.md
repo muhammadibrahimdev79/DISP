@@ -43,8 +43,10 @@ strict validation, bounded redirects and input/output, non-replay protection, ty
 bounded connection reuse with deterministic cleanup. Cancelling an unpolled I/O future has no side effects. Once native I/O has started,
 cancellation discards its result but lets the operating-system operation finish, and shutdown
 drains that work so owned resources are released deterministically. The implementation
-also includes nominal structured HTTP URLs and bounded validated JSON documents with native HTTP
-body integration, deterministic cleanup, and matching interpreter semantics. The implementation
+also includes nominal structured HTTP URLs with injection-safe path/query builders and bounded
+validated JSON documents with safe navigation, checked scalar extraction, array/object
+construction, native HTTP body integration, deterministic cleanup, and matching interpreter
+semantics. The implementation
 remains under active development and should not
 yet be treated as a stable production language.
 
