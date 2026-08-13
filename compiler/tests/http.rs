@@ -130,6 +130,84 @@ fn server(
     (port, handle)
 }
 
+fn persistent_server(requests: usize) -> (u16, thread::JoinHandle<(usize, usize)>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let handle = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut connections = 0;
+        let mut served = 0;
+        while served < requests && Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    connections += 1;
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    while served < requests {
+                        let mut request = Vec::new();
+                        let mut byte = [0; 1];
+                        while !request.ends_with(b"\r\n\r\n") {
+                            match stream.read(&mut byte) {
+                                Ok(0) => break,
+                                Ok(_) => request.push(byte[0]),
+                                Err(error)
+                                    if matches!(
+                                        error.kind(),
+                                        ErrorKind::TimedOut | ErrorKind::WouldBlock
+                                    ) =>
+                                {
+                                    break;
+                                }
+                                Err(error) => panic!("persistent HTTP read failed: {error}"),
+                            }
+                            assert!(request.len() <= 32 * 1024);
+                        }
+                        if request.is_empty() || !request.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                        let headers = String::from_utf8(request).unwrap();
+                        assert!(headers.starts_with("GET /"));
+                        let content_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        let mut body = vec![0; content_length];
+                        stream.read_exact(&mut body).unwrap();
+                        served += 1;
+                        let connection = if served == requests {
+                            "close"
+                        } else {
+                            "keep-alive"
+                        };
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: {connection}\r\n\r\nok"
+                        )
+                        .unwrap();
+                        stream.flush().unwrap();
+                        if connection == "close" {
+                            break;
+                        }
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("persistent HTTP server failed: {error}"),
+            }
+        }
+        (connections, served)
+    });
+    (port, handle)
+}
+
 fn response_source(port: u16) -> String {
     format!(
         r#"async fn inspect() -> Result<bool, HttpError> {{
@@ -152,6 +230,33 @@ async fn main() {{ print(await inspect()) }}"#
 
 fn basic_response(_: &str) -> Vec<u8> {
     b"HTTP/1.1 201 Created\r\nContent-Length: 5\r\nContent-Type: text/plain\r\nX-MiXeD: Value\r\nConnection: close\r\n\r\nhello".to_vec()
+}
+
+fn connection_reuse_source(port: u16) -> String {
+    format!(
+        r#"async fn exercise() -> Result<bool, HttpError> {{
+first = (await Http.get("http://127.0.0.1:{port}/first"))?
+second = (await Http.get("http://127.0.0.1:{port}/second"))?
+return Ok(first.status() == 200 && second.status() == 200)
+}}
+async fn main() {{ print(await exercise()) }}"#
+    )
+}
+
+#[test]
+fn sequential_requests_reuse_connections_in_interpreter_and_native() {
+    let (port, served) = persistent_server(2);
+    let output = run_source(&connection_reuse_source(port)).unwrap();
+    let server_stats = served.join().unwrap();
+    assert_eq!(server_stats, (1, 2), "interpreter output: {output:?}");
+    assert_eq!(output, ["Result.Ok(true)"]);
+
+    let (port, served) = persistent_server(2);
+    let (output, _) = native("connection-reuse", &connection_reuse_source(port), false);
+    if let Some(output) = output {
+        assert_eq!(output, "Result.Ok(true)\n");
+        assert_eq!(served.join().unwrap(), (1, 2));
+    }
 }
 
 #[test]

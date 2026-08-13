@@ -40,7 +40,7 @@ lazy deadline-aware encrypted reads and writes, explicit close, and deterministi
 shutdown/drop cleanup. Safe lazy HTTP/HTTPS GET/POST/PUT/PATCH/DELETE operations and linear owned
 custom requests provide typed responses, snapshotted headers and bodies, safe TLS defaults,
 strict validation, bounded redirects and input/output, non-replay protection, typed failures, and
-deterministic cleanup. Cancelling an unpolled I/O future has no side effects. Once native I/O has started,
+bounded connection reuse with deterministic cleanup. Cancelling an unpolled I/O future has no side effects. Once native I/O has started,
 cancellation discards its result but lets the operating-system operation finish, and shutdown
 drains that work so owned resources are released deterministically. The implementation
 remains under active development and should not

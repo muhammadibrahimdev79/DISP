@@ -819,6 +819,10 @@ at most 100 user headers, request headers and bodies use the same 64 KiB and 16 
 non-empty or user-configured requests are never automatically replayed across redirects. Bare
 GET/HEAD requests retain the bounded safe redirect behavior.
 
+Sequential requests reuse eligible HTTP/1.1 connections without exposing pooling to ordinary
+DISP code. Reuse requires an exactly framed response and is disabled when the peer requests
+closure; interpreter pooling is bounded to 32 origins and two idle connections per origin.
+
 ---
 
 # 38. HTTP Server

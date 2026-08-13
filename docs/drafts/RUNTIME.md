@@ -831,10 +831,15 @@ owned pointer type whose functional `header`, `text`, and `bytes` operations con
 The resulting `send` future owns method, URL, headers, and body snapshots. Native requests pass
 bounded owned input to WinHTTP; non-GET/HEAD methods and any request carrying custom headers or a
 body disable automatic redirects so credentials and non-idempotent bodies cannot be replayed.
+The native runtime keeps one process-wide WinHTTP session, allowing the operating system to pool
+connections while per-request timeout and redirect policy remains isolated. The interpreter uses
+a deterministic bounded pool of at most 32 origins and two idle connections per origin. Only
+fully framed HTTP/1.1 responses without `Connection: close` return a connection to either path.
 
 The interpreter independently parses HTTP/1.1 with bounded headers, content-length and chunked
 framing checks, strict ambiguity rejection, the same redirect/downgrade policy, and the same body
-limit. Native/interpreter differential tests exercise successful responses, redirects, chunked
+limit. Native/interpreter differential tests exercise successful responses, connection reuse,
+redirects, chunked
 bodies, invalid UTF-8, malformed framing, typed failures, laziness, and zero deadlines.
 
 ---

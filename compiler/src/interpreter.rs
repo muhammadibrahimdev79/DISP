@@ -826,10 +826,7 @@ fn http_origin(url: &Url) -> io::Result<String> {
     Ok(format!("{}://{}", url.scheme(), http_host_header(url)?))
 }
 
-fn http_stream_timeout(
-    stream: &InterpreterHttpStream,
-    timeout: StdDuration,
-) -> io::Result<()> {
+fn http_stream_timeout(stream: &InterpreterHttpStream, timeout: StdDuration) -> io::Result<()> {
     match stream {
         InterpreterHttpStream::Plain(socket) => {
             socket.set_read_timeout(Some(timeout))?;
@@ -842,11 +839,7 @@ fn http_stream_timeout(
     }
 }
 
-fn http_pool_return(
-    pool: &mut InterpreterHttpPool,
-    origin: String,
-    stream: InterpreterHttpStream,
-) {
+fn http_pool_return(pool: &mut InterpreterHttpPool, origin: String, stream: InterpreterHttpStream) {
     if pool.len() < 32 || pool.contains_key(&origin) {
         let streams = pool.entry(origin).or_default();
         if streams.len() < 2 {
@@ -989,8 +982,7 @@ fn read_http_response(
                     "HTTP response headers exceed the 64 KiB limit",
                 ));
             }
-            let (status, headers, consumed, http11) =
-                parse_http_headers(&wire[..header_end])?;
+            let (status, headers, consumed, http11) = parse_http_headers(&wire[..header_end])?;
             if consumed != header_end {
                 return Err(http_error(
                     io::ErrorKind::InvalidData,
@@ -1518,6 +1510,7 @@ pub struct Interpreter {
     output: Arc<StdMutex<Vec<String>>>,
     call_depth: usize,
     tasks: Vec<Weak<StdMutex<RuntimeTaskWork>>>,
+    http_pool: InterpreterHttpPool,
 }
 
 impl Interpreter {
@@ -1528,6 +1521,7 @@ impl Interpreter {
             output: Arc::new(StdMutex::new(Vec::new())),
             call_depth: 0,
             tasks: Vec::new(),
+            http_pool: HashMap::new(),
         }
     }
 
@@ -1563,6 +1557,7 @@ impl Interpreter {
             .clear();
         self.call_depth = 0;
         self.tasks.clear();
+        self.http_pool.clear();
         let main = program
             .functions
             .iter()
@@ -2009,9 +2004,9 @@ impl Interpreter {
                 };
                 Ok(runtime_result(result))
             }
-            FutureWork::HttpRequest(request, timeout) => {
-                Ok(runtime_result(interpreter_http_request(request, timeout)))
-            }
+            FutureWork::HttpRequest(request, timeout) => Ok(runtime_result(
+                interpreter_http_request(request, timeout, &mut self.http_pool),
+            )),
         }
     }
 
@@ -4128,12 +4123,18 @@ impl Interpreter {
                             _ => Err(self.error("unknown HttpResponse operation", expression.span)),
                         };
                     }
-                    if matches!(
-                        field.as_str(),
-                        "header" | "text" | "bytes" | "send" | "send_timeout"
-                    ) {
+                    let http_request_receiver = self
+                        .expression_place(object)
+                        .map(|place| matches!(self.read_place(&place), Some(Value::HttpRequest(_))))
+                        .unwrap_or(true);
+                    if http_request_receiver
+                        && matches!(
+                            field.as_str(),
+                            "header" | "text" | "bytes" | "send" | "send_timeout"
+                        )
+                    {
                         let value = self.consume(program, object)?;
-                        if let Value::HttpRequest(mut request) = value {
+                        if let Value::HttpRequest(mut request) = value.clone() {
                             return match field.as_str() {
                                 "header" => {
                                     let Value::String(name) =
@@ -4193,6 +4194,18 @@ impl Interpreter {
                                 }
                                 _ => unreachable!(),
                             };
+                        }
+                        if let Value::UdpDatagram(datagram) = value
+                            && field == "bytes"
+                        {
+                            return Ok(Value::List {
+                                capacity: datagram.bytes.len(),
+                                values: datagram
+                                    .bytes
+                                    .into_iter()
+                                    .map(|byte| Value::Unsigned(byte as u128, 8))
+                                    .collect(),
+                            });
                         }
                     }
                     if let Value::UdpSocket(socket) = self.evaluate(program, object)? {
@@ -5076,6 +5089,7 @@ impl Interpreter {
                     output,
                     call_depth: 0,
                     tasks: Vec::new(),
+                    http_pool: HashMap::new(),
                 };
                 child
                     .call_function(&child_program, &function, values, call_span)
