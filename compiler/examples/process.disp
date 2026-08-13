@@ -1,0 +1,25 @@
+fn run_tool() -> Result<bool, IoError> {
+    output = Process.run(
+        Path("C:/Windows/System32/where.exe"),
+        List.of("cmd.exe")
+    )?
+    print(output.status())
+    print(output.success())
+    print(match output.stdout_text() {
+        Ok(text) => true
+        Err(error) => false
+    })
+    return Ok(output.success())
+}
+
+fn main(args: List<String>) {
+    print(args.len())
+    print(match Environment.get("PATH") {
+        Some(value) => !value.is_empty()
+        None => false
+    })
+    match run_tool() {
+        Ok(value) => print(value)
+        Err(error) => print(error)
+    }
+}

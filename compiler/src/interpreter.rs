@@ -14,6 +14,7 @@ use std::{
         UdpSocket as StdUdpSocket,
     },
     path::PathBuf,
+    process::Command as StdCommand,
     sync::{
         Arc, Mutex as StdMutex, Weak,
         atomic::{AtomicBool, AtomicI64, Ordering},
@@ -2581,6 +2582,7 @@ enum Value {
     UdpDatagram(RuntimeUdpDatagram),
     Instant(StdInstant),
     Duration(StdDuration),
+    ProcessOutput(RuntimeProcessOutput),
     Thread(RuntimeThread),
     Future(RuntimeFuture),
     Task(RuntimeTask),
@@ -2621,6 +2623,13 @@ enum Value {
     },
     Unit,
     Uninitialized,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct RuntimeProcessOutput {
+    status: i64,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -2677,6 +2686,7 @@ pub struct Interpreter {
     call_depth: usize,
     tasks: Vec<Weak<StdMutex<RuntimeTaskWork>>>,
     http_pool: InterpreterHttpPool,
+    program_arguments: Vec<String>,
 }
 
 impl Interpreter {
@@ -2688,10 +2698,16 @@ impl Interpreter {
             call_depth: 0,
             tasks: Vec::new(),
             http_pool: HashMap::new(),
+            program_arguments: Vec::new(),
         }
     }
 
     pub fn run(&mut self, program: &Program) -> Result<Vec<String>, Diagnostic> {
+        self.program_arguments.clear();
+        self.run_configured(program)
+    }
+
+    fn run_configured(&mut self, program: &Program) -> Result<Vec<String>, Diagnostic> {
         thread::scope(|scope| {
             let worker = thread::Builder::new()
                 .name("disp-interpreter".into())
@@ -2714,6 +2730,15 @@ impl Interpreter {
         })
     }
 
+    pub fn run_with_args(
+        &mut self,
+        program: &Program,
+        arguments: &[String],
+    ) -> Result<Vec<String>, Diagnostic> {
+        self.program_arguments = arguments.to_vec();
+        self.run_configured(program)
+    }
+
     fn run_inner(&mut self, program: &Program) -> Result<Vec<String>, Diagnostic> {
         self.scopes.clear();
         self.scope_orders.clear();
@@ -2730,8 +2755,22 @@ impl Interpreter {
             .find(|function| function.name == "main")
             .ok_or_else(|| self.diagnostic("missing `main` function", Span::point(1, 1)))?
             .clone();
+        let arguments = if main.parameters.is_empty() {
+            Vec::new()
+        } else {
+            let values = self
+                .program_arguments
+                .iter()
+                .cloned()
+                .map(|value| Value::String(RuntimeString::literal(value)))
+                .collect::<Vec<_>>();
+            vec![Value::List {
+                capacity: values.len(),
+                values,
+            }]
+        };
         let result = self
-            .call_function(program, &main, Vec::new(), main.name_span)
+            .call_function(program, &main, arguments, main.name_span)
             .map_err(RuntimeFault::into_diagnostic)?;
         if let Value::Future(future) = result {
             self.await_future(program, future, main.name_span)
@@ -4600,9 +4639,113 @@ impl Interpreter {
                     && let Expression::Identifier(owner) = &object.node
                     && matches!(
                         owner.as_str(),
-                        "Path" | "File" | "Directory" | "Time" | "Duration"
+                        "Path"
+                            | "File"
+                            | "Directory"
+                            | "Time"
+                            | "Duration"
+                            | "Environment"
+                            | "Process"
                     )
                 {
+                    if owner == "Environment" {
+                        return match field.as_str() {
+                            "arguments" => {
+                                let values = self
+                                    .program_arguments
+                                    .iter()
+                                    .cloned()
+                                    .map(|value| Value::String(RuntimeString::literal(value)))
+                                    .collect::<Vec<_>>();
+                                Ok(Value::List {
+                                    capacity: values.len(),
+                                    values,
+                                })
+                            }
+                            "get" => {
+                                let Value::String(name) = self.evaluate(program, &arguments[0])?
+                                else {
+                                    unreachable!("type checking validates environment names")
+                                };
+                                if name.text.is_empty()
+                                    || name.text.contains('=')
+                                    || name.text.contains('\0')
+                                {
+                                    return Err(self.error(
+                                        "environment variable name cannot be empty or contain '=' or NUL",
+                                        arguments[0].span,
+                                    ));
+                                }
+                                let value = match std::env::var_os(&name.text) {
+                                    Some(value) => Some(value.into_string().map_err(|_| {
+                                        self.error(
+                                            "environment variable value is not valid UTF-8",
+                                            arguments[0].span,
+                                        )
+                                    })?),
+                                    None => None,
+                                };
+                                Ok(option_value(
+                                    value.map(|value| Value::String(RuntimeString::literal(value))),
+                                ))
+                            }
+                            _ => Err(self.error("unknown Environment operation", expression.span)),
+                        };
+                    }
+                    if owner == "Process" {
+                        let Value::Path(program_path) = self.evaluate(program, &arguments[0])?
+                        else {
+                            unreachable!("type checking validates process paths")
+                        };
+                        let Value::List { values, .. } = self.evaluate(program, &arguments[1])?
+                        else {
+                            unreachable!("type checking validates process arguments")
+                        };
+                        const MAX_ARGUMENTS: usize = 4096;
+                        const MAX_ARGUMENT_BYTES: usize = 1024 * 1024;
+                        if values.len() > MAX_ARGUMENTS {
+                            return Ok(runtime_result(Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "process argument count exceeds 4096",
+                            ))));
+                        }
+                        let mut command = StdCommand::new(program_path);
+                        let mut total = 0usize;
+                        for value in values {
+                            let Value::String(value) = value else {
+                                unreachable!("type checking validates process arguments")
+                            };
+                            if value.text.contains('\0') {
+                                return Ok(runtime_result(Err(io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "process argument cannot contain NUL",
+                                ))));
+                            }
+                            total = total.saturating_add(value.text.len());
+                            command.arg(value.text);
+                        }
+                        if total > MAX_ARGUMENT_BYTES {
+                            return Ok(runtime_result(Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "process arguments exceed 1 MiB",
+                            ))));
+                        }
+                        const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
+                        return Ok(runtime_result(command.output().and_then(|output| {
+                            if output.stdout.len() > MAX_CAPTURE_BYTES
+                                || output.stderr.len() > MAX_CAPTURE_BYTES
+                            {
+                                return Err(io::Error::other(
+                                    "process output exceeds the 16 MiB capture limit",
+                                ));
+                            }
+                            Ok(Value::ProcessOutput(RuntimeProcessOutput {
+                                status: output.status.code().map(i64::from).unwrap_or(-1),
+                                stdout: output.stdout,
+                                stderr: output.stderr,
+                            }))
+                        })));
+                    }
                     if owner == "Path" {
                         let value = self.evaluate(program, &arguments[0])?;
                         let path = runtime_path(value).ok_or_else(|| {
@@ -5735,6 +5878,40 @@ impl Interpreter {
                             _ => Err(self.error("unknown Path operation", expression.span)),
                         };
                     }
+                    if let Value::ProcessOutput(output) = self.evaluate(program, object)? {
+                        let bytes = |values: Vec<u8>| Value::List {
+                            capacity: values.len(),
+                            values: values
+                                .into_iter()
+                                .map(|value| Value::Unsigned(value as u128, 8))
+                                .collect(),
+                        };
+                        return match field.as_str() {
+                            "status" => Ok(Value::Int(output.status)),
+                            "success" => Ok(Value::Bool(output.status == 0)),
+                            "stdout" => Ok(bytes(output.stdout)),
+                            "stderr" => Ok(bytes(output.stderr)),
+                            "stdout_text" | "stderr_text" => {
+                                let raw = if field == "stdout_text" {
+                                    output.stdout
+                                } else {
+                                    output.stderr
+                                };
+                                Ok(runtime_result(
+                                    String::from_utf8(raw)
+                                        .map(|text| Value::String(RuntimeString::literal(text)))
+                                        .map_err(|_| {
+                                            json_conversion_error(
+                                                "process output is not valid UTF-8",
+                                            )
+                                        }),
+                                ))
+                            }
+                            _ => {
+                                Err(self.error("unknown ProcessOutput operation", expression.span))
+                            }
+                        };
+                    }
                     if let Value::Url(url) = self.evaluate(program, object)? {
                         return match field.as_str() {
                             "as_string" => {
@@ -6572,6 +6749,7 @@ impl Interpreter {
         }
         let child_program = program.clone();
         let output = Arc::clone(&self.output);
+        let program_arguments = self.program_arguments.clone();
         let call_span = task.span;
         let handle = thread::Builder::new()
             .name(format!("disp-{name}"))
@@ -6584,6 +6762,7 @@ impl Interpreter {
                     call_depth: 0,
                     tasks: Vec::new(),
                     http_pool: HashMap::new(),
+                    program_arguments,
                 };
                 child
                     .call_function(&child_program, &function, values, call_span)
@@ -7193,6 +7372,7 @@ fn value_type_name(value: &Value) -> &str {
         Value::UdpDatagram(_) => "UdpDatagram",
         Value::Instant(_) => "Instant",
         Value::Duration(_) => "Duration",
+        Value::ProcessOutput(_) => "ProcessOutput",
         Value::Thread(_) => "Thread",
         Value::Future(_) => "Future",
         Value::Task(_) => "Task",
@@ -7258,6 +7438,7 @@ fn value_is_copy(program: &Program, value: &Value) -> bool {
         | Value::MutexGuard(_)
         | Value::AtomicInt(_)
         | Value::Path(_)
+        | Value::ProcessOutput(_)
         | Value::Url(_)
         | Value::Json(_)
         | Value::SocketAddress(_)
@@ -7652,6 +7833,7 @@ fn display_value(value: Value) -> String {
         Value::UdpDatagram(value) => format!("<UdpDatagram:{} bytes>", value.bytes.len()),
         Value::Instant(_) => "<Instant>".into(),
         Value::Duration(value) => format!("{}ns", value.as_nanos()),
+        Value::ProcessOutput(value) => format!("<ProcessOutput:{}>", value.status),
         Value::Thread(_) => "<Thread>".into(),
         Value::Future(_) => "<Future>".into(),
         Value::Task(_) => "<Task>".into(),

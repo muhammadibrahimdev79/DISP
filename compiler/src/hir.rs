@@ -45,6 +45,7 @@ pub enum Type {
     UdpDatagram,
     Instant,
     Duration,
+    ProcessOutput,
     Array(Box<Type>, usize),
     Slice(Box<Type>),
     List(Box<Type>),
@@ -113,6 +114,7 @@ impl Type {
             | Self::Mutex(_)
             | Self::MutexGuard(_)
             | Self::AtomicInt
+            | Self::ProcessOutput
             | Self::Generic(_)
             | Self::Function(_, _)
             | Self::Unknown => false,
@@ -777,6 +779,7 @@ impl<'a> Lowering<'a> {
             "CFloat" => Type::Float { width: 32 },
             "CDouble" => Type::Float { width: 64 },
             "Path" => Type::Path,
+            "ProcessOutput" => Type::ProcessOutput,
             "Url" => Type::Url,
             "Json" => Type::Json,
             "IpAddress" => Type::IpAddress,
@@ -2138,7 +2141,7 @@ impl FunctionLowering<'_, '_> {
                 }
                 if matches!(
                     owner.as_str(),
-                    "Path" | "File" | "Directory" | "Time" | "Duration"
+                    "Path" | "File" | "Directory" | "Time" | "Duration" | "Environment" | "Process"
                 ) {
                     let args = arguments
                         .iter()
@@ -2176,6 +2179,11 @@ impl FunctionLowering<'_, '_> {
                         },
                         ("Time", "sleep") => Type::Unit,
                         ("Duration", _) => Type::Duration,
+                        ("Environment", "arguments") => Type::List(Box::new(Type::String)),
+                        ("Environment", "get") => Type::Option(Box::new(Type::String)),
+                        ("Process", "run") => {
+                            Type::Result(Box::new(Type::ProcessOutput), Box::new(io))
+                        }
                         _ => Type::Unknown,
                     };
                     return Ok(Expr {
@@ -2496,6 +2504,34 @@ impl FunctionLowering<'_, '_> {
                 return Ok(Expr {
                     kind: ExprKind::Call(Call {
                         target: CallTarget::Intrinsic(format!("Path.{field}")),
+                        arguments: args,
+                        receiver: Some(ReceiverMode::Shared),
+                        substitutions: vec![],
+                    }),
+                    ty,
+                    span,
+                });
+            }
+            if matches!(receiver.ty, Type::ProcessOutput) {
+                let args = vec![receiver];
+                let ty = match field.as_str() {
+                    "status" => Type::Int {
+                        signed: true,
+                        width: None,
+                    },
+                    "success" => Type::Bool,
+                    "stdout" | "stderr" => Type::List(Box::new(Type::Int {
+                        signed: false,
+                        width: Some(8),
+                    })),
+                    _ => Type::Result(
+                        Box::new(Type::String),
+                        Box::new(Type::Generic("ConversionError".into())),
+                    ),
+                };
+                return Ok(Expr {
+                    kind: ExprKind::Call(Call {
+                        target: CallTarget::Intrinsic(format!("ProcessOutput.{field}")),
                         arguments: args,
                         receiver: Some(ReceiverMode::Shared),
                         substitutions: vec![],
@@ -3929,6 +3965,7 @@ fn surface_type_is_copy(ty: &Type) -> bool {
         | Type::CString
         | Type::Memory
         | Type::Path
+        | Type::ProcessOutput
         | Type::Url
         | Type::Json
         | Type::IpAddress

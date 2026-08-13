@@ -78,6 +78,10 @@ pub fn check_path(path: &Path) -> Result<Program, Diagnostic> {
 }
 
 pub fn run_path(path: &Path) -> Result<Vec<String>, Diagnostic> {
+    run_path_with_args(path, &[])
+}
+
+pub fn run_path_with_args(path: &Path, arguments: &[String]) -> Result<Vec<String>, Diagnostic> {
     let project = project::load(path)?;
     let sources = project.sources;
     let program = validate_program(project.program).map_err(|error| sources.remap(error))?;
@@ -87,7 +91,7 @@ pub fn run_path(path: &Path) -> Result<Vec<String>, Diagnostic> {
         let _ = cfg::ControlFlowGraph::new(function);
     }
     Interpreter::new()
-        .run(&program)
+        .run_with_args(&program, arguments)
         .map_err(|error| sources.remap(error))
 }
 
@@ -101,8 +105,12 @@ pub fn lower_path(path: &Path) -> Result<(hir::Program, mir::Program), Diagnosti
 }
 
 pub fn run_source(source: &str) -> Result<Vec<String>, Diagnostic> {
+    run_source_with_args(source, &[])
+}
+
+pub fn run_source_with_args(source: &str, arguments: &[String]) -> Result<Vec<String>, Diagnostic> {
     let program = check_source(source)?;
-    Interpreter::new().run(&program)
+    Interpreter::new().run_with_args(&program, arguments)
 }
 
 pub fn lower_source(source: &str) -> Result<(hir::Program, mir::Program), Diagnostic> {

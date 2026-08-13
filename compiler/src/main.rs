@@ -1,4 +1,4 @@
-use disp::{backend, check_path, lower_path, run_path};
+use disp::{backend, check_path, lower_path, run_path_with_args};
 use std::{
     env,
     path::Path,
@@ -66,7 +66,12 @@ fn execute(arguments: Vec<String>) -> Result<(), String> {
         }
         return Ok(());
     }
-    let (command, path) = match arguments.as_slice() {
+    let separator = arguments.iter().position(|argument| argument == "--");
+    let (driver_arguments, program_arguments) = separator.map_or_else(
+        || (arguments.as_slice(), &[][..]),
+        |index| (&arguments[..index], &arguments[index + 1..]),
+    );
+    let (command, path) = match driver_arguments {
         [path] => (Command::Run, path.as_str()),
         [command, path] if command == "check" => (Command::Check, path.as_str()),
         [command, path] if command == "run" => (Command::Run, path.as_str()),
@@ -81,8 +86,14 @@ fn execute(arguments: Vec<String>) -> Result<(), String> {
         [command, flag, path] if command == "check" && flag == "--dump-mir" => {
             (Command::DumpMir, path.as_str())
         }
-        _ => return Err("usage: disp <new|lock|tree> <directory> | disp <check|build|run|interpret> [--dump-hir|--dump-mir|--release|--emit-c|--emit-obj] <file.disp|project-directory>".into()),
+        _ => return Err("usage: disp <new|lock|tree> <directory> | disp <check|build|run|interpret> [--dump-hir|--dump-mir|--release|--emit-c|--emit-obj] <file.disp|project-directory> [-- program-arguments...]".into()),
     };
+    if !program_arguments.is_empty() && !matches!(command, Command::Run | Command::Interpret) {
+        return Err(
+            "program arguments are only accepted by `disp run` and `disp interpret`".into(),
+        );
+    }
+    let program_arguments = program_arguments.to_vec();
     let source_path = Path::new(path);
 
     match command {
@@ -100,6 +111,7 @@ fn execute(arguments: Vec<String>) -> Result<(), String> {
             )
             .map_err(|diagnostic| diagnostic.render(path))?;
             let status = ProcessCommand::new(&artifacts.executable)
+                .args(&program_arguments)
                 .status()
                 .map_err(|error| {
                     format!(
@@ -119,7 +131,8 @@ fn execute(arguments: Vec<String>) -> Result<(), String> {
                 .name("disp-interpreter".into())
                 .stack_size(16 * 1024 * 1024)
                 .spawn(move || {
-                    run_path(&path).map_err(|diagnostic| diagnostic.render(&display_path))
+                    run_path_with_args(&path, &program_arguments)
+                        .map_err(|diagnostic| diagnostic.render(&display_path))
                 })
                 .map_err(|error| format!("error: could not start the interpreter: {error}"))?
                 .join()

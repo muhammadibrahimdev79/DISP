@@ -42,12 +42,15 @@ pub fn compile_and_link(
     ];
     if !cfg!(windows) {
         link.push("-pthread".into());
-    } else if networking {
-        link.push("-lws2_32".into());
-        link.push("-lsecur32".into());
-        link.push("-lcrypt32".into());
-        if http {
-            link.push("-lwinhttp".into());
+    } else {
+        link.push("-lshell32".into());
+        if networking {
+            link.push("-lws2_32".into());
+            link.push("-lsecur32".into());
+            link.push("-lcrypt32".into());
+            if http {
+                link.push("-lwinhttp".into());
+            }
         }
     }
     for library in libraries {

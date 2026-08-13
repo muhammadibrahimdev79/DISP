@@ -13,7 +13,9 @@ The current compiler includes static typing, ownership and borrowing, native
 code generation, first-class functions and ownership-safe closures, algebraic
 data types, generics and traits, strings, slices,
 lists, maps, sets, iteration, paths, filesystem operations, and time
-foundations, native concurrency, checked C interoperability, explicit system-memory
+foundations, UTF-8 command-line arguments, explicit environment reads, injection-safe direct
+process execution with bounded stdout/stderr capture, native concurrency, checked C
+interoperability, explicit system-memory
 control, deterministic multi-file modules, content-locked local package dependencies,
 and lazy owned `Future<T>` values compiled to resumable native `async fn` state machines.
 `await` is available inside async functions, `Async.yield()` provides cooperative suspension,
@@ -69,6 +71,12 @@ Run a DISP example through native compilation:
 
 ```sh
 cargo run -- run examples/easy_disp.disp
+```
+
+Pass arguments after `--`; `fn main(args: List<String>)` receives only the program arguments:
+
+```sh
+cargo run -- run examples/process.disp -- first "second argument"
 ```
 
 Run the same program through the interpreter:

@@ -22,6 +22,7 @@ pub const C_RUNTIME: &str = r#"
 #include <schannel.h>
 #endif
 #include <windows.h>
+#include <shellapi.h>
 #ifdef DISP_HTTP
 #include <winhttp.h>
 #endif
@@ -37,10 +38,12 @@ pub const C_RUNTIME: &str = r#"
 #include <pthread.h>
 #include <sched.h>
 #include <unistd.h>
+#include <sys/wait.h>
 #endif
 
 static void dv_panic(const char *message,int line,int column);
 static disp_native_string disp_owned_bytes(const char *bytes,size_t len);
+static bool disp_utf8_valid(const char *value,size_t length);
 static void disp_time_sleep(uint64_t nanos);
 static uint64_t disp_time_now_nanos(void);
 static void disp_async_file_drain(void);
@@ -138,6 +141,54 @@ static uintptr_t disp_thread_start(disp_thread_entry entry,void *context,int lin
 static void disp_thread_wait(disp_native_thread *thread){if(!thread->handle)return;pthread_t native;memcpy(&native,&thread->handle,sizeof(native));thread->handle=0;if(pthread_join(native,NULL)!=0)dv_panic("could not join native thread",0,0);}
 static void disp_thread_detach(uintptr_t handle){pthread_t native;memcpy(&native,&handle,sizeof(native));if(pthread_detach(native)!=0)dv_panic("could not detach native thread",0,0);}
 #endif
+
+#define DISP_PROCESS_MAX_ARGUMENTS 4096u
+#define DISP_PROCESS_MAX_ARGUMENT_BYTES (1024u*1024u)
+#define DISP_PROCESS_MAX_CAPTURE (16u*1024u*1024u)
+static int disp_program_argc;
+static char **disp_program_argv;
+typedef struct {
+#ifdef _WIN32
+    HANDLE source;
+#else
+    int source;
+#endif
+    uint8_t *data;
+    size_t len;
+    size_t cap;
+    bool failed;
+    bool overflow;
+} disp_process_capture;
+static void disp_process_capture_entry(void *raw){disp_process_capture *capture=(disp_process_capture*)raw;uint8_t chunk[8192];for(;;){size_t count=0;
+#ifdef _WIN32
+DWORD read=0;if(!ReadFile(capture->source,chunk,sizeof(chunk),&read,NULL)){if(GetLastError()!=ERROR_BROKEN_PIPE)capture->failed=true;break;}count=(size_t)read;
+#else
+ssize_t read_count=read(capture->source,chunk,sizeof(chunk));if(read_count<0){if(errno==EINTR)continue;capture->failed=true;break;}count=(size_t)read_count;
+#endif
+if(!count)break;if(capture->len>DISP_PROCESS_MAX_CAPTURE-count){capture->overflow=true;continue;}size_t needed=capture->len+count;if(needed>capture->cap){size_t cap=capture->cap?capture->cap:8192;while(cap<needed)cap*=2;if(cap>DISP_PROCESS_MAX_CAPTURE)cap=DISP_PROCESS_MAX_CAPTURE;capture->data=(uint8_t*)disp_realloc(capture->data,cap,1);capture->cap=cap;}memcpy(capture->data+capture->len,chunk,count);capture->len=needed;}}
+static disp_native_string disp_process_error_text(const char *message){return disp_owned_bytes(message,strlen(message));}
+#ifdef _WIN32
+static bool disp_process_append(char **buffer,size_t *len,size_t *cap,const char *bytes,size_t count){if(*len>SIZE_MAX-count-1)return false;size_t needed=*len+count+1;if(needed>*cap){size_t next=*cap?*cap:64;while(next<needed){if(next>SIZE_MAX/2)return false;next*=2;}*buffer=(char*)disp_realloc(*buffer,next,1);*cap=next;}memcpy(*buffer+*len,bytes,count);*len+=count;(*buffer)[*len]=0;return true;}
+static bool disp_process_quote(char **buffer,size_t *len,size_t *cap,const char *text){if(!disp_process_append(buffer,len,cap,"\"",1))return false;size_t slashes=0;for(const char *p=text;;p++){char ch=*p;if(ch=='\\'){slashes++;continue;}if(ch=='\"'||ch==0){for(size_t i=0;i<slashes*(ch?2:2);i++)if(!disp_process_append(buffer,len,cap,"\\",1))return false;if(ch&& !disp_process_append(buffer,len,cap,"\\\"",2))return false;slashes=0;if(!ch)break;}else{for(size_t i=0;i<slashes;i++)if(!disp_process_append(buffer,len,cap,"\\",1))return false;slashes=0;if(!disp_process_append(buffer,len,cap,&ch,1))return false;}}return disp_process_append(buffer,len,cap,"\"",1);}
+static wchar_t *disp_process_wide(const char *text,size_t length){if(length>INT_MAX)return NULL;int count=MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,text,(int)length,NULL,0);if(count<=0)return NULL;wchar_t *wide=(wchar_t*)disp_alloc(((size_t)count+1)*sizeof(wchar_t),_Alignof(wchar_t));if(MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,text,(int)length,wide,count)!=count){disp_dealloc(wide);return NULL;}wide[count]=0;return wide;}
+static disp_native_string disp_process_utf8(const wchar_t *text,size_t length){if(length>INT_MAX)return (disp_native_string){0};if(!length){disp_native_string empty={.data=(char*)disp_alloc(1,1),.cap=1};empty.data[0]=0;return empty;}int count=WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,text,(int)length,NULL,0,NULL,NULL);if(count<=0)return (disp_native_string){0};disp_native_string result={0};result.data=(char*)disp_alloc((size_t)count+1,1);if(WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,text,(int)length,result.data,count,NULL,NULL)!=count){disp_dealloc(result.data);return (disp_native_string){0};}result.data[count]=0;result.len=result.cap=(size_t)count;return result;}
+static void disp_program_arguments_init(int argc,char **argv){(void)argc;(void)argv;int count=0;LPWSTR *wide=CommandLineToArgvW(GetCommandLineW(),&count);if(!wide){disp_program_argc=0;disp_program_argv=NULL;return;}disp_program_argc=count>0?count-1:0;disp_program_argv=(char**)disp_alloc_zeroed((size_t)disp_program_argc,sizeof(char*),_Alignof(char*));for(int i=0;i<disp_program_argc;i++){size_t length=wcslen(wide[i+1]);disp_native_string value=disp_process_utf8(wide[i+1],length);if(!value.data)dv_panic("program argument is not valid Unicode",0,0);disp_program_argv[i]=value.data;value.data[value.len]=0;}LocalFree(wide);}
+static void disp_program_arguments_drop(void){for(int i=0;i<disp_program_argc;i++)disp_dealloc(disp_program_argv[i]);disp_dealloc(disp_program_argv);disp_program_argc=0;disp_program_argv=NULL;}
+static bool disp_environment_get(const disp_native_string *name,disp_native_string *value,bool *found){wchar_t *wide=disp_process_wide(name->data,name->len);if(!wide)return false;SetLastError(ERROR_SUCCESS);DWORD needed=GetEnvironmentVariableW(wide,NULL,0);if(!needed){DWORD code=GetLastError();disp_dealloc(wide);*found=code!=ERROR_ENVVAR_NOT_FOUND;*value=(disp_native_string){0};return true;}wchar_t *buffer=(wchar_t*)disp_alloc((size_t)needed*sizeof(wchar_t),_Alignof(wchar_t));DWORD length=GetEnvironmentVariableW(wide,buffer,needed);disp_dealloc(wide);if(!length||length>=needed){disp_dealloc(buffer);return false;}*value=disp_process_utf8(buffer,length);disp_dealloc(buffer);*found=true;return value->data!=NULL||length==0;}
+#endif
+#ifndef _WIN32
+static void disp_program_arguments_init(int argc,char **argv){disp_program_argc=argc>0?argc-1:0;disp_program_argv=argc>0?argv+1:argv;}
+static void disp_program_arguments_drop(void){disp_program_argc=0;disp_program_argv=NULL;}
+static bool disp_environment_get(const disp_native_string *name,disp_native_string *value,bool *found){char *key=(char*)disp_alloc(name->len+1,1);memcpy(key,name->data,name->len);key[name->len]=0;const char *raw=getenv(key);disp_dealloc(key);*found=raw!=NULL;if(raw&&!disp_utf8_valid(raw,strlen(raw)))return false;*value=raw?disp_owned_bytes(raw,strlen(raw)):(disp_native_string){0};return true;}
+#endif
+static bool disp_process_run(const disp_native_path *program,const disp_native_string *args,size_t args_len,disp_native_process_output *output,disp_native_string *error){*output=(disp_native_process_output){0};*error=(disp_native_string){0};if(!program->data||!program->len){*error=disp_process_error_text("process program path cannot be empty");return false;}if(memchr(program->data,0,program->len)){*error=disp_process_error_text("process program path cannot contain NUL");return false;}if(args_len>DISP_PROCESS_MAX_ARGUMENTS){*error=disp_process_error_text("process argument count exceeds 4096");return false;}size_t argument_bytes=0;for(size_t i=0;i<args_len;i++){if(memchr(args[i].data,0,args[i].len)||argument_bytes>DISP_PROCESS_MAX_ARGUMENT_BYTES-args[i].len){*error=disp_process_error_text("process arguments exceed limits or contain NUL");return false;}argument_bytes+=args[i].len;}
+#ifdef _WIN32
+char *application=(char*)disp_alloc(program->len+1,1);memcpy(application,program->data,program->len);application[program->len]=0;char *command=NULL;size_t command_len=0,command_cap=0;if(!disp_process_quote(&command,&command_len,&command_cap,application))goto windows_fail;for(size_t i=0;i<args_len;i++){char *arg=(char*)disp_alloc(args[i].len+1,1);memcpy(arg,args[i].data,args[i].len);arg[args[i].len]=0;if(!disp_process_append(&command,&command_len,&command_cap," ",1)||!disp_process_quote(&command,&command_len,&command_cap,arg)){disp_dealloc(arg);goto windows_fail;}disp_dealloc(arg);}wchar_t *wide_application=disp_process_wide(application,program->len),*wide_command=disp_process_wide(command,command_len);if(!wide_application||!wide_command){disp_dealloc(wide_application);disp_dealloc(wide_command);goto windows_fail;}SECURITY_ATTRIBUTES security={sizeof(security),NULL,TRUE};HANDLE out_read=NULL,out_write=NULL,err_read=NULL,err_write=NULL,nul_input=NULL;if(!CreatePipe(&out_read,&out_write,&security,0)||!CreatePipe(&err_read,&err_write,&security,0))goto windows_handles_fail;SetHandleInformation(out_read,HANDLE_FLAG_INHERIT,0);SetHandleInformation(err_read,HANDLE_FLAG_INHERIT,0);nul_input=CreateFileW(L"NUL",GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,&security,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);if(nul_input==INVALID_HANDLE_VALUE){nul_input=NULL;goto windows_handles_fail;}STARTUPINFOEXW startup={0};startup.StartupInfo.cb=sizeof(startup);startup.StartupInfo.dwFlags=STARTF_USESTDHANDLES;startup.StartupInfo.hStdInput=nul_input;startup.StartupInfo.hStdOutput=out_write;startup.StartupInfo.hStdError=err_write;SIZE_T attr_size=0;InitializeProcThreadAttributeList(NULL,1,0,&attr_size);startup.lpAttributeList=(LPPROC_THREAD_ATTRIBUTE_LIST)disp_alloc(attr_size,_Alignof(void*));if(!InitializeProcThreadAttributeList(startup.lpAttributeList,1,0,&attr_size))goto windows_attr_fail;HANDLE inherited[3]={nul_input,out_write,err_write};if(!UpdateProcThreadAttribute(startup.lpAttributeList,0,PROC_THREAD_ATTRIBUTE_HANDLE_LIST,inherited,sizeof(inherited),NULL,NULL))goto windows_attr_list_fail;PROCESS_INFORMATION child={0};if(!CreateProcessW(wide_application,wide_command,NULL,NULL,TRUE,EXTENDED_STARTUPINFO_PRESENT,NULL,NULL,&startup.StartupInfo,&child))goto windows_attr_list_fail;CloseHandle(out_write);out_write=NULL;CloseHandle(err_write);err_write=NULL;CloseHandle(nul_input);nul_input=NULL;DeleteProcThreadAttributeList(startup.lpAttributeList);disp_dealloc(startup.lpAttributeList);disp_dealloc(application);disp_dealloc(command);disp_dealloc(wide_application);disp_dealloc(wide_command);disp_process_capture out={.source=out_read},err={.source=err_read};disp_native_thread out_thread={.handle=disp_thread_start(disp_process_capture_entry,&out,0,0)},err_thread={.handle=disp_thread_start(disp_process_capture_entry,&err,0,0)};DWORD wait_status=WaitForSingleObject(child.hProcess,INFINITE),exit_code=0;if(wait_status==WAIT_OBJECT_0)GetExitCodeProcess(child.hProcess,&exit_code);else exit_code=(DWORD)-1;CloseHandle(child.hThread);CloseHandle(child.hProcess);disp_thread_wait(&out_thread);disp_thread_wait(&err_thread);CloseHandle(out_read);CloseHandle(err_read);if(out.failed||err.failed||out.overflow||err.overflow){disp_dealloc(out.data);disp_dealloc(err.data);*error=disp_process_error_text(out.overflow||err.overflow?"process output exceeds the 16 MiB capture limit":"could not capture process output");return false;}output->status=(int64_t)(int32_t)exit_code;output->stdout_data=out.data;output->stdout_len=out.len;output->stderr_data=err.data;output->stderr_len=err.len;return true;
+windows_attr_list_fail:DeleteProcThreadAttributeList(startup.lpAttributeList);windows_attr_fail:disp_dealloc(startup.lpAttributeList);windows_handles_fail:if(out_read)CloseHandle(out_read);if(out_write)CloseHandle(out_write);if(err_read)CloseHandle(err_read);if(err_write)CloseHandle(err_write);if(nul_input)CloseHandle(nul_input);disp_dealloc(wide_application);disp_dealloc(wide_command);windows_fail:disp_dealloc(application);disp_dealloc(command);*error=disp_process_error_text("could not start child process");return false;
+#else
+int out_pipe[2],err_pipe[2];if(pipe(out_pipe)!=0){*error=disp_process_error_text(strerror(errno));return false;}if(pipe(err_pipe)!=0){close(out_pipe[0]);close(out_pipe[1]);*error=disp_process_error_text(strerror(errno));return false;}char *application=(char*)disp_alloc(program->len+1,1);memcpy(application,program->data,program->len);application[program->len]=0;char **argv=(char**)disp_alloc_zeroed(args_len+2,sizeof(char*),_Alignof(char*));argv[0]=application;for(size_t i=0;i<args_len;i++){argv[i+1]=(char*)disp_alloc(args[i].len+1,1);memcpy(argv[i+1],args[i].data,args[i].len);}pid_t pid=fork();if(pid==0){dup2(out_pipe[1],STDOUT_FILENO);dup2(err_pipe[1],STDERR_FILENO);close(out_pipe[0]);close(out_pipe[1]);close(err_pipe[0]);close(err_pipe[1]);execv(application,argv);_exit(127);}close(out_pipe[1]);close(err_pipe[1]);if(pid<0){close(out_pipe[0]);close(err_pipe[0]);for(size_t i=0;i<args_len;i++)disp_dealloc(argv[i+1]);disp_dealloc(argv);disp_dealloc(application);*error=disp_process_error_text(strerror(errno));return false;}disp_process_capture out={.source=out_pipe[0]},err={.source=err_pipe[0]};disp_native_thread out_thread={.handle=disp_thread_start(disp_process_capture_entry,&out,0,0)},err_thread={.handle=disp_thread_start(disp_process_capture_entry,&err,0,0)};int status=0;pid_t waited;do{waited=waitpid(pid,&status,0);}while(waited<0&&errno==EINTR);disp_thread_wait(&out_thread);disp_thread_wait(&err_thread);close(out_pipe[0]);close(err_pipe[0]);for(size_t i=0;i<args_len;i++)disp_dealloc(argv[i+1]);disp_dealloc(argv);disp_dealloc(application);if(waited<0||out.failed||err.failed||out.overflow||err.overflow){disp_dealloc(out.data);disp_dealloc(err.data);*error=disp_process_error_text(out.overflow||err.overflow?"process output exceeds the 16 MiB capture limit":(waited<0?strerror(errno):"could not capture process output"));return false;}output->status=WIFEXITED(status)?WEXITSTATUS(status):(WIFSIGNALED(status)?128+WTERMSIG(status):-1);output->stdout_data=out.data;output->stdout_len=out.len;output->stderr_data=err.data;output->stderr_len=err.len;return true;
+#endif
+}
 
 static void disp_string_drop(disp_native_string *value){if(value->cap)disp_dealloc(value->data);value->data=NULL;value->len=0;value->cap=0;}
 static disp_native_string disp_string_with_capacity(size_t capacity){disp_native_string value={0};if(capacity){value.data=(char*)disp_alloc(capacity,1);value.cap=capacity;}return value;}

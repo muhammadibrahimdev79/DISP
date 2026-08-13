@@ -35,6 +35,7 @@ pub enum Type {
     UdpDatagram,
     Instant,
     Duration,
+    ProcessOutput,
     Array(Box<Type>, usize),
     Slice(Box<Type>),
     List(Box<Type>),
@@ -482,10 +483,16 @@ impl TypeChecker {
                     Span::point(1, 1),
                 )
             })?;
-        if !main.parameters.is_empty() || main.return_type.is_some() {
+        let main_parameters_valid = main.parameters.is_empty()
+            || (main.parameters.len() == 1
+                && matches!(
+                    self.functions["main"].parameters.as_slice(),
+                    [Type::List(element)] if matches!(**element, Type::String)
+                ));
+        if !main_parameters_valid || main.return_type.is_some() {
             return Err(Diagnostic::new(
                 DiagnosticKind::Type,
-                "`main` must have signature `fn main()` in the current runtime profile",
+                "`main` must have signature `fn main()` or `fn main(args: List<String>)`",
                 main.name_span,
             ));
         }
@@ -2195,7 +2202,13 @@ impl TypeChecker {
                     && let Expression::Identifier(owner) = &object.node
                     && matches!(
                         owner.as_str(),
-                        "File" | "Directory" | "Time" | "Duration" | "Path"
+                        "File"
+                            | "Directory"
+                            | "Time"
+                            | "Duration"
+                            | "Path"
+                            | "Environment"
+                            | "Process"
                     )
                 {
                     let io_error = Type::IoError;
@@ -2307,6 +2320,36 @@ impl TypeChecker {
                                 ));
                             }
                             return Ok(Type::Duration);
+                        }
+                        ("Environment", "arguments") if arguments.is_empty() => {
+                            return Ok(Type::List(Box::new(Type::String)));
+                        }
+                        ("Environment", "get") if arguments.len() == 1 => {
+                            let actual = self.check_expression(&arguments[0])?;
+                            if !matches!(actual, Type::String | Type::Str) {
+                                return Err(Diagnostic::new(
+                                    DiagnosticKind::Type,
+                                    "environment variable name must be String or str",
+                                    arguments[0].span,
+                                ));
+                            }
+                            return Ok(Type::Option(Box::new(Type::String)));
+                        }
+                        ("Process", "run") if arguments.len() == 2 => {
+                            self.require_path(&arguments[0])?;
+                            let actual = self.check_expression(&arguments[1])?;
+                            if !matches!(actual, Type::List(ref element) if matches!(**element, Type::String))
+                            {
+                                return Err(Diagnostic::new(
+                                    DiagnosticKind::Type,
+                                    "process arguments must be List<String>",
+                                    arguments[1].span,
+                                ));
+                            }
+                            return Ok(Type::Result(
+                                Box::new(Type::ProcessOutput),
+                                Box::new(Type::IoError),
+                            ));
                         }
                         _ => {
                             return Err(Diagnostic::new(
@@ -3046,6 +3089,22 @@ impl TypeChecker {
                             }
                             "parent" if arguments.is_empty() => {
                                 return Ok(Type::Option(Box::new(Type::Path)));
+                            }
+                            _ => {}
+                        }
+                    }
+                    if matches!(receiver, Type::ProcessOutput) {
+                        match field.as_str() {
+                            "status" if arguments.is_empty() => return Ok(Type::Int),
+                            "success" if arguments.is_empty() => return Ok(Type::Bool),
+                            "stdout" | "stderr" if arguments.is_empty() => {
+                                return Ok(Type::List(Box::new(Type::Unsigned(8))));
+                            }
+                            "stdout_text" | "stderr_text" if arguments.is_empty() => {
+                                return Ok(Type::Result(
+                                    Box::new(Type::String),
+                                    Box::new(Type::ConversionError),
+                                ));
                             }
                             _ => {}
                         }
@@ -4349,6 +4408,7 @@ impl TypeChecker {
             "CFloat" if ty.arguments.is_empty() => Type::Float32,
             "CDouble" if ty.arguments.is_empty() => Type::Float,
             "Path" if ty.arguments.is_empty() => Type::Path,
+            "ProcessOutput" if ty.arguments.is_empty() => Type::ProcessOutput,
             "Url" if ty.arguments.is_empty() => Type::Url,
             "Json" if ty.arguments.is_empty() => Type::Json,
             "IpAddress" if ty.arguments.is_empty() => Type::IpAddress,
@@ -4810,6 +4870,7 @@ impl TypeChecker {
             Type::CStr => "CStr".into(),
             Type::Memory => "Memory".into(),
             Type::Path => "Path".into(),
+            Type::ProcessOutput => "ProcessOutput".into(),
             Type::Url => "Url".into(),
             Type::Json => "Json".into(),
             Type::IpAddress => "IpAddress".into(),

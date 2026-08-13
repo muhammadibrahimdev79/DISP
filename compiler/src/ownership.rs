@@ -1412,7 +1412,7 @@ impl<'a> Analyzer<'a> {
             if let Expression::Identifier(owner) = &object.node
                 && matches!(
                     owner.as_str(),
-                    "Path" | "File" | "Directory" | "Time" | "Duration"
+                    "Path" | "File" | "Directory" | "Time" | "Duration" | "Environment" | "Process"
                 )
             {
                 for argument in arguments {
@@ -1443,6 +1443,12 @@ impl<'a> Analyzer<'a> {
                     ("Time", "unix_seconds") => Ty::Copy,
                     ("Time", "sleep") => Ty::Unit,
                     ("Duration", _) => Ty::Duration,
+                    ("Environment", "arguments") => Ty::List(Box::new(Ty::Owned("String".into()))),
+                    ("Environment", "get") => Ty::Option(Box::new(Ty::Owned("String".into()))),
+                    ("Process", "run") => Ty::Result(
+                        Box::new(Ty::Owned("ProcessOutput".into())),
+                        Box::new(Ty::Owned("IoError".into())),
+                    ),
                     _ => Ty::Unit,
                 });
             }
@@ -1582,6 +1588,17 @@ impl<'a> Analyzer<'a> {
                     "name" | "extension" => Ty::Option(Box::new(Ty::Owned("String".into()))),
                     "parent" => Ty::Option(Box::new(Ty::Path)),
                     _ => Ty::Copy,
+                });
+            }
+            if matches!(self.expr_ty(object), Ok(Ty::Owned(ref name)) if name == "ProcessOutput") {
+                self.check_expr(object, UseMode::Read)?;
+                return Ok(match field.as_str() {
+                    "status" | "success" => Ty::Copy,
+                    "stdout" | "stderr" => Ty::List(Box::new(Ty::Copy)),
+                    _ => Ty::Result(
+                        Box::new(Ty::Owned("String".into())),
+                        Box::new(Ty::Owned("ConversionError".into())),
+                    ),
                 });
             }
             if matches!(self.expr_ty(object), Ok(Ty::Url)) {

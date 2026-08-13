@@ -63,19 +63,36 @@ pub fn generate(
         function(program, instance, &mut output)?;
     }
     let entry_function = &program.functions[instances.entry.function.0];
+    let entry_arguments = if entry_function.argument_count == 1 {
+        let argument_ty = substitute(
+            &entry_function.locals[1].ty,
+            &mono::mapping(entry_function, &instances.entry),
+        );
+        let argument_c = native_types::c_type(&argument_ty);
+        format!(
+            "{argument_c} args=({argument_c}){{0}};if(disp_program_argc>0){{args.data=(disp_native_string*)disp_alloc_zeroed((size_t)disp_program_argc,sizeof(disp_native_string),_Alignof(disp_native_string));args.len=args.cap=(size_t)disp_program_argc;for(size_t i=0;i<args.len;i++){{size_t n=strlen(disp_program_argv[i]);if(!disp_utf8_valid(disp_program_argv[i],n))dv_panic(\"program argument is not valid UTF-8\",0,0);args.data[i]=disp_owned_bytes(disp_program_argv[i],n);}}}}"
+        )
+    } else {
+        String::new()
+    };
+    let call_arguments = if entry_function.argument_count == 1 {
+        "args"
+    } else {
+        ""
+    };
     if entry_function.asynchronous {
         let substitutions = mono::mapping(entry_function, &instances.entry);
         let result = c_local_type(entry_function, entry_function.return_local, &substitutions);
         writeln!(
             output,
-            "int main(void){{disp_native_future future={}();{result} result=({result}){{0}};disp_future_wait(&future,&result,0,0);(void)result;return 0;}}",
+            "int main(int argc,char **argv){{disp_program_arguments_init(argc,argv);{entry_arguments}disp_native_future future={}({call_arguments});{result} result=({result}){{0}};disp_future_wait(&future,&result,0,0);(void)result;disp_program_arguments_drop();return 0;}}",
             mono::mangle(program, &instances.entry)
         )
         .unwrap();
     } else {
         writeln!(
             output,
-            "int main(void){{{} result={}();(void)result;return 0;}}",
+            "int main(int argc,char **argv){{disp_program_arguments_init(argc,argv);{entry_arguments}{} result={}({call_arguments});(void)result;disp_program_arguments_drop();return 0;}}",
             native_types::c_type(&hir::Type::Unit),
             mono::mangle(program, &instances.entry)
         )
@@ -1032,6 +1049,7 @@ pub fn supported(program: &mir::Program, ty: &hir::Type) -> bool {
         | hir::Type::UdpDatagram
         | hir::Type::Instant
         | hir::Type::Duration
+        | hir::Type::ProcessOutput
         | hir::Type::Int { .. }
         | hir::Type::Float { .. } => true,
         hir::Type::AtomicInt => true,
@@ -2911,6 +2929,70 @@ fn terminator(
                         }
                     }
                 }
+                hir::CallTarget::Intrinsic(name) if name.starts_with("Environment.") => {
+                    match name.as_str() {
+                        "Environment.arguments" => {
+                            let list_c = native_types::c_type(&destination_ty);
+                            format!(
+                                "({{{list_c} _r={{0}};if(disp_program_argc>0){{_r.data=(disp_native_string*)disp_alloc_zeroed((size_t)disp_program_argc,sizeof(disp_native_string),_Alignof(disp_native_string));_r.len=_r.cap=(size_t)disp_program_argc;for(size_t _i=0;_i<_r.len;_i++)_r.data[_i]=disp_owned_bytes(disp_program_argv[_i],strlen(disp_program_argv[_i]));}}_r;}})"
+                            )
+                        }
+                        "Environment.get" => {
+                            let (name, _) =
+                                system_argument(program, function, &arguments[0], substitutions);
+                            let option_c = native_types::c_type(&destination_ty);
+                            format!(
+                                "({{{option_c} _r={{0}};disp_native_string *_name={name};if(!_name->len||memchr(_name->data,0,_name->len)||memchr(_name->data,'=',_name->len))dv_panic(\"environment variable name cannot be empty or contain '=' or NUL\",{},{});disp_native_string _value={{0}};bool _found=false;if(!disp_environment_get(_name,&_value,&_found))dv_panic(\"environment variable value is not valid UTF-8\",{},{});if(_found){{_r.tag=1;_r.payload.v1.f0=_value;}}_r;}})",
+                                span.start.line,
+                                span.start.column,
+                                span.start.line,
+                                span.start.column
+                            )
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                hir::CallTarget::Intrinsic(name) if name == "Process.run" => {
+                    let (path, _) =
+                        system_argument(program, function, &arguments[0], substitutions);
+                    let (args, _) =
+                        system_argument(program, function, &arguments[1], substitutions);
+                    let result_c = native_types::c_type(&destination_ty);
+                    format!(
+                        "({{{result_c} _r={{0}};disp_native_process_output _output={{0}};disp_native_string _error={{0}};if(disp_process_run({path},({args})->data,({args})->len,&_output,&_error)){{_r.tag=0;_r.payload.v0.f0=_output;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                    )
+                }
+                hir::CallTarget::Intrinsic(name) if name.starts_with("ProcessOutput.") => {
+                    let (output, _) =
+                        system_argument(program, function, &arguments[0], substitutions);
+                    match name.as_str() {
+                        "ProcessOutput.status" => format!("({output})->status"),
+                        "ProcessOutput.success" => format!("(({output})->status==0)"),
+                        "ProcessOutput.stdout" | "ProcessOutput.stderr" => {
+                            let list_c = native_types::c_type(&destination_ty);
+                            let field = if name.ends_with("stdout") {
+                                "stdout"
+                            } else {
+                                "stderr"
+                            };
+                            format!(
+                                "({{{list_c} _r={{0}};size_t _len=({output})->{field}_len;if(_len){{_r.data=(uint8_t*)disp_alloc(_len,1);memcpy(_r.data,({output})->{field}_data,_len);_r.len=_r.cap=_len;}}_r;}})"
+                            )
+                        }
+                        "ProcessOutput.stdout_text" | "ProcessOutput.stderr_text" => {
+                            let result_c = native_types::c_type(&destination_ty);
+                            let field = if name.contains("stdout") {
+                                "stdout"
+                            } else {
+                                "stderr"
+                            };
+                            format!(
+                                "({{{result_c} _r={{0}};const char *_data=(const char*)({output})->{field}_data;size_t _len=({output})->{field}_len;if(disp_utf8_valid(_data,_len)){{_r.tag=0;_r.payload.v0.f0=disp_owned_bytes(_data,_len);}}else{{_r.tag=1;_r.payload.v1.f0=disp_owned_bytes(\"process output is not valid UTF-8\",strlen(\"process output is not valid UTF-8\"));}}_r;}})"
+                            )
+                        }
+                        _ => unreachable!(),
+                    }
+                }
                 hir::CallTarget::Intrinsic(name) if name.starts_with("Directory.") => {
                     let (path, _) =
                         system_argument(program, function, &arguments[0], substitutions);
@@ -4227,6 +4309,7 @@ fn to_dv(value: &str, ty: &hir::Type) -> String {
         hir::Type::Instant | hir::Type::Duration => {
             format!("dv_u((unsigned __int128)({value}).nanos,64)")
         }
+        hir::Type::ProcessOutput => "dv_string(\"<ProcessOutput>\",15)".into(),
         hir::Type::Str => format!("dv_string(({value}).data,({value}).len)"),
         hir::Type::Int {
             signed: true,
@@ -4459,6 +4542,10 @@ fn drop_value_depth(program: &mir::Program, value: &str, ty: &hir::Type, depth: 
         hir::Type::Path => format!("disp_path_drop(&({value}));"),
         hir::Type::Url => format!("disp_url_drop(&({value}));"),
         hir::Type::Json => format!("disp_json_drop(&({value}));"),
+        hir::Type::Generic(_) => format!("disp_string_drop(&({value}));"),
+        hir::Type::ProcessOutput => format!(
+            "{{disp_dealloc(({value}).stdout_data);disp_dealloc(({value}).stderr_data);({value})=(disp_native_process_output){{0}};}}"
+        ),
         hir::Type::SocketAddress => format!("disp_socket_address_drop(&({value}));"),
         hir::Type::TcpStream => format!("disp_tcp_stream_drop(&({value}));"),
         hir::Type::TlsStream => format!("disp_tls_stream_drop(&({value}));"),

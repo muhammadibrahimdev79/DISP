@@ -60,6 +60,44 @@ fn run_and_check_commands_use_the_full_pipeline() {
 }
 
 #[test]
+fn run_and_interpret_forward_arguments_after_separator() {
+    let source = source_file(
+        "arguments.disp",
+        "fn main(args: List<String>) { print(args.len()) print(match args.get(0) { Some(value) => (*value).contains(\"hello world\"), None => false }) }",
+    );
+    let path = source.to_str().unwrap();
+    let Some(interpreted) = disp(&["interpret", path, "--", "hello world", "second"]) else {
+        return;
+    };
+    assert!(interpreted.status.success());
+    assert_eq!(
+        String::from_utf8(interpreted.stdout)
+            .unwrap()
+            .replace("\r\n", "\n"),
+        "2\ntrue\n"
+    );
+
+    let Some(native) = disp(&["run", path, "--", "hello world", "second"]) else {
+        return;
+    };
+    if !native.status.success() && String::from_utf8_lossy(&native.stderr).contains("os error 4551")
+    {
+        return;
+    }
+    assert!(
+        native.status.success(),
+        "{}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(native.stdout)
+            .unwrap()
+            .replace("\r\n", "\n"),
+        "2\ntrue\n"
+    );
+}
+
+#[test]
 fn compile_fail_reports_stage_and_location() {
     let source = source_file("invalid.disp", "fn main() { print(missing) }");
     let Some(output) = disp(&["check", source.to_str().unwrap()]) else {
