@@ -2745,9 +2745,29 @@ const SQLITE_NULL: i32 = 5;
 const DATABASE_SQL_LIMIT: usize = 1024 * 1024;
 const DATABASE_ROW_LIMIT: usize = 100_000;
 
+#[derive(Clone, PartialEq, Eq)]
+struct NativeDataField {
+    name: String,
+    storage: &'static str,
+    optional: bool,
+    primary: bool,
+}
+
+struct NativeDataTable {
+    fields: Vec<NativeDataField>,
+    primary: usize,
+    rows: Vec<Value>,
+}
+
+#[derive(Default)]
+struct NativeDataStore {
+    tables: HashMap<String, NativeDataTable>,
+}
+
 struct RuntimeDatabaseState {
     handle: *mut Sqlite3,
     closed: bool,
+    native: Option<NativeDataStore>,
 }
 
 // SQLite is opened in FULLMUTEX mode, and every access is additionally serialized
@@ -2846,7 +2866,41 @@ impl RuntimeDatabase {
         Ok(Self(Arc::new(StdMutex::new(RuntimeDatabaseState {
             handle,
             closed: false,
+            native: None,
         }))))
+    }
+
+    fn native_memory() -> io::Result<Self> {
+        Ok(Self(Arc::new(StdMutex::new(RuntimeDatabaseState {
+            handle: std::ptr::null_mut(),
+            closed: false,
+            native: Some(NativeDataStore::default()),
+        }))))
+    }
+
+    fn with_native<T>(
+        &self,
+        operation: impl FnOnce(&mut NativeDataStore) -> io::Result<T>,
+    ) -> io::Result<Option<T>> {
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("data store state is poisoned"))?;
+        if state.closed {
+            return Err(io::Error::other("data store is closed"));
+        }
+        state.native.as_mut().map(operation).transpose()
+    }
+
+    fn is_native(&self) -> io::Result<bool> {
+        let state = self
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("data store state is poisoned"))?;
+        if state.closed {
+            return Err(io::Error::other("data store is closed"));
+        }
+        Ok(state.native.is_some())
     }
 
     fn with_state<T>(
@@ -3163,7 +3217,16 @@ impl RuntimeDatabase {
             .0
             .lock()
             .map_err(|_| io::Error::other("database state is poisoned"))?;
-        if state.closed || state.handle.is_null() {
+        if state.closed {
+            return Ok(());
+        }
+        if let Some(native) = state.native.as_mut() {
+            native.tables.clear();
+            state.closed = true;
+            return Ok(());
+        }
+        if state.handle.is_null() {
+            state.closed = true;
             return Ok(());
         }
         // SAFETY: state owns a live connection. SQLite returns zero inside a transaction.
@@ -3192,6 +3255,11 @@ impl RuntimeDatabase {
 
 impl Drop for RuntimeDatabaseState {
     fn drop(&mut self) {
+        if self.native.is_some() {
+            self.native = None;
+            self.closed = true;
+            return;
+        }
         if self.closed || self.handle.is_null() {
             return;
         }
@@ -3291,6 +3359,45 @@ fn data_ensure_schema(
     database: &RuntimeDatabase,
     schema: &crate::ast::StructDeclaration,
 ) -> io::Result<()> {
+    let fields = schema
+        .fields
+        .iter()
+        .map(|field| NativeDataField {
+            name: field.name.clone(),
+            storage: data_sql_type(&field.ty),
+            optional: data_inner_type(&field.ty).1,
+            primary: field.primary,
+        })
+        .collect::<Vec<_>>();
+    if database
+        .with_native(|store| {
+            if let Some(table) = store.tables.get(&schema.name) {
+                if table.fields != fields {
+                    return Err(io::Error::other(format!(
+                        "stored `{}` layout does not match its DISP Data schema",
+                        schema.name
+                    )));
+                }
+                return Ok(());
+            }
+            let primary = fields
+                .iter()
+                .position(|field| field.primary)
+                .expect("validated data schema has one primary field");
+            store.tables.insert(
+                schema.name.clone(),
+                NativeDataTable {
+                    fields,
+                    primary,
+                    rows: Vec::new(),
+                },
+            );
+            Ok(())
+        })?
+        .is_some()
+    {
+        return Ok(());
+    }
     database.execute(&data_create_sql(schema), &[])?;
     let pragma = format!("PRAGMA table_info({})", data_identifier(&schema.name));
     let columns = database.query(&pragma, &[])?;
@@ -3326,6 +3433,73 @@ fn data_ensure_schema(
         }
     }
     Ok(())
+}
+
+fn native_data_write(
+    database: &RuntimeDatabase,
+    schema: &crate::ast::StructDeclaration,
+    value: Value,
+    replace: bool,
+) -> io::Result<Option<u64>> {
+    database.with_native(|store| {
+        let table = store
+            .tables
+            .get_mut(&schema.name)
+            .ok_or_else(|| io::Error::other("DISP Data schema was not registered"))?;
+        let Value::Struct { fields, .. } = &value else {
+            return Err(io::Error::other("DISP Data write requires a schema value"));
+        };
+        let primary_name = &table.fields[table.primary].name;
+        let key = fields
+            .get(primary_name)
+            .ok_or_else(|| io::Error::other("data value is missing its primary field"))?;
+        let existing = table.rows.iter().position(|row| {
+            matches!(row, Value::Struct { fields, .. } if fields.get(primary_name) == Some(key))
+        });
+        if let Some(index) = existing {
+            if !replace {
+                return Err(io::Error::other(format!(
+                    "duplicate primary value for `{}`",
+                    schema.name
+                )));
+            }
+            table.rows[index] = value;
+            return Ok(1);
+        }
+        if table.rows.len() >= DATABASE_ROW_LIMIT {
+            return Err(io::Error::other("data table exceeds the 100000-row limit"));
+        }
+        table.rows.push(value);
+        Ok(1)
+    })
+}
+
+fn native_data_rows(
+    database: &RuntimeDatabase,
+    schema: &crate::ast::StructDeclaration,
+) -> io::Result<Option<Vec<Value>>> {
+    database.with_native(|store| {
+        store
+            .tables
+            .get(&schema.name)
+            .map(|table| table.rows.clone())
+            .ok_or_else(|| io::Error::other("DISP Data schema was not registered"))
+    })
+}
+
+fn native_data_replace_rows(
+    database: &RuntimeDatabase,
+    schema: &crate::ast::StructDeclaration,
+    rows: Vec<Value>,
+) -> io::Result<Option<()>> {
+    database.with_native(|store| {
+        let table = store
+            .tables
+            .get_mut(&schema.name)
+            .ok_or_else(|| io::Error::other("DISP Data schema was not registered"))?;
+        table.rows = rows;
+        Ok(())
+    })
 }
 
 fn normalize_data_value(ty: &TypeName, value: &RuntimeJson) -> io::Result<RuntimeJson> {
@@ -5001,6 +5175,144 @@ impl Interpreter {
         }
     }
 
+    fn evaluate_data_expression(
+        &mut self,
+        program: &Program,
+        schema: &crate::ast::StructDeclaration,
+        row: &HashMap<String, Value>,
+        parameters: &HashMap<Span, Value>,
+        expression: &Expr,
+    ) -> RuntimeResult<Value> {
+        match &expression.node {
+            Expression::Identifier(name)
+                if schema.fields.iter().any(|field| field.name == *name)
+                    && self.expression_place(expression).is_none() =>
+            {
+                row.get(name).cloned().ok_or_else(|| {
+                    self.error("stored row is missing a DISP Data field", expression.span)
+                })
+            }
+            Expression::Unary { operator, operand } => {
+                let value =
+                    self.evaluate_data_expression(program, schema, row, parameters, operand)?;
+                match (operator, value) {
+                    (UnaryOperator::Negate, Value::Int(value)) => {
+                        value.checked_neg().map(Value::Int).ok_or_else(|| {
+                            self.error("integer overflow in DISP Data negation", expression.span)
+                        })
+                    }
+                    (UnaryOperator::Negate, Value::Signed(value, width)) => value
+                        .checked_neg()
+                        .filter(|value| {
+                            width == 128
+                                || (-(1_i128 << (width - 1))..=(1_i128 << (width - 1)) - 1)
+                                    .contains(value)
+                        })
+                        .map(|value| Value::Signed(value, width))
+                        .ok_or_else(|| {
+                            self.error("integer overflow in DISP Data negation", expression.span)
+                        }),
+                    (UnaryOperator::Negate, Value::Float(value)) => Ok(Value::Float(-value)),
+                    (UnaryOperator::Negate, Value::Float32(value)) => Ok(Value::Float32(-value)),
+                    (UnaryOperator::Not, Value::Bool(value)) => Ok(Value::Bool(!value)),
+                    _ => Err(self.error("invalid DISP Data unary operand", expression.span)),
+                }
+            }
+            Expression::Binary {
+                left,
+                operator: BinaryOperator::And,
+                right,
+            } => match self.evaluate_data_expression(program, schema, row, parameters, left)? {
+                Value::Bool(false) => Ok(Value::Bool(false)),
+                Value::Bool(true) => {
+                    match self.evaluate_data_expression(program, schema, row, parameters, right)? {
+                        Value::Bool(value) => Ok(Value::Bool(value)),
+                        _ => Err(self.error("right DISP Data operand is not bool", right.span)),
+                    }
+                }
+                _ => Err(self.error("left DISP Data operand is not bool", left.span)),
+            },
+            Expression::Binary {
+                left,
+                operator: BinaryOperator::Or,
+                right,
+            } => match self.evaluate_data_expression(program, schema, row, parameters, left)? {
+                Value::Bool(true) => Ok(Value::Bool(true)),
+                Value::Bool(false) => {
+                    match self.evaluate_data_expression(program, schema, row, parameters, right)? {
+                        Value::Bool(value) => Ok(Value::Bool(value)),
+                        _ => Err(self.error("right DISP Data operand is not bool", right.span)),
+                    }
+                }
+                _ => Err(self.error("left DISP Data operand is not bool", left.span)),
+            },
+            Expression::Binary {
+                left,
+                operator,
+                right,
+            } => {
+                let left = self.evaluate_data_expression(program, schema, row, parameters, left)?;
+                let right_span = right.span;
+                let right =
+                    self.evaluate_data_expression(program, schema, row, parameters, right)?;
+                let (left, right) = coerce_numeric_pair(left, right)
+                    .map_err(|message| self.error(message, right_span))?;
+                self.evaluate_binary(*operator, left, right, expression.span)
+            }
+            Expression::Integer(_)
+            | Expression::Float(_)
+            | Expression::String(_)
+            | Expression::Character(_)
+            | Expression::Bool(_) => self.evaluate(program, expression),
+            Expression::Identifier(_) => {
+                parameters.get(&expression.span).cloned().ok_or_else(|| {
+                    self.error("DISP Data parameter was not evaluated", expression.span)
+                })
+            }
+            _ => Err(self.error(
+                "unsupported expression reached a native DISP Data plan",
+                expression.span,
+            )),
+        }
+    }
+
+    fn capture_data_parameters(
+        &mut self,
+        program: &Program,
+        schema: &crate::ast::StructDeclaration,
+        expression: &Expr,
+        output: &mut HashMap<Span, Value>,
+    ) -> RuntimeResult<()> {
+        match &expression.node {
+            Expression::Identifier(name)
+                if schema.fields.iter().any(|field| field.name == *name)
+                    && self.expression_place(expression).is_none() =>
+            {
+                Ok(())
+            }
+            Expression::Identifier(_) => {
+                output.insert(expression.span, self.evaluate(program, expression)?);
+                Ok(())
+            }
+            Expression::Unary { operand, .. } => {
+                self.capture_data_parameters(program, schema, operand, output)
+            }
+            Expression::Binary { left, right, .. } => {
+                self.capture_data_parameters(program, schema, left, output)?;
+                self.capture_data_parameters(program, schema, right, output)
+            }
+            Expression::Integer(_)
+            | Expression::Float(_)
+            | Expression::String(_)
+            | Expression::Character(_)
+            | Expression::Bool(_) => Ok(()),
+            _ => Err(self.error(
+                "unsupported expression reached a native DISP Data plan",
+                expression.span,
+            )),
+        }
+    }
+
     fn evaluate_data_write(
         &mut self,
         program: &Program,
@@ -5013,7 +5325,7 @@ impl Interpreter {
             unreachable!("type checking validates the DISP Data store")
         };
         let value = self.evaluate(program, value)?;
-        let Value::Struct { type_name, fields } = &value else {
+        let Value::Struct { type_name, .. } = &value else {
             unreachable!("type checking validates the DISP Data value")
         };
         let schema = program
@@ -5021,8 +5333,22 @@ impl Interpreter {
             .iter()
             .find(|schema| schema.name == *type_name && schema.data)
             .expect("type checking validates the DISP Data schema");
+        if let Err(error) = data_ensure_schema(&database, schema) {
+            return Ok(runtime_result(Err(error)));
+        }
+        if database
+            .is_native()
+            .map_err(|error| self.error(error.to_string(), store.span))?
+        {
+            let result = native_data_write(&database, schema, value, replace).and_then(|result| {
+                result.ok_or_else(|| io::Error::other("native DISP Data provider disappeared"))
+            });
+            return Ok(runtime_result(result.map(Value::UInt)));
+        }
+        let Value::Struct { fields, .. } = &value else {
+            unreachable!()
+        };
         let result = (|| {
-            data_ensure_schema(&database, schema)?;
             let names = data_select_sql(schema);
             let placeholders = std::iter::repeat_n("?", schema.fields.len())
                 .collect::<Vec<_>>()
@@ -5089,6 +5415,124 @@ impl Interpreter {
             .iter()
             .find(|schema| schema.name == schema_name && schema.data)
             .expect("type checking validates the DISP Data schema");
+        let limit = limit
+            .map(|value| self.evaluate(program, value))
+            .transpose()?;
+        if let Err(error) = data_ensure_schema(&database, schema) {
+            return Ok(runtime_result(Err(error)));
+        }
+        if database
+            .is_native()
+            .map_err(|error| self.error(error.to_string(), store.span))?
+        {
+            let mut parameters = HashMap::new();
+            if let Some(predicate) = predicate {
+                self.capture_data_parameters(program, schema, predicate, &mut parameters)?;
+            }
+            if let Some(order) = order {
+                self.capture_data_parameters(program, schema, &order.key, &mut parameters)?;
+            }
+            let mut values = match native_data_rows(&database, schema) {
+                Ok(Some(rows)) => rows,
+                Ok(None) => {
+                    return Ok(runtime_result(Err(io::Error::other(
+                        "native DISP Data provider disappeared",
+                    ))));
+                }
+                Err(error) => return Ok(runtime_result(Err(error))),
+            };
+            if let Some(predicate) = predicate {
+                let mut retained = Vec::with_capacity(values.len());
+                for value in values {
+                    let Value::Struct { fields, .. } = &value else {
+                        return Ok(runtime_result(Err(io::Error::other(
+                            "stored row does not match its DISP Data schema",
+                        ))));
+                    };
+                    match self.evaluate_data_expression(
+                        program,
+                        schema,
+                        fields,
+                        &parameters,
+                        predicate,
+                    )? {
+                        Value::Bool(true) => retained.push(value),
+                        Value::Bool(false) => {}
+                        _ => unreachable!("type checking validates DISP Data predicates"),
+                    }
+                }
+                values = retained;
+            }
+            if let Some(order) = order {
+                for index in 1..values.len() {
+                    let mut at = index;
+                    while at > 0 {
+                        let Value::Struct {
+                            fields: left_fields,
+                            ..
+                        } = &values[at]
+                        else {
+                            unreachable!("native data tables contain schema values")
+                        };
+                        let Value::Struct {
+                            fields: right_fields,
+                            ..
+                        } = &values[at - 1]
+                        else {
+                            unreachable!("native data tables contain schema values")
+                        };
+                        let left = self.evaluate_data_expression(
+                            program,
+                            schema,
+                            left_fields,
+                            &parameters,
+                            &order.key,
+                        )?;
+                        let right = self.evaluate_data_expression(
+                            program,
+                            schema,
+                            right_fields,
+                            &parameters,
+                            &order.key,
+                        )?;
+                        let operator = if order.descending {
+                            BinaryOperator::Greater
+                        } else {
+                            BinaryOperator::Less
+                        };
+                        let ordered =
+                            self.evaluate_binary(operator, left, right, order.key.span)?;
+                        if ordered != Value::Bool(true) {
+                            break;
+                        }
+                        values.swap(at, at - 1);
+                        at -= 1;
+                    }
+                }
+            }
+            let amount = match limit {
+                Some(Value::Int(value)) if value >= 0 => value as u64,
+                Some(Value::UInt(value)) => value,
+                Some(_) => {
+                    return Ok(runtime_result(Err(io::Error::other(
+                        "DISP Data limit is outside uint range",
+                    ))));
+                }
+                None => DATABASE_ROW_LIMIT as u64,
+            };
+            if amount > DATABASE_ROW_LIMIT as u64 {
+                return Ok(runtime_result(Err(io::Error::other(
+                    "DISP Data limit exceeds 100000 rows",
+                ))));
+            }
+            values.truncate(amount as usize);
+            let capacity = values.len();
+            return Ok(Value::Enum {
+                type_name: "Result".into(),
+                variant: "Ok".into(),
+                payload: vec![Value::List { values, capacity }],
+            });
+        }
         let mut parameters = Vec::new();
         let predicate = predicate
             .map(|value| self.data_expression_sql(program, schema, value, &mut parameters))
@@ -5099,11 +5543,7 @@ impl Interpreter {
                     .map(|key| (key, value.descending))
             })
             .transpose()?;
-        let limit = limit
-            .map(|value| self.evaluate(program, value))
-            .transpose()?;
         let result = (|| {
-            data_ensure_schema(&database, schema)?;
             let mut sql = format!(
                 "SELECT {} FROM {}",
                 data_select_sql(schema),
@@ -5155,15 +5595,55 @@ impl Interpreter {
             .find(|schema| schema.name == schema_name && schema.data)
             .expect("type checking validates the DISP Data schema");
         let mut parameters = Vec::new();
+        if let Err(error) = data_ensure_schema(&database, schema) {
+            return Ok(runtime_result(Err(error)));
+        }
+        if database
+            .is_native()
+            .map_err(|error| self.error(error.to_string(), store.span))?
+        {
+            let mut captured = HashMap::new();
+            self.capture_data_parameters(program, schema, predicate, &mut captured)?;
+            let rows = match native_data_rows(&database, schema) {
+                Ok(Some(rows)) => rows,
+                Ok(None) => {
+                    return Ok(runtime_result(Err(io::Error::other(
+                        "native DISP Data provider disappeared",
+                    ))));
+                }
+                Err(error) => return Ok(runtime_result(Err(error))),
+            };
+            let mut retained = Vec::with_capacity(rows.len());
+            let mut removed = 0_u64;
+            for row in rows {
+                let Value::Struct { fields, .. } = &row else {
+                    return Ok(runtime_result(Err(io::Error::other(
+                        "stored row does not match its DISP Data schema",
+                    ))));
+                };
+                match self
+                    .evaluate_data_expression(program, schema, fields, &captured, predicate)?
+                {
+                    Value::Bool(true) => removed += 1,
+                    Value::Bool(false) => retained.push(row),
+                    _ => unreachable!("type checking validates DISP Data predicates"),
+                }
+            }
+            let result = native_data_replace_rows(&database, schema, retained)
+                .and_then(|result| {
+                    result.ok_or_else(|| io::Error::other("native DISP Data provider disappeared"))
+                })
+                .map(|()| Value::UInt(removed));
+            return Ok(runtime_result(result));
+        }
         let predicate = self.data_expression_sql(program, schema, predicate, &mut parameters)?;
-        let result = (|| {
-            data_ensure_schema(&database, schema)?;
+        let result = {
             let sql = format!(
                 "DELETE FROM {} WHERE {predicate}",
                 data_identifier(&schema.name)
             );
             database.execute(&sql, &parameters).map(Value::UInt)
-        })();
+        };
         Ok(runtime_result(result))
     }
 
@@ -5196,7 +5676,7 @@ impl Interpreter {
                     });
                     path.and_then(RuntimeDatabase::open)
                 } else {
-                    RuntimeDatabase::open(":memory:")
+                    RuntimeDatabase::native_memory()
                 };
                 Ok(runtime_result(result.map(Value::Database)))
             }
@@ -6219,6 +6699,7 @@ impl Interpreter {
                             | "Environment"
                             | "Process"
                             | "Database"
+                            | "DataStore"
                     )
                 {
                     if owner == "Environment" {

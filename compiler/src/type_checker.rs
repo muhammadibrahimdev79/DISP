@@ -39,6 +39,7 @@ pub enum Type {
     ChildProcess,
     ProcessOutput,
     Database,
+    DataStore,
     Array(Box<Type>, usize),
     Slice(Box<Type>),
     List(Box<Type>),
@@ -1165,7 +1166,7 @@ impl TypeChecker {
                     ));
                 }
                 let store_ty = self.check_expression(store)?;
-                self.require_same(&Type::Database, &store_ty, store.span, "DISP Data store")?;
+                self.require_same(&Type::DataStore, &store_ty, store.span, "DISP Data store")?;
                 Ok(Type::Result(
                     Box::new(Type::UInt),
                     Box::new(Type::DataError),
@@ -1183,7 +1184,7 @@ impl TypeChecker {
                     }
                 }
                 Ok(Type::Result(
-                    Box::new(Type::Database),
+                    Box::new(Type::DataStore),
                     Box::new(Type::DataError),
                 ))
             }
@@ -1197,7 +1198,7 @@ impl TypeChecker {
             } => {
                 let id = self.require_data_schema(schema, *schema_span)?;
                 let store_ty = self.check_expression(store)?;
-                self.require_same(&Type::Database, &store_ty, store.span, "DISP Data store")?;
+                self.require_same(&Type::DataStore, &store_ty, store.span, "DISP Data store")?;
                 let previous = self.data_context.replace(id);
                 let checked = (|| {
                     if let Some(predicate) = predicate {
@@ -1241,7 +1242,7 @@ impl TypeChecker {
             } => {
                 let id = self.require_data_schema(schema, *schema_span)?;
                 let store_ty = self.check_expression(store)?;
-                self.require_same(&Type::Database, &store_ty, store.span, "DISP Data store")?;
+                self.require_same(&Type::DataStore, &store_ty, store.span, "DISP Data store")?;
                 let previous = self.data_context.replace(id);
                 let predicate_ty = self.check_expression(predicate);
                 self.data_context = previous;
@@ -4824,6 +4825,7 @@ impl TypeChecker {
             "ProcessCommand" if ty.arguments.is_empty() => Type::ProcessCommand,
             "ChildProcess" if ty.arguments.is_empty() => Type::ChildProcess,
             "Database" if ty.arguments.is_empty() => Type::Database,
+            "DataStore" if ty.arguments.is_empty() => Type::DataStore,
             "Url" if ty.arguments.is_empty() => Type::Url,
             "Json" if ty.arguments.is_empty() => Type::Json,
             "IpAddress" if ty.arguments.is_empty() => Type::IpAddress,
@@ -5347,6 +5349,7 @@ impl TypeChecker {
             Type::ProcessCommand => "ProcessCommand".into(),
             Type::ChildProcess => "ChildProcess".into(),
             Type::Database => "Database".into(),
+            Type::DataStore => "DataStore".into(),
             Type::Url => "Url".into(),
             Type::Json => "Json".into(),
             Type::IpAddress => "IpAddress".into(),

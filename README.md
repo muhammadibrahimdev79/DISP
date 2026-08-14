@@ -53,9 +53,11 @@ semantics. An owned SQLite `Database` foundation provides prepared parameter bin
 JSON-object query rows, explicit transactions, typed failures, and deterministic rollback/close
 in both native execution and the interpreter. First-class nominal `data` schemas and
 compiler-owned `data add`, `data save`, `data find`, and guarded `data remove` expressions now
-lower through typed logical Data plans in HIR/MIR. Native programs execute those plans through
-the current SQLite provider with generated prepared operations; SQL is not exposed as the DISP
-Data language, and the provider remains replaceable by PostgreSQL or a future DISP-native engine.
+lower through typed logical Data plans in HIR/MIR. `data memory` uses DISP's own typed row store
+and evaluates those plans directly in both native binaries and the interpreter; it does not
+translate them to SQL. `DataStore` is nominally separate from the compatibility `Database` type,
+so raw SQL methods cannot leak into DISP Data code. Durable `data open` currently retains the
+SQLite physical provider while the DISP-native page and recovery format is being built.
 The implementation
 remains under active development and should not
 yet be treated as a stable production language.

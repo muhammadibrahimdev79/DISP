@@ -185,7 +185,7 @@ impl<'a> LayoutEngine<'a> {
                 u64::from(self.target.pointer_width) / 8,
                 self.target.pointer_alignment,
             ),
-            hir::Type::Database => scalar(
+            hir::Type::Database | hir::Type::DataStore => scalar(
                 u64::from(self.target.pointer_width) / 8,
                 self.target.pointer_alignment,
             ),

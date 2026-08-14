@@ -411,13 +411,17 @@ MIR carries a `DataPlanId` rather than embedded SQL. External values are evaluat
 and bound as parameters. `remove` requires `where`, preventing an accidental unbounded
 delete in ordinary syntax. Limits are restricted to 100,000 rows.
 
-`data memory` creates an ephemeral store and `data open Path(...)` creates or opens a
-durable store. The current physical provider beneath both operations is the owned
-`Database` connection above. Native code
-generates prepared provider operations only after the DISP plan is checked. The
-interpreter executes the same semantics as a differential oracle. The public Data
-syntax and logical plans are provider-independent so future PostgreSQL and DISP-native
-engines do not require application queries to be rewritten.
+`data memory` creates an ephemeral `DataStore`. It uses DISP's own native typed row
+catalog and executes checked plans directly, including filtering, ordering, limits,
+primary-key insertion/upsert, and guarded removal. External values are evaluated once.
+`DataStore` and `Database` are distinct nominal types, so a data store cannot invoke raw
+SQL methods.
+
+`data open Path(...)` creates or opens a durable `DataStore`. Its physical provider is
+currently SQLite, hidden behind the same checked plan boundary, while the DISP-native
+page, journal, and recovery format is developed. This distinction is internal: source
+syntax and the HIR/MIR Data plan do not change with the provider. The interpreter
+executes matching semantics as a differential oracle.
 
 ## Collection loops
 

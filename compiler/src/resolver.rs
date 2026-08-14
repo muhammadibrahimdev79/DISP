@@ -529,6 +529,7 @@ impl Resolver {
                         | "Environment"
                         | "Process"
                         | "Database"
+                        | "DataStore"
                         | "Async"
                 ) {
                     return Ok(());
@@ -573,7 +574,7 @@ impl Resolver {
                 field,
                 field_span,
             } => {
-                if matches!(&object.node, Expression::Identifier(name) if matches!(name.as_str(), "String" | "List" | "Map" | "Set" | "Mutex" | "AtomicInt" | "Path" | "Url" | "Json" | "IpAddress" | "Dns" | "SocketAddress" | "Tls" | "Http" | "TcpListener" | "UdpSocket" | "File" | "Directory" | "Time" | "Duration" | "Environment" | "Process" | "Database" | "Async"))
+                if matches!(&object.node, Expression::Identifier(name) if matches!(name.as_str(), "String" | "List" | "Map" | "Set" | "Mutex" | "AtomicInt" | "Path" | "Url" | "Json" | "IpAddress" | "Dns" | "SocketAddress" | "Tls" | "Http" | "TcpListener" | "UdpSocket" | "File" | "Directory" | "Time" | "Duration" | "Environment" | "Process" | "Database" | "DataStore" | "Async"))
                 {
                     return Ok(());
                 }
@@ -866,8 +867,8 @@ impl Resolver {
             | "TcpStream" | "TlsStream" | "TcpListener" | "UdpSocket" | "UdpDatagram"
             | "Instant" | "Duration" | "IoError" | "NetworkError" | "HttpError" | "DataError"
             | "HttpRequest" | "Url" | "Json" | "HttpResponse" | "ProcessCommand"
-            | "ChildProcess" | "Database" | "ProcessOutput" | "char" | "bool" | "Unit"
-            | "ConversionError" => Some(0),
+            | "ChildProcess" | "Database" | "DataStore" | "ProcessOutput" | "char" | "bool"
+            | "Unit" | "ConversionError" => Some(0),
             name if self
                 .generic_types
                 .last()

@@ -93,6 +93,41 @@ fn main() {
 }
 
 #[test]
+fn native_data_store_enforces_keys_and_typed_plans() {
+    let source = r#"
+data Record {
+    id: int primary
+    score: int
+    active: bool
+    note: Option<String>
+}
+
+fn verify() -> Result<bool, DataError> {
+    var store = data memory?
+    data add Record { id: 1, score: 2, active: true, note: None } in store?
+    data add Record { id: 2, score: 5, active: true, note: Some("ready") } in store?
+    duplicate = data add Record { id: 1, score: 99, active: false, note: None } in store
+    duplicate_rejected = match duplicate { Err(_) => true, Ok(_) => false }
+    var wanted: Option<String> = None
+    bonus = 1
+    rows = data find Record in store
+        where note == wanted && active && score + bonus >= 3
+        order score descending
+        limit 1?
+    return Ok(duplicate_rejected && rows.len() == 1)
+}
+
+fn main() {
+    print(match verify() { Ok(value) => value, Err(_) => false })
+}
+"#;
+    assert_eq!(run_source(source).unwrap(), ["true"]);
+    if let Some(output) = native_output("native-typed-plans", source) {
+        assert_eq!(output, "true\n");
+    }
+}
+
+#[test]
 fn invalid_data_schemas_have_source_diagnostics() {
     let missing = check_source("data User { id: int } fn main() {}").unwrap_err();
     assert!(missing.message.contains("primary"), "{missing}");
@@ -110,19 +145,19 @@ fn invalid_data_schemas_have_source_diagnostics() {
     );
 
     let unknown_field = check_source(
-        "data User { id: int primary } fn main(){ var db=Database.memory()?; values=data find User in db where missing == 1? }",
+        "data User { id: int primary } fn main(){ var store=data memory?; values=data find User in store where missing == 1? }",
     )
     .unwrap_err();
     assert!(unknown_field.message.contains("unknown name `missing`"));
 
     let unsafe_delete = check_source(
-        "data User { id: int primary } fn main(){ var db=Database.memory()?; data remove User in db }",
+        "data User { id: int primary } fn main(){ var store=data memory?; data remove User in store }",
     )
     .unwrap_err();
     assert!(unsafe_delete.message.contains("requires `where`"));
 
     let non_boolean = check_source(
-        "data User { id: int primary } fn run()->Result<List<User>,DataError>{ var db=Database.memory()?; return data find User in db where id + 1 } fn main(){}",
+        "data User { id: int primary } fn run()->Result<List<User>,DataError>{ var store=data memory?; return data find User in store where id + 1 } fn main(){}",
     )
     .unwrap_err();
     assert!(non_boolean.message.contains("condition"), "{non_boolean}");
@@ -133,8 +168,23 @@ fn invalid_data_schemas_have_source_diagnostics() {
     .unwrap_err();
     assert!(wrong_store.message.contains("Data store"), "{wrong_store}");
 
+    let sql_database = check_source(
+        "data User { id: int primary } fn run()->Result<List<User>,DataError>{ var db=Database.memory()?; return data find User in db } fn main(){}",
+    )
+    .unwrap_err();
+    assert!(
+        sql_database.message.contains("expected DataStore"),
+        "{sql_database}"
+    );
+
+    let raw_sql = check_source(
+        "fn run()->Result<uint,DataError>{ var store=data memory?; var args: List<Json> = List.new(); return store.execute(\"select 1\", args) } fn main(){}",
+    )
+    .unwrap_err();
+    assert!(raw_sql.message.contains("DataStore"), "{raw_sql}");
+
     let immutable_store = check_source(
-        "data User { id: int primary } fn run()->Result<List<User>,DataError>{ let db=Database.memory()?; return data find User in db } fn main(){}",
+        "data User { id: int primary } fn run()->Result<List<User>,DataError>{ let store=data memory?; return data find User in store } fn main(){}",
     )
     .unwrap_err();
     assert!(
@@ -143,7 +193,7 @@ fn invalid_data_schemas_have_source_diagnostics() {
     );
 
     let ordinary_struct = check_source(
-        "struct User { id: int } fn run()->Result<uint,DataError>{ var db=Database.memory()?; return data add User{id:1} in db } fn main(){}",
+        "struct User { id: int } fn run()->Result<uint,DataError>{ var store=data memory?; return data add User{id:1} in store } fn main(){}",
     )
     .unwrap_err();
     assert!(

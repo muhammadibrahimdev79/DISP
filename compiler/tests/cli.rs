@@ -24,6 +24,25 @@ fn source_file(name: &str, source: &str) -> std::path::PathBuf {
 }
 
 #[test]
+fn version_and_help_identify_the_developer_preview() {
+    let Some(version) = disp(&["--version"]) else {
+        return;
+    };
+    assert!(version.status.success());
+    assert_eq!(
+        String::from_utf8(version.stdout).unwrap().trim(),
+        "DISP 0.1.0 Developer Preview"
+    );
+    let Some(help) = disp(&["--help"]) else {
+        return;
+    };
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(help.contains("disp <file.disp|project-directory>"));
+    assert!(help.contains("program arguments follow `--`"));
+}
+
+#[test]
 fn run_and_check_commands_use_the_full_pipeline() {
     let source = source_file(
         "valid.disp",

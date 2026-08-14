@@ -1084,6 +1084,7 @@ pub fn supported(program: &mir::Program, ty: &hir::Type) -> bool {
         | hir::Type::ChildProcess
         | hir::Type::ProcessOutput
         | hir::Type::Database
+        | hir::Type::DataStore
         | hir::Type::Int { .. }
         | hir::Type::Float { .. } => true,
         hir::Type::AtomicInt => true,
@@ -3008,8 +3009,13 @@ fn terminator(
                             "({{{result_c} _r={{0}};disp_native_database _database={{0}};disp_native_string _error={{0}};if(disp_database_open(({path})->data,({path})->len,&_database,&_error)){{_r.tag=0;_r.payload.v0.f0=_database;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
                         )
                     } else {
+                        let constructor = if name == "DataStore.memory" {
+                            "disp_data_store_memory"
+                        } else {
+                            "disp_database_memory"
+                        };
                         format!(
-                            "({{{result_c} _r={{0}};disp_native_database _database={{0}};disp_native_string _error={{0}};if(disp_database_memory(&_database,&_error)){{_r.tag=0;_r.payload.v0.f0=_database;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                            "({{{result_c} _r={{0}};disp_native_database _database={{0}};disp_native_string _error={{0}};if({constructor}(&_database,&_error)){{_r.tag=0;_r.payload.v0.f0=_database;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
                         )
                     }
                 }
@@ -4275,6 +4281,136 @@ fn data_parameters(expression: &hir::DataExpr, output: &mut Vec<usize>) {
     }
 }
 
+fn data_constant_native(constant: &hir::Constant) -> String {
+    match constant {
+        hir::Constant::Signed(value, width) => {
+            let bits = *value as u128;
+            format!(
+                "dv_i((__int128)(((unsigned __int128){}ULL<<64)|{}ULL),{})",
+                (bits >> 64) as u64,
+                bits as u64,
+                width.unwrap_or(64)
+            )
+        }
+        hir::Constant::Unsigned(value, width) => format!(
+            "dv_u(((unsigned __int128){}ULL<<64)|{}ULL,{})",
+            (*value >> 64) as u64,
+            *value as u64,
+            width.unwrap_or(64)
+        ),
+        hir::Constant::Float(value, width) => format!("dv_f({value:?},{width})"),
+        hir::Constant::Bool(value) => format!("dv_bool({value})"),
+        hir::Constant::Char(value) => format!("dv_char({})", *value as u32),
+        hir::Constant::String(value) => {
+            format!("dv_string(\"{}\",{})", escape(value), value.len())
+        }
+        hir::Constant::Unit => "dv_unit()".into(),
+    }
+}
+
+fn data_expr_native_raw(
+    program: &mir::Program,
+    function: &mir::Function,
+    expression: &hir::DataExpr,
+    row: &str,
+    arguments: &[mir::Operand],
+    substitutions: &HashMap<String, hir::Type>,
+) -> Option<String> {
+    match expression.kind {
+        hir::DataExprKind::Field(index) => Some(format!("(({row})->f{index})")),
+        hir::DataExprKind::Parameter(index) => {
+            let (value, _) = system_argument(program, function, &arguments[index], substitutions);
+            Some(format!("(*({value}))"))
+        }
+        _ => None,
+    }
+}
+
+fn data_native_equal(ty: &hir::Type, left: &str, right: &str) -> String {
+    match ty {
+        hir::Type::Option(inner) => {
+            let payload = data_native_equal(
+                inner,
+                &format!("({left}).payload.v1.f0"),
+                &format!("({right}).payload.v1.f0"),
+            );
+            format!("((({left}).tag==({right}).tag)&&((({left}).tag==0)||({payload})))")
+        }
+        hir::Type::String | hir::Type::Str => native_key_equal(ty, left, right),
+        _ => format!("(({left})==({right}))"),
+    }
+}
+
+fn data_expr_native(
+    program: &mir::Program,
+    function: &mir::Function,
+    expression: &hir::DataExpr,
+    row: &str,
+    arguments: &[mir::Operand],
+    substitutions: &HashMap<String, hir::Type>,
+) -> String {
+    match &expression.kind {
+        hir::DataExprKind::Field(_) | hir::DataExprKind::Parameter(_) => {
+            let raw =
+                data_expr_native_raw(program, function, expression, row, arguments, substitutions)
+                    .expect("field and parameter data expressions are native values");
+            to_dv(&raw, &expression.ty)
+        }
+        hir::DataExprKind::Constant(value) => data_constant_native(value),
+        hir::DataExprKind::Unary(operator, operand) => {
+            let operand =
+                data_expr_native(program, function, operand, row, arguments, substitutions);
+            format!(
+                "dv_unary({},{operand},{},{})",
+                unary(*operator),
+                expression.span.start.line,
+                expression.span.start.column
+            )
+        }
+        hir::DataExprKind::Binary(operator, left, right)
+            if matches!(operator, ast::BinaryOperator::And | ast::BinaryOperator::Or) =>
+        {
+            let left = data_expr_native(program, function, left, row, arguments, substitutions);
+            let right = data_expr_native(program, function, right, row, arguments, substitutions);
+            let operator = if *operator == ast::BinaryOperator::And {
+                "&&"
+            } else {
+                "||"
+            };
+            format!("dv_bool(dv_truth({left}){operator}dv_truth({right}))")
+        }
+        hir::DataExprKind::Binary(operator, left, right)
+            if matches!(
+                operator,
+                ast::BinaryOperator::Equal | ast::BinaryOperator::NotEqual
+            ) && matches!(left.ty, hir::Type::Option(_)) =>
+        {
+            let left_raw =
+                data_expr_native_raw(program, function, left, row, arguments, substitutions)
+                    .expect("Option data comparisons use fields or parameters");
+            let right_raw =
+                data_expr_native_raw(program, function, right, row, arguments, substitutions)
+                    .expect("Option data comparisons use fields or parameters");
+            let equal = data_native_equal(&left.ty, &left_raw, &right_raw);
+            if *operator == ast::BinaryOperator::Equal {
+                format!("dv_bool({equal})")
+            } else {
+                format!("dv_bool(!({equal}))")
+            }
+        }
+        hir::DataExprKind::Binary(operator, left, right) => {
+            let left = data_expr_native(program, function, left, row, arguments, substitutions);
+            let right = data_expr_native(program, function, right, row, arguments, substitutions);
+            format!(
+                "dv_binary({},{left},{right},{},{})",
+                binary(*operator),
+                expression.span.start.line,
+                expression.span.start.column
+            )
+        }
+    }
+}
+
 fn data_decode_field(field: &hir::Field, row: &str, target: &str) -> String {
     let key = escape(&field.name);
     let get = format!(
@@ -4285,12 +4421,12 @@ fn data_decode_field(field: &hir::Field, row: &str, target: &str) -> String {
     );
     let decode = match &field.ty {
         hir::Type::Bool => format!(
-            "if(_ok){{int64_t _boolean=0;if(!disp_json_as_int(&_field_{},&_boolean,&_error)||(_boolean!=0&&_boolean!=1)){{if(!_error.len){{const char *_message=\"stored bool is outside 0 or 1\";_error=disp_owned_bytes(_message,strlen(_message));}}_ok=false;}}else {target}=(_boolean!=0);}}",
-            field.index
+            "if(_ok){{int64_t _boolean=0;bool _decoded_boolean=false;if(!strcmp(disp_json_kind_name(&_field_{}),\"bool\")){{if(!disp_json_as_bool(&_field_{},&_decoded_boolean,&_error))_ok=false;else _boolean=_decoded_boolean?1:0;}}else if(!disp_json_as_int(&_field_{},&_boolean,&_error)||(_boolean!=0&&_boolean!=1)){{if(!_error.len){{const char *_message=\"stored bool is outside 0 or 1\";_error=disp_owned_bytes(_message,strlen(_message));}}_ok=false;}}if(_ok){target}=(_boolean!=0);}}",
+            field.index, field.index, field.index
         ),
         hir::Type::Option(inner) if matches!(inner.as_ref(), hir::Type::Bool) => format!(
-            "if(_ok){{if(!strcmp(disp_json_kind_name(&_field_{}),\"null\")){{{target}.tag=0;}}else{{int64_t _boolean=0;if(!disp_json_as_int(&_field_{},&_boolean,&_error)||(_boolean!=0&&_boolean!=1)){{if(!_error.len){{const char *_message=\"stored bool is outside 0 or 1\";_error=disp_owned_bytes(_message,strlen(_message));}}_ok=false;}}else{{{target}.tag=1;{target}.payload.v1.f0=(_boolean!=0);}}}}}}",
-            field.index, field.index
+            "if(_ok){{if(!strcmp(disp_json_kind_name(&_field_{}),\"null\")){{{target}.tag=0;}}else{{int64_t _boolean=0;bool _decoded_boolean=false;if(!strcmp(disp_json_kind_name(&_field_{}),\"bool\")){{if(!disp_json_as_bool(&_field_{},&_decoded_boolean,&_error))_ok=false;else _boolean=_decoded_boolean?1:0;}}else if(!disp_json_as_int(&_field_{},&_boolean,&_error)||(_boolean!=0&&_boolean!=1)){{if(!_error.len){{const char *_message=\"stored bool is outside 0 or 1\";_error=disp_owned_bytes(_message,strlen(_message));}}_ok=false;}}if(_ok){{{target}.tag=1;{target}.payload.v1.f0=(_boolean!=0);}}}}}}",
+            field.index, field.index, field.index, field.index
         ),
         ty => format!(
             "if(_ok&&!{}(&_field_{},&({target}),&_error))_ok=false;",
@@ -4333,7 +4469,9 @@ fn data_schema_guard(schema: &hir::Struct, database: &str) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "disp_data_ensure_schema(({database})->state,\"{}\",{},\"{}\",{},(const char*[]){{{names}}},(const char*[]){{{types}}},(bool[]){{{required}}},(bool[]){{{primary}}},{},&_error)",
+        "disp_data_ensure_schema(({database})->state,\"{}\",{},\"{}\",{},\"{}\",{},(const char*[]){{{names}}},(const char*[]){{{types}}},(bool[]){{{required}}},(bool[]){{{primary}}},{},&_error)",
+        escape(&schema.name),
+        schema.name.len(),
         escape(&create),
         create.len(),
         escape(&inspect),
@@ -4372,6 +4510,18 @@ fn data_call(
                 })
                 .collect::<String>();
             let names = data_select_sql(schema);
+            let keys = schema
+                .fields
+                .iter()
+                .map(|field| {
+                    format!(
+                        "(disp_native_string){{(char*)\"{}\",{},0}}",
+                        escape(&field.name),
+                        field.name.len()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
             let placeholders = std::iter::repeat_n("?", count)
                 .collect::<Vec<_>>()
                 .join(",");
@@ -4405,8 +4555,11 @@ fn data_call(
                 }
             }
             format!(
-                "({{{result_c} _r={{0}};disp_native_string _error={{0}};bool _ok={guard};disp_native_json _params[{}]={{{{0}}}};size_t _encoded=0;{encoders}uint64_t _changes=0;if(_ok)_ok=disp_database_execute(({database})->state,\"{}\",{},_params,{count},&_changes,&_error);for(size_t _i=0;_i<_encoded;_i++)disp_json_drop(&_params[_i]);if(_ok){{_r.tag=0;_r.payload.v0.f0=_changes;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})",
+                "({{{result_c} _r={{0}};disp_native_string _error={{0}};bool _ok={guard};disp_native_json _params[{}]={{{{0}}}};size_t _encoded=0;{encoders}uint64_t _changes=0;if(_ok&&({database})->state->native){{disp_native_json _row={{0}};_ok=disp_json_from_object((disp_native_string[]){{{keys}}},_params,{count},&_row,&_error);if(_ok)_ok=disp_data_native_write(({database})->state,\"{}\",{},&_row,{},&_changes,&_error);disp_json_drop(&_row);}}else if(_ok)_ok=disp_database_execute(({database})->state,\"{}\",{},_params,{count},&_changes,&_error);for(size_t _i=0;_i<_encoded;_i++)disp_json_drop(&_params[_i]);if(_ok){{_r.tag=0;_r.payload.v0.f0=_changes;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})",
                 count.max(1),
+                escape(&schema.name),
+                schema.name.len(),
+                replace,
                 escape(&sql),
                 sql.len()
             )
@@ -4464,6 +4617,56 @@ fn data_call(
             let list_ty = hir::Type::List(Box::new(schema_ty.clone()));
             let list_c = native_types::c_type(&list_ty);
             let element_c = native_types::c_type(&schema_ty);
+            let native_predicate = predicate.as_ref().map_or_else(
+                || "dv_bool(true)".into(),
+                |predicate| {
+                    data_expr_native(
+                        program,
+                        function,
+                        predicate,
+                        "_row",
+                        arguments,
+                        substitutions,
+                    )
+                },
+            );
+            let native_order = order.as_ref().map_or_else(String::new, |(order, descending)| {
+                let left = data_expr_native(
+                    program,
+                    function,
+                    order,
+                    "_left",
+                    arguments,
+                    substitutions,
+                );
+                let right = data_expr_native(
+                    program,
+                    function,
+                    order,
+                    "_right",
+                    arguments,
+                    substitutions,
+                );
+                let comparison = if *descending {
+                    ast::BinaryOperator::Greater
+                } else {
+                    ast::BinaryOperator::Less
+                };
+                format!(
+                    "if(_native){{for(size_t _i=1;_i<_values.len;_i++){{{element_c} _moving=_values.data[_i];size_t _at=_i;while(_at){{{element_c} *_left=&_moving,*_right=&_values.data[_at-1];if(!dv_truth(dv_binary({},{left},{right},{},{})))break;_values.data[_at]=_values.data[_at-1];_at--;}}_values.data[_at]=_moving;}}}}",
+                    binary(comparison),
+                    order.span.start.line,
+                    order.span.start.column
+                )
+            });
+            let native_limit = limit_argument.map_or_else(
+                || "size_t _native_limit=DISP_DATABASE_ROW_LIMIT;".into(),
+                |index| {
+                    let (value, _) =
+                        system_argument(program, function, &arguments[index], substitutions);
+                    format!("size_t _native_limit=(size_t)(*{value});")
+                },
+            );
             let decoders = schema
                 .fields
                 .iter()
@@ -4471,7 +4674,7 @@ fn data_call(
                     data_decode_field(
                         field,
                         "&_rows[_i]",
-                        &format!("_values.data[_i].f{}", field.index),
+                        &format!("_values.data[_target].f{}", field.index),
                     )
                 })
                 .collect::<String>();
@@ -4482,16 +4685,19 @@ fn data_call(
                 .map(|(index, field)| {
                     let drop = drop_value(
                         program,
-                        &format!("_values.data[_i].f{}", field.index),
+                        &format!("_values.data[_target].f{}", field.index),
                         &field.ty,
                     );
                     format!("if(_field_done>{index}){{{drop}}}")
                 })
                 .collect::<String>();
             let drop_element = drop_value(program, "_values.data[_i]", &schema_ty);
+            let drop_target = drop_value(program, "_values.data[_target]", &schema_ty);
             format!(
-                "({{{result_c} _r={{0}};disp_native_string _error={{0}};bool _ok={guard};disp_native_json _params[{}]={{{{0}}}};size_t _encoded=0;{limit_check}{encoders}disp_native_json *_rows=NULL;size_t _rows_len=0,_rows_cap=0;if(_ok)_ok=disp_database_query(({database})->state,\"{}\",{},_params,{parameter_count},&_rows,&_rows_len,&_rows_cap,&_error);{list_c} _values={{0}};size_t _decoded=0;if(_ok&&_rows_len){{_values.data=({element_c}*)disp_alloc_zeroed(_rows_len,sizeof({element_c}),_Alignof({element_c}));_values.cap=_rows_len;}}if(_ok){{for(size_t _i=0;_i<_rows_len;_i++){{size_t _field_done=0;{decoders}if(!_ok){{{partial_drops}break;}}_decoded++;_values.len++;}}}}disp_database_rows_drop(_rows,_rows_len);for(size_t _i=0;_i<_encoded;_i++)disp_json_drop(&_params[_i]);if(_ok){{_r.tag=0;_r.payload.v0.f0=_values;}}else{{for(size_t _i=0;_i<_decoded;_i++){{{drop_element}}}disp_dealloc(_values.data);_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})",
+                "({{{result_c} _r={{0}};disp_native_string _error={{0}};bool _ok={guard};bool _native=_ok&&({database})->state->native;disp_native_json _params[{}]={{{{0}}}};size_t _encoded=0;{limit_check}{native_limit}{encoders}disp_native_json *_rows=NULL;size_t _rows_len=0,_rows_cap=0;if(_ok){{if(_native)_ok=disp_data_native_snapshot(({database})->state,\"{}\",{},&_rows,&_rows_len,&_rows_cap,&_error);else _ok=disp_database_query(({database})->state,\"{}\",{},_params,{parameter_count},&_rows,&_rows_len,&_rows_cap,&_error);}}{list_c} _values={{0}};if(_ok&&_rows_len){{_values.data=({element_c}*)disp_alloc_zeroed(_rows_len,sizeof({element_c}),_Alignof({element_c}));_values.cap=_rows_len;}}if(_ok){{for(size_t _i=0;_i<_rows_len;_i++){{size_t _target=_values.len,_field_done=0;{decoders}if(!_ok){{{partial_drops}break;}}{element_c} *_row=&_values.data[_target];if(_native&&!dv_truth({native_predicate})){{{drop_target}continue;}}_values.len++;}}}}{native_order}if(_ok&&_native&&_values.len>_native_limit){{for(size_t _i=_native_limit;_i<_values.len;_i++){{{drop_element}}}_values.len=_native_limit;}}disp_database_rows_drop(_rows,_rows_len);for(size_t _i=0;_i<_encoded;_i++)disp_json_drop(&_params[_i]);if(_ok){{_r.tag=0;_r.payload.v0.f0=_values;}}else{{for(size_t _i=0;_i<_values.len;_i++){{{drop_element}}}disp_dealloc(_values.data);_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})",
                 parameter_count.max(1),
+                escape(&schema.name),
+                schema.name.len(),
                 escape(&sql),
                 sql.len()
             )
@@ -4517,9 +4723,39 @@ fn data_call(
                 data_expr_sql(predicate, schema)
             );
             let count = indices.len();
+            let element_c = native_types::c_type(&schema_ty);
+            let native_predicate = data_expr_native(
+                program,
+                function,
+                predicate,
+                "_row",
+                arguments,
+                substitutions,
+            );
+            let decoders = schema
+                .fields
+                .iter()
+                .map(|field| {
+                    data_decode_field(field, "&_rows[_i]", &format!("_value.f{}", field.index))
+                })
+                .collect::<String>();
+            let partial_drops = schema
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    let drop = drop_value(program, &format!("_value.f{}", field.index), &field.ty);
+                    format!("if(_field_done>{index}){{{drop}}}")
+                })
+                .collect::<String>();
+            let drop_value = drop_value(program, "_value", &schema_ty);
             format!(
-                "({{{result_c} _r={{0}};disp_native_string _error={{0}};bool _ok={guard};disp_native_json _params[{}]={{{{0}}}};size_t _encoded=0;{encoders}uint64_t _changes=0;if(_ok)_ok=disp_database_execute(({database})->state,\"{}\",{},_params,{count},&_changes,&_error);for(size_t _i=0;_i<_encoded;_i++)disp_json_drop(&_params[_i]);if(_ok){{_r.tag=0;_r.payload.v0.f0=_changes;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})",
+                "({{{result_c} _r={{0}};disp_native_string _error={{0}};bool _ok={guard};bool _native=_ok&&({database})->state->native;disp_native_json _params[{}]={{{{0}}}};size_t _encoded=0;{encoders}uint64_t _changes=0;if(_ok&&_native){{disp_native_json *_rows=NULL;size_t _rows_len=0,_rows_cap=0;_ok=disp_data_native_snapshot(({database})->state,\"{}\",{},&_rows,&_rows_len,&_rows_cap,&_error);bool *_remove=_rows_len?(bool*)disp_alloc_zeroed(_rows_len,sizeof(bool),_Alignof(bool)):NULL;if(_ok){{for(size_t _i=0;_i<_rows_len;_i++){{{element_c} _value={{0}};size_t _field_done=0;{decoders}if(!_ok){{{partial_drops}break;}}{element_c} *_row=&_value;_remove[_i]=dv_truth({native_predicate});{drop_value}}}}}if(_ok)_ok=disp_data_native_delete(({database})->state,\"{}\",{},_remove,_rows_len,&_changes,&_error);disp_dealloc(_remove);disp_database_rows_drop(_rows,_rows_len);}}else if(_ok)_ok=disp_database_execute(({database})->state,\"{}\",{},_params,{count},&_changes,&_error);for(size_t _i=0;_i<_encoded;_i++)disp_json_drop(&_params[_i]);if(_ok){{_r.tag=0;_r.payload.v0.f0=_changes;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})",
                 count.max(1),
+                escape(&schema.name),
+                schema.name.len(),
+                escape(&schema.name),
+                schema.name.len(),
                 escape(&sql),
                 sql.len()
             )
@@ -5040,6 +5276,7 @@ fn to_dv(value: &str, ty: &hir::Type) -> String {
         hir::Type::ProcessCommand => "dv_string(\"<ProcessCommand>\",16)".into(),
         hir::Type::ChildProcess => "dv_string(\"<ChildProcess>\",14)".into(),
         hir::Type::Database => "dv_string(\"<Database>\",10)".into(),
+        hir::Type::DataStore => "dv_string(\"<DataStore>\",11)".into(),
         hir::Type::Str => format!("dv_string(({value}).data,({value}).len)"),
         hir::Type::Int {
             signed: true,
@@ -5278,7 +5515,9 @@ fn drop_value_depth(program: &mir::Program, value: &str, ty: &hir::Type, depth: 
         ),
         hir::Type::ProcessCommand => format!("disp_process_command_drop(&({value}));"),
         hir::Type::ChildProcess => format!("disp_child_drop(&({value}));"),
-        hir::Type::Database => format!("disp_database_drop(&({value}));"),
+        hir::Type::Database | hir::Type::DataStore => {
+            format!("disp_database_drop(&({value}));")
+        }
         hir::Type::SocketAddress => format!("disp_socket_address_drop(&({value}));"),
         hir::Type::TcpStream => format!("disp_tcp_stream_drop(&({value}));"),
         hir::Type::TlsStream => format!("disp_tls_stream_drop(&({value}));"),

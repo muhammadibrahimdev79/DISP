@@ -174,7 +174,7 @@ pub fn build(
 
 fn type_uses_database(ty: &hir::Type) -> bool {
     match ty {
-        hir::Type::Database => true,
+        hir::Type::Database | hir::Type::DataStore => true,
         hir::Type::Array(inner, _)
         | hir::Type::Slice(inner)
         | hir::Type::List(inner)

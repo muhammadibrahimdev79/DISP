@@ -9,7 +9,7 @@ pub fn generate(
 ) -> Result<String, Diagnostic> {
     let mut output = String::from(
         "/* Concrete monomorphized DISP storage types. */\n\
-         typedef struct { unsigned char _zero[0]; } disp_native_unit;\n\
+         typedef unsigned char disp_native_unit;\n\
          typedef struct { char *data; size_t len; size_t cap; } disp_native_string;\n\
          typedef struct { const char *data; size_t len; } disp_native_str;\n\
          typedef struct { char *data; size_t len; size_t cap; } disp_native_cstring;\n\
@@ -359,7 +359,7 @@ pub fn c_type(ty: &hir::Type) -> String {
         hir::Type::ProcessCommand => "disp_native_process_command".into(),
         hir::Type::ChildProcess => "disp_native_child_process".into(),
         hir::Type::ProcessOutput => "disp_native_process_output".into(),
-        hir::Type::Database => "disp_native_database".into(),
+        hir::Type::Database | hir::Type::DataStore => "disp_native_database".into(),
         hir::Type::Thread(_) => "disp_native_thread".into(),
         hir::Type::Future(_) => "disp_native_future".into(),
         hir::Type::Task(_) => "disp_native_task".into(),

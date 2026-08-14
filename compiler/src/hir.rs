@@ -49,6 +49,7 @@ pub enum Type {
     ChildProcess,
     ProcessOutput,
     Database,
+    DataStore,
     Array(Box<Type>, usize),
     Slice(Box<Type>),
     List(Box<Type>),
@@ -121,6 +122,7 @@ impl Type {
             | Self::ChildProcess
             | Self::ProcessOutput
             | Self::Database
+            | Self::DataStore
             | Self::Generic(_)
             | Self::Function(_, _)
             | Self::Unknown => false,
@@ -839,6 +841,7 @@ impl<'a> Lowering<'a> {
             "ProcessCommand" => Type::ProcessCommand,
             "ChildProcess" => Type::ChildProcess,
             "Database" => Type::Database,
+            "DataStore" => Type::DataStore,
             "Url" => Type::Url,
             "Json" => Type::Json,
             "IpAddress" => Type::IpAddress,
@@ -1297,7 +1300,7 @@ impl FunctionLowering<'_, '_> {
                         substitutions: vec![],
                     }),
                     Type::Result(
-                        Box::new(Type::Database),
+                        Box::new(Type::DataStore),
                         Box::new(Type::Generic("DataError".into())),
                     ),
                 )
@@ -2450,6 +2453,7 @@ impl FunctionLowering<'_, '_> {
                         | "Environment"
                         | "Process"
                         | "Database"
+                        | "DataStore"
                 ) {
                     let args = arguments
                         .iter()
@@ -4407,6 +4411,7 @@ fn surface_type_is_copy(ty: &Type) -> bool {
         | Type::ChildProcess
         | Type::ProcessOutput
         | Type::Database
+        | Type::DataStore
         | Type::Url
         | Type::Json
         | Type::IpAddress

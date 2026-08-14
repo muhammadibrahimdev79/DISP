@@ -843,6 +843,7 @@ pub fn type_code(ty: &hir::Type) -> String {
         hir::Type::ProcessCommand => "pc".into(),
         hir::Type::ChildProcess => "cp".into(),
         hir::Type::Database => "db".into(),
+        hir::Type::DataStore => "data_store".into(),
         hir::Type::Url => "url".into(),
         hir::Type::Json => "json".into(),
         hir::Type::IpAddress => "ni".into(),

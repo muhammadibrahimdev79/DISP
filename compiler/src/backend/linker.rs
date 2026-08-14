@@ -1,5 +1,10 @@
 use crate::diagnostics::{Diagnostic, DiagnosticKind, Span};
-use std::{path::Path, process::Command};
+use std::{
+    env,
+    ffi::OsString,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 #[derive(Clone, Copy)]
 pub struct RuntimeFeatures {
@@ -41,7 +46,7 @@ pub fn compile_and_link(
         "-o".into(),
         path(object)?.into(),
     ]);
-    run_gcc(&compile, "C compilation")?;
+    run_native_cc(&compile, "C compilation")?;
     let mut link = vec![
         path(object)?.into(),
         "-o".into(),
@@ -71,7 +76,7 @@ pub fn compile_and_link(
     for library in libraries {
         link.push(format!("-l{library}"));
     }
-    run_gcc(&link, "native linking")
+    run_native_cc(&link, "native linking")
 }
 
 fn windows_sqlite_library() -> Result<String, Diagnostic> {
@@ -91,16 +96,49 @@ fn path(path: &Path) -> Result<&str, Diagnostic> {
     path.to_str()
         .ok_or_else(|| error("native toolchain cannot represent a non-UTF-8 path"))
 }
-fn run_gcc(arguments: &[String], phase: &str) -> Result<(), Diagnostic> {
-    let output = Command::new("gcc")
+fn bundled_zig() -> Option<PathBuf> {
+    let executable = env::current_exe().ok()?;
+    let directory = executable.parent()?;
+    let candidate = directory
+        .join("toolchain")
+        .join(if cfg!(windows) { "zig.exe" } else { "zig" });
+    candidate.is_file().then_some(candidate)
+}
+
+fn native_cc() -> (OsString, Vec<OsString>, &'static str) {
+    if let Some(path) = env::var_os("DISP_ZIG").map(PathBuf::from)
+        && path.is_file()
+    {
+        return (path.into_os_string(), vec!["cc".into()], "bundled Zig");
+    }
+    if let Some(path) = bundled_zig() {
+        return (path.into_os_string(), vec!["cc".into()], "bundled Zig");
+    }
+    if let Some(command) = env::var_os("DISP_CC") {
+        return (command, Vec::new(), "configured C compiler");
+    }
+    ("gcc".into(), Vec::new(), "GCC")
+}
+
+fn run_native_cc(arguments: &[String], phase: &str) -> Result<(), Diagnostic> {
+    let (program, prefix, description) = native_cc();
+    let output = Command::new(&program)
+        .args(prefix)
         .args(arguments)
         .output()
-        .map_err(|cause| error(&format!("GCC is unavailable for {phase}: {cause}")))?;
+        .map_err(|cause| {
+            error(&format!(
+                "{description} is unavailable for {phase}: {cause}"
+            ))
+        })?;
     if output.status.success() {
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(error(&format!("{phase} failed:\n{}", stderr.trim())))
+    Err(error(&format!(
+        "{phase} failed with {description}:\n{}",
+        stderr.trim()
+    )))
 }
 fn error(message: &str) -> Diagnostic {
     Diagnostic::new(DiagnosticKind::Backend, message, Span::point(1, 1))

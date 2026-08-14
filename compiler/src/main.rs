@@ -36,6 +36,17 @@ fn main() {
 }
 
 fn execute(arguments: Vec<String>) -> Result<(), String> {
+    if matches!(arguments.as_slice(), [flag] if flag == "--version" || flag == "-V") {
+        println!("DISP {} Developer Preview", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if matches!(arguments.as_slice(), [flag] if flag == "--help" || flag == "-h") {
+        println!(
+            "DISP {} Developer Preview\n\nusage:\n  disp <file.disp|project-directory>\n  disp <check|build|run|interpret> [option] <file.disp|project-directory>\n  disp <new|lock|tree> <directory>\n\nbuild/check options:\n  --release  --emit-c  --emit-obj  --dump-hir  --dump-mir\n\nprogram arguments follow `--`.",
+            env!("CARGO_PKG_VERSION")
+        );
+        return Ok(());
+    }
     if let [command, path] = arguments.as_slice()
         && command == "new"
     {
@@ -86,7 +97,7 @@ fn execute(arguments: Vec<String>) -> Result<(), String> {
         [command, flag, path] if command == "check" && flag == "--dump-mir" => {
             (Command::DumpMir, path.as_str())
         }
-        _ => return Err("usage: disp <new|lock|tree> <directory> | disp <check|build|run|interpret> [--dump-hir|--dump-mir|--release|--emit-c|--emit-obj] <file.disp|project-directory> [-- program-arguments...]".into()),
+        _ => return Err("usage: disp <new|lock|tree> <directory> | disp <check|build|run|interpret> [--dump-hir|--dump-mir|--release|--emit-c|--emit-obj] <file.disp|project-directory> [-- program-arguments...]\ntry `disp --help` for details".into()),
     };
     if !program_arguments.is_empty() && !matches!(command, Command::Run | Command::Interpret) {
         return Err(

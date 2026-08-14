@@ -920,7 +920,7 @@ impl<'a> Analyzer<'a> {
                     self.check_expr(path, UseMode::Read)?;
                 }
                 Ok(Ty::Result(
-                    Box::new(Ty::Owned("Database".into())),
+                    Box::new(Ty::Owned("DataStore".into())),
                     Box::new(Ty::Owned("DataError".into())),
                 ))
             }
@@ -1520,6 +1520,7 @@ impl<'a> Analyzer<'a> {
                         | "Environment"
                         | "Process"
                         | "Database"
+                        | "DataStore"
                 )
             {
                 for argument in arguments {
