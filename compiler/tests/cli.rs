@@ -79,6 +79,79 @@ fn run_and_check_commands_use_the_full_pipeline() {
 }
 
 #[test]
+fn native_run_cache_reuses_unchanged_builds_and_tracks_imports() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory =
+        std::env::temp_dir().join(format!("disp-native-cache-{}-{unique}", std::process::id()));
+    fs::create_dir_all(&directory).unwrap();
+    let entry = directory.join("main.disp");
+    let dependency = directory.join("answer.disp");
+    fs::write(
+        &entry,
+        "module main\nuse answer\nfn main() { print(value()) }\n",
+    )
+    .unwrap();
+    fs::write(&dependency, "module answer\npub fn value() -> int = 42\n").unwrap();
+
+    let path = entry.to_str().unwrap();
+    let Some(first) = disp(&[path]) else {
+        return;
+    };
+    if !first.status.success() && String::from_utf8_lossy(&first.stderr).contains("os error 4551") {
+        return;
+    }
+    assert!(first.status.success());
+    assert_eq!(String::from_utf8(first.stdout).unwrap().trim(), "42");
+    let executable = directory.join("build/main.exe");
+    let fingerprint = directory.join("build/main/fingerprint.sha256");
+    assert!(fingerprint.is_file());
+    let first_modified = fs::metadata(&executable).unwrap().modified().unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let Some(cached) = disp(&[path]) else {
+        return;
+    };
+    assert!(cached.status.success());
+    assert_eq!(String::from_utf8(cached.stdout).unwrap().trim(), "42");
+    assert_eq!(
+        fs::metadata(&executable).unwrap().modified().unwrap(),
+        first_modified,
+        "an unchanged program should reuse its native executable"
+    );
+
+    fs::write(&dependency, "module answer\npub fn value() -> int = 43\n").unwrap();
+    let Some(rebuilt) = disp(&[path]) else {
+        return;
+    };
+    assert!(rebuilt.status.success());
+    assert_eq!(String::from_utf8(rebuilt.stdout).unwrap().trim(), "43");
+    assert_ne!(
+        fs::metadata(&executable).unwrap().modified().unwrap(),
+        first_modified,
+        "changing an imported module must invalidate the native cache"
+    );
+
+    fs::write(
+        &dependency,
+        "module answer\npub fn value() -> int = missing\n",
+    )
+    .unwrap();
+    let Some(invalid) = disp(&[path]) else {
+        return;
+    };
+    assert!(!invalid.status.success());
+    assert!(invalid.stdout.is_empty(), "stale native code must not run");
+    assert!(
+        String::from_utf8(invalid.stderr)
+            .unwrap()
+            .contains("unknown name `missing`")
+    );
+}
+
+#[test]
 fn run_and_interpret_forward_arguments_after_separator() {
     let source = source_file(
         "arguments.disp",

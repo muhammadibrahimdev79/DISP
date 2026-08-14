@@ -82,6 +82,10 @@ Run a DISP example through native compilation:
 cargo run -- run examples/easy_disp.disp
 ```
 
+Native runs still perform the complete frontend safety pipeline. When the compiler,
+build options, entry source, and every imported source are unchanged, DISP reuses the
+verified native executable instead of invoking the native toolchain again.
+
 Pass arguments after `--`; `fn main(args: List<String>)` receives only the program arguments:
 
 ```sh

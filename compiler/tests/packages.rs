@@ -10,8 +10,12 @@ static NEXT_WORKSPACE: AtomicUsize = AtomicUsize::new(0);
 
 fn workspace(name: &str, files: &[(&str, &str)]) -> PathBuf {
     let id = NEXT_WORKSPACE.fetch_add(1, Ordering::Relaxed);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let root = std::env::temp_dir().join(format!(
-        "disp-package-tests-{}-{id}-{name}",
+        "disp-package-tests-{}-{nonce}-{id}-{name}",
         std::process::id()
     ));
     fs::create_dir_all(&root).unwrap();

@@ -676,6 +676,7 @@ impl Loader {
         self.next_line = end_line + 2;
         self.sources.files.push(SourceFile {
             path: self.diagnostic_path(package_id.as_deref(), &canonical),
+            identity_path: canonical.clone(),
             start_line,
             end_line,
         });

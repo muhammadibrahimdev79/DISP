@@ -120,6 +120,26 @@ fn target_layouts_and_abi_are_concrete() {
 }
 
 #[test]
+fn in_memory_programs_without_source_identity_never_share_native_cache_entries() {
+    let first_source = "fn main() { print(1) }";
+    let second_source = "fn main() { print(2) }";
+    let path = temp_source("identityless_cache", first_source);
+    let (first_hir, first_mir) = lower_source(first_source).unwrap();
+    let first = backend::build(&first_hir, &first_mir, &path, BuildOptions::default()).unwrap();
+    assert!(!first.reused);
+
+    let (second_hir, second_mir) = lower_source(second_source).unwrap();
+    let second = backend::build(&second_hir, &second_mir, &path, BuildOptions::default()).unwrap();
+    assert!(!second.reused);
+    let output = match try_run_native(&second.executable) {
+        Ok(output) => output,
+        Err(error) if error.raw_os_error() == Some(4551) => return,
+        Err(error) => panic!("could not execute rebuilt in-memory program: {error}"),
+    };
+    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "2");
+}
+
+#[test]
 fn monomorphization_is_deterministic_and_deduplicated() {
     let source = "struct Box<T> { value: T } fn id<T>(value: T) -> T { return value } fn main() { let first = Box { value: id(1) } let second = Box { value: id(2) } print(first.value + second.value) }";
     let (_, mir) = lower_source(source).unwrap();

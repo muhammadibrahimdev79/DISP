@@ -29,7 +29,10 @@ impl Span {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceFile {
+    /// User-facing path used in diagnostics.
     pub path: PathBuf,
+    /// Canonical file identity used by compiler services such as build caching.
+    pub identity_path: PathBuf,
     pub start_line: usize,
     pub end_line: usize,
 }

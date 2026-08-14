@@ -37,7 +37,7 @@ Implemented executable subset:
 - CFG predecessor/successor, reachability, reverse-postorder, and back-edge analysis
 - checked integer arithmetic and an explicit `disp interpret` semantic oracle
 - deterministic monomorphization, target-aware layouts, ABI classification, and native MIR lowering
-- `disp check`, `disp build`, native `disp run`, and `disp interpret`
+- `disp check`, `disp build`, native `disp run`, and `disp interpret`; native builds use a content-addressed cache that is invalidated by compiler, option, entry-source, or imported-source changes
 
 The numeric runtime implements distinct checked signed and unsigned widths, `int`/`uint`, `f32`/`f64`, safe widening, checked explicit conversions, and wrapping/saturating integer operations. Generic functions and ADTs use substitution-based inference, and traits use coherent static dispatch with associated-type completeness checking.
 

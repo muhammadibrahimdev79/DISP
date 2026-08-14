@@ -8,6 +8,10 @@ use std::{
     net::{TcpListener, TcpStream, ToSocketAddrs},
     path::PathBuf,
     process::Command,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -139,13 +143,15 @@ fn assert_lazy_connection(source_for_port: impl Fn(u16) -> String) {
         let port = listener.local_addr().unwrap().port();
         let source = source_for_port(port);
         listener.set_nonblocking(true).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
         let worker = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(7);
+            let deadline = Instant::now() + Duration::from_secs(60);
             let mut socket = loop {
                 match listener.accept() {
                     Ok((socket, _)) => break socket,
                     Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                        if Instant::now() >= deadline {
+                        if worker_cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
                             return false;
                         }
                         std::thread::sleep(Duration::from_millis(5));
@@ -179,6 +185,9 @@ fn assert_lazy_connection(source_for_port: impl Fn(u16) -> String) {
             assert_eq!(run_source(&source).unwrap(), ["Result.Ok(true)"]);
             true
         };
+        if !executed {
+            cancelled.store(true, Ordering::Release);
+        }
         assert_eq!(worker.join().unwrap(), executed);
     }
 }

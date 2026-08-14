@@ -13,6 +13,7 @@ use crate::{
     diagnostics::{Diagnostic, DiagnosticKind, Span},
     hir, mir,
 };
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     fs,
@@ -30,6 +31,15 @@ pub struct BuildArtifacts {
     pub executable: PathBuf,
     pub object: Option<PathBuf>,
     pub backend_ir: Option<PathBuf>,
+    pub reused: bool,
+}
+
+struct BuildPaths {
+    directory: PathBuf,
+    c: PathBuf,
+    object: PathBuf,
+    executable: PathBuf,
+    fingerprint: PathBuf,
 }
 
 pub fn build(
@@ -39,6 +49,20 @@ pub fn build(
     options: BuildOptions,
 ) -> Result<BuildArtifacts, Diagnostic> {
     mir::validate(mir)?;
+    let paths = build_paths(source_path)?;
+    let fingerprint = build_fingerprint(hir, options);
+    if fingerprint
+        .as_deref()
+        .is_some_and(|expected| cache_matches(&paths, options, expected))
+    {
+        return Ok(BuildArtifacts {
+            executable: paths.executable,
+            object: options.emit_object.then_some(paths.object),
+            backend_ir: options.emit_c.then_some(paths.c),
+            reused: true,
+        });
+    }
+
     let target = target::Target::host()?;
     let mono = mono::collect(mir)?;
     validate_layouts(hir, mir, &mono, target)?;
@@ -96,6 +120,52 @@ pub fn build(
                 )
             })
     });
+    fs::create_dir_all(&paths.directory)
+        .map_err(|cause| error(&format!("could not create native build directory: {cause}")))?;
+    fs::write(&paths.c, generated.source)
+        .map_err(|cause| error(&format!("could not write backend C: {cause}")))?;
+    let libraries = mono
+        .instances
+        .iter()
+        .filter_map(|instance| {
+            hir.functions[instance.function.0]
+                .external
+                .as_ref()
+                .and_then(|external| external.library.clone())
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    linker::compile_and_link(
+        &paths.c,
+        &paths.object,
+        &paths.executable,
+        options.optimized,
+        linker::RuntimeFeatures {
+            networking,
+            http,
+            database,
+        },
+        &libraries,
+    )?;
+    if !options.emit_c {
+        let _ = fs::remove_file(&paths.c);
+    }
+    if !options.emit_object {
+        let _ = fs::remove_file(&paths.object);
+    }
+    if let Some(fingerprint) = fingerprint {
+        let _ = fs::write(&paths.fingerprint, format!("{fingerprint}\n"));
+    }
+    Ok(BuildArtifacts {
+        executable: paths.executable,
+        object: options.emit_object.then_some(paths.object),
+        backend_ir: options.emit_c.then_some(paths.c),
+        reused: false,
+    })
+}
+
+fn build_paths(source_path: &Path) -> Result<BuildPaths, Diagnostic> {
     let project_root;
     let (stem, parent) = if source_path.is_dir() {
         project_root = if source_path.is_absolute() {
@@ -127,49 +197,60 @@ pub fn build(
             }
         })
         .collect::<String>();
-    let build_dir = parent.join("build").join(&safe_stem);
-    fs::create_dir_all(&build_dir)
-        .map_err(|cause| error(&format!("could not create native build directory: {cause}")))?;
-    let c_path = build_dir.join(format!("{safe_stem}.backend.c"));
-    let object_path = build_dir.join(format!("{safe_stem}.o"));
-    let executable_path = parent.join("build").join(format!("{safe_stem}.exe"));
-    fs::write(&c_path, generated.source)
-        .map_err(|cause| error(&format!("could not write backend C: {cause}")))?;
-    let libraries = mono
-        .instances
-        .iter()
-        .filter_map(|instance| {
-            hir.functions[instance.function.0]
-                .external
-                .as_ref()
-                .and_then(|external| external.library.clone())
-        })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    linker::compile_and_link(
-        &c_path,
-        &object_path,
-        &executable_path,
-        options.optimized,
-        linker::RuntimeFeatures {
-            networking,
-            http,
-            database,
-        },
-        &libraries,
-    )?;
-    if !options.emit_c {
-        let _ = fs::remove_file(&c_path);
-    }
-    if !options.emit_object {
-        let _ = fs::remove_file(&object_path);
-    }
-    Ok(BuildArtifacts {
-        executable: executable_path,
-        object: options.emit_object.then_some(object_path),
-        backend_ir: options.emit_c.then_some(c_path),
+    let root = parent.join("build");
+    let directory = root.join(&safe_stem);
+    Ok(BuildPaths {
+        c: directory.join(format!("{safe_stem}.backend.c")),
+        object: directory.join(format!("{safe_stem}.o")),
+        fingerprint: directory.join("fingerprint.sha256"),
+        executable: root.join(format!("{safe_stem}.exe")),
+        directory,
     })
+}
+
+fn build_fingerprint(program: &hir::Program, options: BuildOptions) -> Option<String> {
+    // `lower_source` intentionally has no filesystem identity. Callers may reuse an
+    // output path for different in-memory programs, so those builds cannot be cached
+    // without an explicit content identity from the caller.
+    if program.source_files.is_empty() {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"DISP native build cache v1\0");
+    digest.update(env!("CARGO_PKG_VERSION").as_bytes());
+    digest.update([
+        options.optimized as u8,
+        options.emit_c as u8,
+        options.emit_object as u8,
+    ]);
+    digest.update(std::env::consts::OS.as_bytes());
+    digest.update([0]);
+    digest.update(std::env::consts::ARCH.as_bytes());
+    digest.update([0]);
+
+    let compiler = std::env::current_exe().ok()?;
+    digest.update(fs::read(compiler).ok()?);
+
+    let mut sources = program.source_files.iter().collect::<Vec<_>>();
+    sources.sort_by(|left, right| left.identity_path.cmp(&right.identity_path));
+    for source in sources {
+        digest.update(source.identity_path.to_string_lossy().as_bytes());
+        digest.update([0]);
+        digest.update(fs::read(&source.identity_path).ok()?);
+        digest.update([0]);
+    }
+    Some(format!("{:x}", digest.finalize()))
+}
+
+fn cache_matches(paths: &BuildPaths, options: BuildOptions, expected: &str) -> bool {
+    let executable_exists =
+        fs::metadata(&paths.executable).is_ok_and(|metadata| metadata.len() > 0);
+    let object_exists = !options.emit_object || paths.object.is_file();
+    let c_exists = !options.emit_c || paths.c.is_file();
+    executable_exists
+        && object_exists
+        && c_exists
+        && fs::read_to_string(&paths.fingerprint).is_ok_and(|actual| actual.trim() == expected)
 }
 
 fn type_uses_database(ty: &hir::Type) -> bool {
