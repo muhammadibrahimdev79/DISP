@@ -1,0 +1,35 @@
+data Person {
+    id: int primary
+    name: String
+    active: bool
+    note: Option<String>
+}
+
+fn update() -> Result<bool, DataError> {
+    var people = data open Path("people.dispdb")?
+
+    data save Person {
+        id: 1,
+        name: "Ada",
+        active: true,
+        note: None,
+    } in people?
+    data save Person {
+        id: 2,
+        name: "Grace",
+        active: true,
+        note: Some("compiler"),
+    } in people?
+
+    active = data find Person in people
+        where active == true
+        order id ascending?
+    return Ok(active.len() == 2)
+}
+
+fn main() {
+    print(match update() {
+        Ok(saved) => saved,
+        Err(_) => false,
+    })
+}

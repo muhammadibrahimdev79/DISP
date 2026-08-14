@@ -11,6 +11,7 @@ pub struct RuntimeFeatures {
     pub networking: bool,
     pub http: bool,
     pub database: bool,
+    pub data: bool,
 }
 
 pub fn compile_and_link(
@@ -39,6 +40,9 @@ pub fn compile_and_link(
     }
     if features.database {
         compile.push("-DDISP_DATABASE".into());
+    }
+    if features.data {
+        compile.push("-DDISP_DATA".into());
     }
     compile.extend([
         "-c".into(),

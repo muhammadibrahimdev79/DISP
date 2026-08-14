@@ -3005,8 +3005,13 @@ fn terminator(
                     if matches!(name.as_str(), "Database.open" | "DataStore.open") {
                         let (path, _) =
                             system_argument(program, function, &arguments[0], substitutions);
+                        let constructor = if name == "DataStore.open" {
+                            "disp_data_store_open"
+                        } else {
+                            "disp_database_open"
+                        };
                         format!(
-                            "({{{result_c} _r={{0}};disp_native_database _database={{0}};disp_native_string _error={{0}};if(disp_database_open(({path})->data,({path})->len,&_database,&_error)){{_r.tag=0;_r.payload.v0.f0=_database;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                            "({{{result_c} _r={{0}};disp_native_database _database={{0}};disp_native_string _error={{0}};if({constructor}(({path})->data,({path})->len,&_database,&_error)){{_r.tag=0;_r.payload.v0.f0=_database;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
                         )
                     } else {
                         let constructor = if name == "DataStore.memory" {

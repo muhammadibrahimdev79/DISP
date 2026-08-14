@@ -1,6 +1,7 @@
 pub mod ast;
 pub mod backend;
 pub mod cfg;
+mod data_store;
 pub mod diagnostics;
 pub mod hir;
 pub mod interpreter;

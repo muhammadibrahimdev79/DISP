@@ -2,6 +2,7 @@ use crate::ast::{
     AssignmentOperator, BinaryOperator, Block, EnumDeclaration, Expr, Expression, Function,
     Pattern, Program, Statement, TypeName, TypeQualifier, UnaryOperator, VariantDeclaration,
 };
+use crate::data_store;
 use crate::diagnostics::{Diagnostic, DiagnosticKind, Span};
 use native_tls::{Protocol, TlsConnector, TlsStream as NativeTlsStream};
 use std::{
@@ -2748,20 +2749,23 @@ const DATABASE_ROW_LIMIT: usize = 100_000;
 #[derive(Clone, PartialEq, Eq)]
 struct NativeDataField {
     name: String,
-    storage: &'static str,
+    storage: String,
     optional: bool,
     primary: bool,
 }
 
+#[derive(Clone)]
 struct NativeDataTable {
     fields: Vec<NativeDataField>,
     primary: usize,
     rows: Vec<Value>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct NativeDataStore {
     tables: HashMap<String, NativeDataTable>,
+    pending: HashMap<String, data_store::Table>,
+    path: Option<PathBuf>,
 }
 
 struct RuntimeDatabaseState {
@@ -2875,6 +2879,31 @@ impl RuntimeDatabase {
             handle: std::ptr::null_mut(),
             closed: false,
             native: Some(NativeDataStore::default()),
+        }))))
+    }
+
+    fn native_open(path: PathBuf) -> io::Result<Self> {
+        let snapshot = data_store::load(&path)?;
+        for table in &snapshot.tables {
+            for row in &table.rows {
+                let row = String::from_utf8(row.clone())
+                    .map_err(|_| io::Error::other("stored row is not valid UTF-8"))?;
+                runtime_json(row)?;
+            }
+        }
+        let pending = snapshot
+            .tables
+            .into_iter()
+            .map(|table| (table.name.clone(), table))
+            .collect();
+        Ok(Self(Arc::new(StdMutex::new(RuntimeDatabaseState {
+            handle: std::ptr::null_mut(),
+            closed: false,
+            native: Some(NativeDataStore {
+                tables: HashMap::new(),
+                pending,
+                path: Some(path),
+            }),
         }))))
     }
 
@@ -3355,20 +3384,77 @@ fn data_json_integer(value: &RuntimeJson, context: &str) -> io::Result<i64> {
         .map_err(|_| io::Error::other(format!("{context} is not an integer")))
 }
 
-fn data_ensure_schema(
-    database: &RuntimeDatabase,
-    schema: &crate::ast::StructDeclaration,
-) -> io::Result<()> {
-    let fields = schema
+fn native_data_fields(schema: &crate::ast::StructDeclaration) -> Vec<NativeDataField> {
+    schema
         .fields
         .iter()
         .map(|field| NativeDataField {
             name: field.name.clone(),
-            storage: data_sql_type(&field.ty),
+            storage: data_sql_type(&field.ty).to_owned(),
             optional: data_inner_type(&field.ty).1,
             primary: field.primary,
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn native_data_snapshot(
+    program: &Program,
+    store: &NativeDataStore,
+) -> io::Result<data_store::Snapshot> {
+    let mut tables = store.pending.values().cloned().collect::<Vec<_>>();
+    for (name, table) in &store.tables {
+        let rows = table
+            .rows
+            .iter()
+            .map(|row| encode_json_value(program, row).map(|json| json.text.into_bytes()))
+            .collect::<io::Result<Vec<_>>>()?;
+        tables.push(data_store::Table {
+            name: name.clone(),
+            fields: table
+                .fields
+                .iter()
+                .map(|field| data_store::Field {
+                    name: field.name.clone(),
+                    storage: field.storage.clone(),
+                    optional: field.optional,
+                    primary: field.primary,
+                })
+                .collect(),
+            rows,
+        });
+    }
+    Ok(data_store::Snapshot { tables })
+}
+
+fn persist_native_data(program: &Program, store: &NativeDataStore) -> io::Result<()> {
+    let Some(path) = &store.path else {
+        return Ok(());
+    };
+    data_store::commit(path, &native_data_snapshot(program, store)?)
+}
+
+fn mutate_native_data<T>(
+    program: &Program,
+    store: &mut NativeDataStore,
+    operation: impl FnOnce(&mut NativeDataStore) -> io::Result<T>,
+) -> io::Result<T> {
+    let previous = store.path.as_ref().map(|_| store.clone());
+    let value = operation(store)?;
+    if let Err(error) = persist_native_data(program, store) {
+        if let Some(previous) = previous {
+            *store = previous;
+        }
+        return Err(error);
+    }
+    Ok(value)
+}
+
+fn data_ensure_schema(
+    program: &Program,
+    database: &RuntimeDatabase,
+    schema: &crate::ast::StructDeclaration,
+) -> io::Result<()> {
+    let fields = native_data_fields(schema);
     if database
         .with_native(|store| {
             if let Some(table) = store.tables.get(&schema.name) {
@@ -3380,19 +3466,63 @@ fn data_ensure_schema(
                 }
                 return Ok(());
             }
+            if let Some(persisted) = store.pending.get(&schema.name).cloned() {
+                let stored_fields = persisted
+                    .fields
+                    .iter()
+                    .map(|field| NativeDataField {
+                        name: field.name.clone(),
+                        storage: field.storage.clone(),
+                        optional: field.optional,
+                        primary: field.primary,
+                    })
+                    .collect::<Vec<_>>();
+                if stored_fields != fields {
+                    return Err(io::Error::other(format!(
+                        "stored `{}` layout does not match its DISP Data schema",
+                        schema.name
+                    )));
+                }
+                let rows = persisted
+                    .rows
+                    .into_iter()
+                    .map(|row| {
+                        String::from_utf8(row)
+                            .map_err(|_| io::Error::other("stored row is not valid UTF-8"))
+                            .and_then(runtime_json)
+                    })
+                    .collect::<io::Result<Vec<_>>>()?;
+                let rows = data_decode_rows(program, schema, rows)?;
+                let primary = fields
+                    .iter()
+                    .position(|field| field.primary)
+                    .expect("validated data schema has one primary field");
+                store.pending.remove(&schema.name);
+                store.tables.insert(
+                    schema.name.clone(),
+                    NativeDataTable {
+                        fields,
+                        primary,
+                        rows,
+                    },
+                );
+                return Ok(());
+            }
             let primary = fields
                 .iter()
                 .position(|field| field.primary)
                 .expect("validated data schema has one primary field");
-            store.tables.insert(
-                schema.name.clone(),
-                NativeDataTable {
-                    fields,
-                    primary,
-                    rows: Vec::new(),
-                },
-            );
-            Ok(())
+            mutate_native_data(program, store, |store| {
+                store.tables.insert(
+                    schema.name.clone(),
+                    NativeDataTable {
+                        fields,
+                        primary,
+                        rows: Vec::new(),
+                    },
+                );
+                Ok(())
+            })
         })?
         .is_some()
     {
@@ -3436,41 +3566,44 @@ fn data_ensure_schema(
 }
 
 fn native_data_write(
+    program: &Program,
     database: &RuntimeDatabase,
     schema: &crate::ast::StructDeclaration,
     value: Value,
     replace: bool,
 ) -> io::Result<Option<u64>> {
     database.with_native(|store| {
-        let table = store
-            .tables
-            .get_mut(&schema.name)
-            .ok_or_else(|| io::Error::other("DISP Data schema was not registered"))?;
-        let Value::Struct { fields, .. } = &value else {
-            return Err(io::Error::other("DISP Data write requires a schema value"));
-        };
-        let primary_name = &table.fields[table.primary].name;
-        let key = fields
-            .get(primary_name)
-            .ok_or_else(|| io::Error::other("data value is missing its primary field"))?;
-        let existing = table.rows.iter().position(|row| {
-            matches!(row, Value::Struct { fields, .. } if fields.get(primary_name) == Some(key))
-        });
-        if let Some(index) = existing {
-            if !replace {
-                return Err(io::Error::other(format!(
-                    "duplicate primary value for `{}`",
-                    schema.name
-                )));
+        mutate_native_data(program, store, |store| {
+            let table = store
+                .tables
+                .get_mut(&schema.name)
+                .ok_or_else(|| io::Error::other("DISP Data schema was not registered"))?;
+            let Value::Struct { fields, .. } = &value else {
+                return Err(io::Error::other("DISP Data write requires a schema value"));
+            };
+            let primary_name = &table.fields[table.primary].name;
+            let key = fields
+                .get(primary_name)
+                .ok_or_else(|| io::Error::other("data value is missing its primary field"))?;
+            let existing = table.rows.iter().position(|row| {
+                matches!(row, Value::Struct { fields, .. } if fields.get(primary_name) == Some(key))
+            });
+            if let Some(index) = existing {
+                if !replace {
+                    return Err(io::Error::other(format!(
+                        "duplicate primary value for `{}`",
+                        schema.name
+                    )));
+                }
+                table.rows[index] = value;
+                return Ok(1);
             }
-            table.rows[index] = value;
-            return Ok(1);
-        }
-        if table.rows.len() >= DATABASE_ROW_LIMIT {
-            return Err(io::Error::other("data table exceeds the 100000-row limit"));
-        }
-        table.rows.push(value);
-        Ok(1)
+            if table.rows.len() >= DATABASE_ROW_LIMIT {
+                return Err(io::Error::other("data table exceeds the 100000-row limit"));
+            }
+            table.rows.push(value);
+            Ok(1)
+        })
     })
 }
 
@@ -3488,17 +3621,20 @@ fn native_data_rows(
 }
 
 fn native_data_replace_rows(
+    program: &Program,
     database: &RuntimeDatabase,
     schema: &crate::ast::StructDeclaration,
     rows: Vec<Value>,
 ) -> io::Result<Option<()>> {
     database.with_native(|store| {
-        let table = store
-            .tables
-            .get_mut(&schema.name)
-            .ok_or_else(|| io::Error::other("DISP Data schema was not registered"))?;
-        table.rows = rows;
-        Ok(())
+        mutate_native_data(program, store, |store| {
+            let table = store
+                .tables
+                .get_mut(&schema.name)
+                .ok_or_else(|| io::Error::other("DISP Data schema was not registered"))?;
+            table.rows = rows;
+            Ok(())
+        })
     })
 }
 
@@ -3508,6 +3644,7 @@ fn normalize_data_value(ty: &TypeName, value: &RuntimeJson) -> io::Result<Runtim
         return Ok(value.clone());
     }
     match inner.name.as_str() {
+        "bool" if value.kind == "bool" => Ok(value.clone()),
         "bool" => match data_json_integer(value, "stored bool")? {
             0 => runtime_json("false".into()),
             1 => runtime_json("true".into()),
@@ -5333,16 +5470,17 @@ impl Interpreter {
             .iter()
             .find(|schema| schema.name == *type_name && schema.data)
             .expect("type checking validates the DISP Data schema");
-        if let Err(error) = data_ensure_schema(&database, schema) {
+        if let Err(error) = data_ensure_schema(program, &database, schema) {
             return Ok(runtime_result(Err(error)));
         }
         if database
             .is_native()
             .map_err(|error| self.error(error.to_string(), store.span))?
         {
-            let result = native_data_write(&database, schema, value, replace).and_then(|result| {
-                result.ok_or_else(|| io::Error::other("native DISP Data provider disappeared"))
-            });
+            let result =
+                native_data_write(program, &database, schema, value, replace).and_then(|result| {
+                    result.ok_or_else(|| io::Error::other("native DISP Data provider disappeared"))
+                });
             return Ok(runtime_result(result.map(Value::UInt)));
         }
         let Value::Struct { fields, .. } = &value else {
@@ -5418,7 +5556,7 @@ impl Interpreter {
         let limit = limit
             .map(|value| self.evaluate(program, value))
             .transpose()?;
-        if let Err(error) = data_ensure_schema(&database, schema) {
+        if let Err(error) = data_ensure_schema(program, &database, schema) {
             return Ok(runtime_result(Err(error)));
         }
         if database
@@ -5595,7 +5733,7 @@ impl Interpreter {
             .find(|schema| schema.name == schema_name && schema.data)
             .expect("type checking validates the DISP Data schema");
         let mut parameters = Vec::new();
-        if let Err(error) = data_ensure_schema(&database, schema) {
+        if let Err(error) = data_ensure_schema(program, &database, schema) {
             return Ok(runtime_result(Err(error)));
         }
         if database
@@ -5629,7 +5767,7 @@ impl Interpreter {
                     _ => unreachable!("type checking validates DISP Data predicates"),
                 }
             }
-            let result = native_data_replace_rows(&database, schema, retained)
+            let result = native_data_replace_rows(program, &database, schema, retained)
                 .and_then(|result| {
                     result.ok_or_else(|| io::Error::other("native DISP Data provider disappeared"))
                 })
@@ -5674,7 +5812,8 @@ impl Interpreter {
                             "data store path is not valid UTF-8",
                         )
                     });
-                    path.and_then(RuntimeDatabase::open)
+                    path.map(PathBuf::from)
+                        .and_then(RuntimeDatabase::native_open)
                 } else {
                     RuntimeDatabase::native_memory()
                 };

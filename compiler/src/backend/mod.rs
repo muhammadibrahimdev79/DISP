@@ -110,7 +110,22 @@ pub fn build(
                     mir::Terminator::Call {
                         target: hir::CallTarget::Intrinsic(name),
                         ..
-                    } if name.starts_with("Database.") || name.starts_with("DataStore.")
+                    } if name.starts_with("Database.")
+                )
+            })
+    });
+    let data = mir.functions.iter().any(|function| {
+        function
+            .locals
+            .iter()
+            .any(|local| type_uses_data_store(&local.ty))
+            || function.blocks.iter().any(|block| {
+                matches!(
+                    &block.terminator,
+                    mir::Terminator::Call {
+                        target: hir::CallTarget::Intrinsic(name),
+                        ..
+                    } if name.starts_with("DataStore.")
                 ) || matches!(
                     &block.terminator,
                     mir::Terminator::Call {
@@ -145,6 +160,7 @@ pub fn build(
             networking,
             http,
             database,
+            data,
         },
         &libraries,
     )?;
@@ -255,7 +271,7 @@ fn cache_matches(paths: &BuildPaths, options: BuildOptions, expected: &str) -> b
 
 fn type_uses_database(ty: &hir::Type) -> bool {
     match ty {
-        hir::Type::Database | hir::Type::DataStore => true,
+        hir::Type::Database => true,
         hir::Type::Array(inner, _)
         | hir::Type::Slice(inner)
         | hir::Type::List(inner)
@@ -276,6 +292,34 @@ fn type_uses_database(ty: &hir::Type) -> bool {
         }
         hir::Type::Function(arguments, result) => {
             arguments.iter().any(type_uses_database) || type_uses_database(result)
+        }
+        _ => false,
+    }
+}
+
+fn type_uses_data_store(ty: &hir::Type) -> bool {
+    match ty {
+        hir::Type::DataStore => true,
+        hir::Type::Array(inner, _)
+        | hir::Type::Slice(inner)
+        | hir::Type::List(inner)
+        | hir::Type::Set(inner)
+        | hir::Type::Thread(inner)
+        | hir::Type::Future(inner)
+        | hir::Type::Task(inner)
+        | hir::Type::Mutex(inner)
+        | hir::Type::MutexGuard(inner)
+        | hir::Type::Option(inner)
+        | hir::Type::Reference { inner, .. }
+        | hir::Type::RawPointer { inner, .. } => type_uses_data_store(inner),
+        hir::Type::Map(key, value) | hir::Type::Result(key, value) => {
+            type_uses_data_store(key) || type_uses_data_store(value)
+        }
+        hir::Type::Struct(_, arguments) | hir::Type::Enum(_, arguments) => {
+            arguments.iter().any(type_uses_data_store)
+        }
+        hir::Type::Function(arguments, result) => {
+            arguments.iter().any(type_uses_data_store) || type_uses_data_store(result)
         }
         _ => false,
     }
