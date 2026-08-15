@@ -398,7 +398,7 @@ fn representative_examples_match_the_interpreter_natively() {
             "system_memory_example",
             include_str!("../examples/system_memory.disp"),
         ),
-        ("hello_example", include_str!("../hello.disp")),
+        ("hello_example", include_str!("../examples/hello.disp")),
     ] {
         let expected = run_source(source).unwrap().join("\n") + "\n";
         let path = temp_source(name, source);

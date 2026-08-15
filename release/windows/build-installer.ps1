@@ -29,7 +29,7 @@ try {
 $env:DISP_COMPILER_EXE = Join-Path $compiler "target\release\disp.exe"
 $env:DISP_ZIG_ARCHIVE = $ZigArchive
 $env:DISP_INSTALL_SCRIPT = Join-Path $scriptDirectory "install.ps1"
-$env:DISP_RELEASE_NOTES = Join-Path $repository "RELEASE_NOTES_0.1.md"
+$env:DISP_RELEASE_NOTES = Join-Path $repository "docs\releases\RELEASE_NOTES_0.1.md"
 try {
     rustc (Join-Path $scriptDirectory "bootstrap.rs") -O -o $OutputPath
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $OutputPath -PathType Leaf)) {

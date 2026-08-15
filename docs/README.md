@@ -5,11 +5,12 @@ working behavior from future design ideas.
 
 ## Verified implementation documentation
 
-These documents live beside the compiler and are maintained against its tests:
+These documents are maintained against the compiler and its tests:
 
-- [Compiler status and usage](../compiler/README.md)
-- [Implemented surface syntax](../compiler/SURFACE_SYNTAX.md)
-- [Native benchmark baselines](../compiler/NATIVE_BASELINES.md)
+- [Compiler status and usage](compiler/README.md)
+- [Implemented surface syntax](language/SURFACE_SYNTAX.md)
+- [Native benchmark baselines](performance/NATIVE_BASELINES.md)
+- [0.1 developer-preview release notes](releases/RELEASE_NOTES_0.1.md)
 - [Executable examples](../compiler/examples/)
 - [Compiler test suites](../compiler/tests/)
 

@@ -11,6 +11,10 @@ target/
 *.obj
 *.pdb
 
+# Local databases created by DISP examples and smoke tests
+*.dispdb
+*.dispdb.*
+
 # Local editor and operating-system files
 .DS_Store
 Thumbs.db

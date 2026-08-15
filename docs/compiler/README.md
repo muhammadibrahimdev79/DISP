@@ -43,9 +43,10 @@ The numeric runtime implements distinct checked signed and unsigned widths, `int
 
 The initial native backend supports Windows x86-64. It lowers validated, monomorphized MIR to deterministic C as a temporary backend IR, asks GCC (discovered through `PATH`) for a real PE/COFF object, and links a standalone `.exe`. This is intentionally described as a C/object backend, not LLVM. Calling-convention classification and concrete layouts remain separate from code generation so a direct machine-code backend can replace the temporary lowering without touching the frontend.
 
-Run:
+From the repository root, enter the compiler crate and run:
 
 ```text
+cd compiler
 cargo run -- run examples/control_flow.disp
 cargo run -- build examples/control_flow.disp
 cargo run -- build --release examples/control_flow.disp

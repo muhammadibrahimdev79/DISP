@@ -29,8 +29,10 @@ early native programs. It is not a stable production release.
   not included in this artifact.
 - Intelligence and Page are early compiler domains, not complete AI or application UI
   platforms yet.
-- The persistent DISP-native page/journal/recovery engine is under development;
-  durable `data open` currently uses the hidden SQLite compatibility provider.
+- Durable `data open` now uses DISP's native fixed-page storage and write-ahead recovery
+  format. Advanced indexes, joins, query optimization, replication, and distributed
+  storage remain under development. SQLite is available only through the separate
+  compatibility `Database` API.
 - The package manager, debugger, formatter, language server, self-hosting compiler,
   freestanding OS target, GPU toolchain, and full Page renderer are not complete.
 - The installer is not yet code-signed, so Windows may show an unknown-publisher
@@ -51,4 +53,3 @@ Run it from a new terminal:
 ```text
 disp hello.disp
 ```
-
