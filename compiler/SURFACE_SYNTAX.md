@@ -417,11 +417,14 @@ primary-key insertion/upsert, and guarded removal. External values are evaluated
 `DataStore` and `Database` are distinct nominal types, so a data store cannot invoke raw
 SQL methods.
 
-`data open Path(...)` creates or opens a durable `DataStore`. Its physical provider is
-currently SQLite, hidden behind the same checked plan boundary, while the DISP-native
-page, journal, and recovery format is developed. This distinction is internal: source
-syntax and the HIR/MIR Data plan do not change with the provider. The interpreter
-executes matching semantics as a differential oracle.
+`data open Path(...)` creates or opens a durable `DataStore` backed by DISP's native v2
+storage format. The file is split into fixed 4096-byte pages with header, page, and payload
+integrity checks. Each mutation commits only changed pages through a synced write-ahead log;
+opening the store rolls a committed log forward after interruption. An operating-system lock
+prevents a second process or store from mutating the same path concurrently, and the lock is
+released deterministically when the store is dropped. Version 1 snapshots remain readable and
+migrate on their next successful mutation. Interpreter and native execution share the exact
+format and recovery behavior.
 
 ## Collection loops
 

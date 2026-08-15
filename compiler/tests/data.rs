@@ -19,6 +19,60 @@ fn source_path(path: &std::path::Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
+    })
+}
+
+fn legacy_empty_snapshot() -> Vec<u8> {
+    let payload = 0_u32.to_le_bytes();
+    let mut bytes = Vec::with_capacity(32 + payload.len());
+    bytes.extend_from_slice(b"DISPDB\x1a\n");
+    bytes.extend_from_slice(&1_u32.to_le_bytes());
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(&fnv1a(&payload).to_le_bytes());
+    bytes.extend_from_slice(&payload);
+    bytes
+}
+
+fn committed_wal(old: &[u8], new: &[u8]) -> Vec<u8> {
+    const PAGE_SIZE: usize = 4096;
+    const HEADER_SIZE: usize = 64;
+    const RECORD_SIZE: usize = 8 + PAGE_SIZE;
+
+    assert_eq!(new.len() % PAGE_SIZE, 0);
+    let pages = new.len() / PAGE_SIZE;
+    let changed = new
+        .chunks_exact(PAGE_SIZE)
+        .enumerate()
+        .filter(|(page, bytes)| {
+            let start = page * PAGE_SIZE;
+            old.get(start..start + PAGE_SIZE) != Some(*bytes)
+        })
+        .collect::<Vec<_>>();
+    assert!(changed.iter().any(|(page, _)| *page == 0));
+
+    let mut wal = vec![0_u8; HEADER_SIZE + changed.len() * RECORD_SIZE];
+    wal[..8].copy_from_slice(b"DISPWAL\n");
+    wal[8..12].copy_from_slice(&1_u32.to_le_bytes());
+    wal[12..16].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+    wal[16..24].copy_from_slice(&new[16..24]);
+    wal[24..32].copy_from_slice(&(pages as u64).to_le_bytes());
+    wal[32..40].copy_from_slice(&(changed.len() as u64).to_le_bytes());
+    for (record, (page, bytes)) in changed.into_iter().enumerate() {
+        let start = HEADER_SIZE + record * RECORD_SIZE;
+        wal[start..start + 8].copy_from_slice(&(page as u64).to_le_bytes());
+        wal[start + 8..start + RECORD_SIZE].copy_from_slice(bytes);
+    }
+    let records_checksum = fnv1a(&wal[HEADER_SIZE..]);
+    wal[40..48].copy_from_slice(&records_checksum.to_le_bytes());
+    let header_checksum = fnv1a(&wal[..56]);
+    wal[56..64].copy_from_slice(&header_checksum.to_le_bytes());
+    wal
+}
+
 fn native_output(name: &str, source: &str) -> Option<String> {
     let path = std::env::temp_dir().join(format!("disp-data-{name}.disp"));
     fs::write(&path, source).unwrap();
@@ -161,6 +215,8 @@ fn main() {{ print(match seed() {{ Ok(value) => value, Err(error) => 0 }}) }}
 
     let bytes = fs::read(&path).unwrap();
     assert_eq!(&bytes[..8], b"DISPDB\x1a\n");
+    assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 2);
+    assert_eq!(bytes.len() % 4096, 0);
     assert!(!bytes.starts_with(b"SQLite format 3"));
 
     let reopen = format!(
@@ -178,6 +234,130 @@ fn main() {{ print(match load() {{ Ok(value) => value, Err(error) => false }}) }
 "#
     );
     assert_eq!(run_source(&reopen).unwrap(), ["true"]);
+}
+
+#[test]
+fn legacy_snapshots_migrate_to_fixed_pages_in_both_engines() {
+    let interpreted = data_path("legacy-interpreter");
+    let native = data_path("legacy-native");
+    fs::write(&interpreted, legacy_empty_snapshot()).unwrap();
+    fs::write(&native, legacy_empty_snapshot()).unwrap();
+
+    let migrate = |path: &std::path::Path| {
+        let path = source_path(path);
+        format!(
+            r#"
+data Item {{ id: int primary name: String }}
+fn migrate() -> Result<bool, DataError> {{
+    var store = data open Path("{path}")?
+    changed = data add Item {{ id: 1, name: "migrated" }} in store?
+    return Ok(changed == 1)
+}}
+fn main() {{ match migrate() {{ Ok(value) => print(value), Err(error) => print(error) }} }}
+"#
+        )
+    };
+
+    assert_eq!(run_source(&migrate(&interpreted)).unwrap(), ["true"]);
+    let interpreted_bytes = fs::read(&interpreted).unwrap();
+    assert_eq!(
+        u32::from_le_bytes(interpreted_bytes[8..12].try_into().unwrap()),
+        2
+    );
+    assert_eq!(interpreted_bytes.len() % 4096, 0);
+
+    if let Some(output) = native_output("legacy-migration", &migrate(&native)) {
+        assert_eq!(output, "true\n");
+        assert_eq!(interpreted_bytes, fs::read(&native).unwrap());
+    }
+}
+
+#[test]
+fn committed_wal_recovers_identically_in_interpreter_and_native() {
+    let template = data_path("wal-template");
+    let template_source = source_path(&template);
+    let seed = format!(
+        r#"
+data Item {{ id: int primary name: String }}
+fn seed() -> Result<bool, DataError> {{
+    var store = data open Path("{template_source}")?
+    changed = data add Item {{ id: 1, name: "before" }} in store?
+    return Ok(changed == 1)
+}}
+fn main() {{ print(match seed() {{ Ok(value) => value, Err(_) => false }}) }}
+"#
+    );
+    assert_eq!(run_source(&seed).unwrap(), ["true"]);
+    let before = fs::read(&template).unwrap();
+
+    let update = format!(
+        r#"
+data Item {{ id: int primary name: String }}
+fn update() -> Result<bool, DataError> {{
+    var store = data open Path("{template_source}")?
+    changed = data save Item {{ id: 1, name: "after" }} in store?
+    return Ok(changed == 1)
+}}
+fn main() {{ print(match update() {{ Ok(value) => value, Err(_) => false }}) }}
+"#
+    );
+    assert_eq!(run_source(&update).unwrap(), ["true"]);
+    let after = fs::read(&template).unwrap();
+    let wal = committed_wal(&before, &after);
+
+    let verify = |path: &std::path::Path| {
+        let path = source_path(path);
+        format!(
+            r#"
+data Item {{ id: int primary name: String }}
+fn verify() -> Result<bool, DataError> {{
+    var store = data open Path("{path}")?
+    rows = data find Item in store where name == "after"?
+    return Ok(rows.len() == 1)
+}}
+fn main() {{ match verify() {{ Ok(value) => print(value), Err(error) => print(error) }} }}
+"#
+        )
+    };
+
+    let interpreted = data_path("wal-interpreter");
+    fs::write(&interpreted, &before).unwrap();
+    fs::write(format!("{}.wal", interpreted.display()), &wal).unwrap();
+    assert_eq!(run_source(&verify(&interpreted)).unwrap(), ["true"]);
+    assert_eq!(fs::read(&interpreted).unwrap(), after);
+    assert!(!std::path::Path::new(&format!("{}.wal", interpreted.display())).exists());
+
+    let native = data_path("wal-native");
+    fs::write(&native, &before).unwrap();
+    fs::write(format!("{}.wal", native.display()), &wal).unwrap();
+    if let Some(output) = native_output("wal-recovery", &verify(&native)) {
+        assert_eq!(output, "true\n");
+        assert_eq!(fs::read(&native).unwrap(), after);
+        assert!(!std::path::Path::new(&format!("{}.wal", native.display())).exists());
+    }
+}
+
+#[test]
+fn a_second_open_is_rejected_while_the_first_store_owns_the_lock() {
+    let interpreted = source_path(&data_path("lock-interpreter"));
+    let native = source_path(&data_path("lock-native"));
+    let source = |path: &str| {
+        format!(
+            r#"
+fn check() -> Result<bool, DataError> {{
+    var first = data open Path("{path}")?
+    second = data open Path("{path}")
+    return Ok(match second {{ Err(_) => true, Ok(_) => false }})
+}}
+fn main() {{ print(match check() {{ Ok(value) => value, Err(_) => false }}) }}
+"#
+        )
+    };
+
+    assert_eq!(run_source(&source(&interpreted)).unwrap(), ["true"]);
+    if let Some(output) = native_output("exclusive-data-lock", &source(&native)) {
+        assert_eq!(output, "true\n");
+    }
 }
 
 #[test]

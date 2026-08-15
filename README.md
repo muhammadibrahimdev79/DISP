@@ -56,10 +56,12 @@ compiler-owned `data add`, `data save`, `data find`, and guarded `data remove` e
 lower through typed logical Data plans in HIR/MIR. `data memory` uses DISP's own typed row store
 and evaluates those plans directly in both native binaries and the interpreter; it does not
 translate them to SQL. `DataStore` is nominally separate from the compatibility `Database` type,
-so raw SQL methods cannot leak into DISP Data code. Durable `data open` uses DISP's own bounded,
-versioned snapshot format with integrity checking, atomic replacement, recovery backups, and
-byte-for-byte compatible interpreter/native semantics. DataStore-only native programs do not
-link SQLite; SQLite remains solely behind the explicitly selected compatibility `Database` API.
+so raw SQL methods cannot leak into DISP Data code. Durable `data open` uses DISP's own bounded
+v2 format with fixed 4096-byte pages, page and payload integrity checks, changed-page
+write-ahead commits, crash recovery, exclusive operating-system-backed process locking, and
+automatic migration from v1 snapshots. Interpreter and native execution use the same bytes and
+recovery rules. DataStore-only native programs do not link SQLite; SQLite remains solely behind
+the explicitly selected compatibility `Database` API.
 The implementation
 remains under active development and should not
 yet be treated as a stable production language.

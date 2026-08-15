@@ -2766,6 +2766,7 @@ struct NativeDataStore {
     tables: HashMap<String, NativeDataTable>,
     pending: HashMap<String, data_store::Table>,
     path: Option<PathBuf>,
+    lock: Option<Arc<data_store::Lock>>,
 }
 
 struct RuntimeDatabaseState {
@@ -2883,7 +2884,8 @@ impl RuntimeDatabase {
     }
 
     fn native_open(path: PathBuf) -> io::Result<Self> {
-        let snapshot = data_store::load(&path)?;
+        let lock = Arc::new(data_store::Lock::acquire(&path)?);
+        let snapshot = data_store::load(&path, &lock)?;
         for table in &snapshot.tables {
             for row in &table.rows {
                 let row = String::from_utf8(row.clone())
@@ -2903,6 +2905,7 @@ impl RuntimeDatabase {
                 tables: HashMap::new(),
                 pending,
                 path: Some(path),
+                lock: Some(lock),
             }),
         }))))
     }
@@ -3430,7 +3433,11 @@ fn persist_native_data(program: &Program, store: &NativeDataStore) -> io::Result
     let Some(path) = &store.path else {
         return Ok(());
     };
-    data_store::commit(path, &native_data_snapshot(program, store)?)
+    let lock = store
+        .lock
+        .as_deref()
+        .ok_or_else(|| io::Error::other("persistent DISP Data store has no lock"))?;
+    data_store::commit(path, &native_data_snapshot(program, store)?, lock)
 }
 
 fn mutate_native_data<T>(
