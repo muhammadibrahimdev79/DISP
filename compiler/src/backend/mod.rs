@@ -213,7 +213,29 @@ fn build_paths(source_path: &Path) -> Result<BuildPaths, Diagnostic> {
             }
         })
         .collect::<String>();
-    let root = parent.join("build");
+    let root = if let Some(configured) =
+        std::env::var_os("DISP_BUILD_ROOT").filter(|value| !value.is_empty())
+    {
+        let absolute_source = if source_path.is_absolute() {
+            source_path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|cause| error(&format!("could not resolve current directory: {cause}")))?
+                .join(source_path)
+        };
+        let mut digest = Sha256::new();
+        digest.update(b"DISP external build path v1\0");
+        digest.update(absolute_source.to_string_lossy().as_bytes());
+        let identity = digest
+            .finalize()
+            .iter()
+            .take(12)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        PathBuf::from(configured).join(identity)
+    } else {
+        parent.join("build")
+    };
     let directory = root.join(&safe_stem);
     Ok(BuildPaths {
         c: directory.join(format!("{safe_stem}.backend.c")),
