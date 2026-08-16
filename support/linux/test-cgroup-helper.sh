@@ -6,7 +6,7 @@ if [ "$(id -u)" -eq 0 ]; then
     echo "test-cgroup-helper: run hostile probes as an unprivileged user" >&2
     exit 1
 fi
-if [ ! -u "${helper}" ] || [ ! -x "${helper}" ]; then
+if [ ! -u "${helper}" ] || [ ! -g "${helper}" ] || [ ! -x "${helper}" ]; then
     echo "test-cgroup-helper: trusted installed helper is unavailable" >&2
     exit 1
 fi

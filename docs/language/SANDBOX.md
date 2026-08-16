@@ -88,8 +88,8 @@ cgroup v2 `pids.max` guarantee; the fallback intentionally makes no aggregate-co
 
 Both the shared Rust launcher and generated native runtime inspect only the fixed system identity
 `/usr/libexec/disp-cgroup-launch`. It is eligible only when it is a regular file owned by UID/GID 0,
-has the set-user-ID bit, has no group/other write bit, and is executable. It is never resolved from
-`PATH` and no environment variable can substitute another helper.
+has the set-user-ID and set-group-ID bits, has no group/other write bit, and is executable. It is
+never resolved from `PATH` and no environment variable can substitute another helper.
 
 `DISP_LINUX_HARD_SANDBOX` accepts exactly:
 
@@ -104,7 +104,7 @@ monitors aggregate `cpu.stat` plus the wall deadline. The worker enters the leaf
 restores the invoking user's real/effective/saved UID and GID, verifies the drop, installs
 no-new-privs and the escape filter, closes private descriptors, then executes the canonical target.
 On completion or violation the supervisor uses `cgroup.kill` and removes the leaf. The helper and a
-complete generated runtime both cross-compile for x86-64 Linux; setuid installation and hostile
+complete generated runtime both cross-compile for x86-64 Linux; setuid/setgid installation and hostile
 runtime execution remain mandatory evidence before this profile is called complete.
 
 The current differential lifecycle probe starts a real grandchild which would write a delayed

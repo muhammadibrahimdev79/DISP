@@ -24,8 +24,8 @@ The helper is not enabled merely because a binary with this name exists. Packagi
 
 1. compile the exact reviewed source with stack protection, fortified libc calls, PIE, immediate
    binding, and full RELRO;
-2. install it at a system path owned by UID/GID 0, with no group/other write bit and the set-user-ID
-   bit enabled;
+2. install it at a system path owned by UID/GID 0, with no group/other write bit and both the
+   set-user-ID and set-group-ID bits enabled;
 3. create `/sys/fs/cgroup/disp` as a root-owned, non-group/other-writable cgroup v2 directory at
    boot;
 4. enable the `cpu`, `memory`, and `pids` controllers at both the parent and DISP subtree levels;

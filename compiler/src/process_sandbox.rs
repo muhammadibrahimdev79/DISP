@@ -582,7 +582,7 @@ fn linux_launch_command(
     let trusted = metadata.is_file()
         && metadata.uid() == 0
         && metadata.gid() == 0
-        && metadata.mode() & 0o4_000 != 0
+        && metadata.mode() & 0o6_000 == 0o6_000
         && metadata.mode() & 0o022 == 0;
     if !trusted {
         if mode == "auto" {
@@ -590,7 +590,7 @@ fn linux_launch_command(
         }
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "required Linux cgroup helper must be root-owned, setuid, and not group/other writable",
+            "required Linux cgroup helper must be root-owned, setuid/setgid, and not group/other writable",
         ));
     }
     let mut helper_arguments = vec![

@@ -28,12 +28,12 @@ case ",${mount_options}," in
         exit 1
         ;;
 esac
-install -o root -g root -m 4755 "${temporary}" /usr/libexec/disp-cgroup-launch
+install -o root -g root -m 6755 "${temporary}" /usr/libexec/disp-cgroup-launch
 install -o root -g root -m 0755 "${script_dir}/disp-cgroup-setup" \
     /usr/libexec/disp-cgroup-setup
 install -o root -g root -m 0644 "${script_dir}/disp-cgroup-setup.service" \
     /etc/systemd/system/disp-cgroup-setup.service
-if [ "$(stat -c '%u:%g:%a' /usr/libexec/disp-cgroup-launch)" != "0:0:4755" ]; then
+if [ "$(stat -c '%u:%g:%a' /usr/libexec/disp-cgroup-launch)" != "0:0:6755" ]; then
     echo "install-cgroup-helper: trusted helper identity was not established" >&2
     exit 1
 fi
