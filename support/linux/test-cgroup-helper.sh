@@ -87,7 +87,10 @@ static int delayed_descendant(const char *marker) {
     usleep(800000);
     int fd = open(marker, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (fd >= 0) {
-        write(fd, "escaped", 7);
+        if (write(fd, "escaped", 7) != 7) {
+            close(fd);
+            _exit(51);
+        }
         close(fd);
     }
     _exit(0);
