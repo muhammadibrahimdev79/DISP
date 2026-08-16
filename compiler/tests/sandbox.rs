@@ -271,7 +271,8 @@ fn runtime_engines_inherit_linux_escape_filter() {
     let source = format!(
         r#"
 fn contained() -> Result<bool, IoError> {{
-    output = Process.run(Path("{}"), List.new())?
+    var arguments: List<String> = List.new()
+    output = Process.run(Path("{}"), arguments)?
     return Ok(output.success())
 }}
 fn main() {{ print(match contained() {{ Ok(value) => value, Err(error) => false }}) }}
@@ -306,7 +307,8 @@ int main(void) {
     let source = format!(
         r#"
 fn contained() -> Result<bool, IoError> {{
-    output = Process.run(Path("{}"), List.new())?
+    var arguments: List<String> = List.new()
+    output = Process.run(Path("{}"), arguments)?
     return Ok(!output.success())
 }}
 fn main() {{ print(match contained() {{ Ok(value) => value, Err(error) => false }}) }}
@@ -342,7 +344,8 @@ int main(void) {
     let source = format!(
         r#"
 fn contained() -> Result<bool, IoError> {{
-    output = Process.run(Path("{}"), List.new())?
+    var arguments: List<String> = List.new()
+    output = Process.run(Path("{}"), arguments)?
     return Ok(!output.success())
 }}
 fn main() {{ print(match contained() {{ Ok(value) => value, Err(error) => false }}) }}

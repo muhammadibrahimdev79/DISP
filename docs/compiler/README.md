@@ -54,7 +54,7 @@ Implemented executable subset:
 
 The numeric runtime implements distinct checked signed and unsigned widths, `int`/`uint`, `f32`/`f64`, safe widening, checked explicit conversions, and wrapping/saturating integer operations. Generic functions and ADTs use substitution-based inference, and traits use coherent static dispatch with exact method contracts, complete associated-type definitions, order-independent constraint proofs, and cycle-safe selection.
 
-The initial native backend supports Windows x86-64. It lowers validated, monomorphized MIR to deterministic C as a temporary backend IR, asks GCC (discovered through `PATH`) for a real PE/COFF object, and links a standalone `.exe`. This is intentionally described as a C/object backend, not LLVM. Calling-convention classification and concrete layouts remain separate from code generation so a direct machine-code backend can replace the temporary lowering without touching the frontend.
+The initial native backend supports Windows and Linux x86-64. It lowers validated, monomorphized MIR to deterministic C as a temporary backend IR, asks GCC (discovered through `PATH`) for a native object, and links a standalone executable. This is intentionally described as a C/object backend, not LLVM. Calling-convention classification and concrete layouts remain separate from code generation so a direct machine-code backend can replace the temporary lowering without touching the frontend.
 
 From the repository root, enter the compiler crate and run:
 
