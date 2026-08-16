@@ -262,7 +262,6 @@ static int configure_worker(
     gid_t group,
     unsigned long long memory,
     unsigned long long cpu_millis,
-    unsigned long long processes,
     int deny_network
 ) {
     char pid_text[32];
@@ -272,18 +271,14 @@ static int configure_worker(
 
     rlim_t memory_limit = (rlim_t)memory;
     rlim_t cpu_seconds = (rlim_t)(cpu_millis / 1000 + (cpu_millis % 1000 != 0));
-    rlim_t process_limit = (rlim_t)processes;
     if ((unsigned long long)memory_limit != memory ||
-        (unsigned long long)cpu_seconds != cpu_millis / 1000 + (cpu_millis % 1000 != 0) ||
-        (unsigned long long)process_limit != processes) {
+        (unsigned long long)cpu_seconds != cpu_millis / 1000 + (cpu_millis % 1000 != 0)) {
         errno = EOVERFLOW;
         return -1;
     }
     struct rlimit address = { memory_limit, memory_limit };
     struct rlimit cpu = { cpu_seconds, cpu_seconds };
-    struct rlimit count = { process_limit, process_limit };
-    if (setrlimit(RLIMIT_AS, &address) != 0 || setrlimit(RLIMIT_CPU, &cpu) != 0 ||
-        setrlimit(RLIMIT_NPROC, &count) != 0) return -1;
+    if (setrlimit(RLIMIT_AS, &address) != 0 || setrlimit(RLIMIT_CPU, &cpu) != 0) return -1;
 
     if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) != 0) return -1;
     if (setresgid(group, group, group) != 0 || setresuid(user, user, user) != 0) return -1;
@@ -475,7 +470,7 @@ int main(int argc, char **argv) {
         return 125;
     }
     if (child == 0) {
-        if (configure_worker(job, supervisor, user, group, memory, cpu_millis, processes,
+        if (configure_worker(job, supervisor, user, group, memory, cpu_millis,
             deny_network) != 0) {
             report("configure worker boundary");
             _exit(126);
