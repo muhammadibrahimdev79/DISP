@@ -822,17 +822,20 @@ the interpreter provides the same language-level contract through the host TLS i
 `Http.get` and `Http.get_timeout` lower to lazy native futures. The native Windows implementation
 uses WinHTTP with the system proxy and trust configuration, certificate revocation checking,
 TLS 1.2 or newer, at most ten automatic redirects, and explicit 64 KiB header and 16 MiB body
-limits. HTTPS-to-HTTP redirects are rejected. Request state is reference-counted across the future
-and worker; timeout, cancellation, success, error, future drop, and response drop each have a
-single deterministic ownership path.
+limits. The POSIX implementation uses the platform libcurl with certificate and host verification,
+TLS 1.2 or newer, shared connection/DNS/TLS-session caches, and the same bounded callbacks and
+redirect policy; native HTTP linking therefore requires the libcurl development package.
+HTTPS-to-HTTP redirects are rejected. Request state is reference-counted across the future and
+worker; timeout, cancellation, success, error, future drop, and response drop each have a single
+deterministic ownership path.
 
 `Http.post`, `put`, `patch`, and `delete` share that future machinery. `HttpRequest` is a concrete
 owned pointer type whose functional `header`, `text`, and `bytes` operations consume their input.
 The resulting `send` future owns method, URL, headers, and body snapshots. Native requests pass
-bounded owned input to WinHTTP; non-GET/HEAD methods and any request carrying custom headers or a
+bounded owned input to the platform client; non-GET/HEAD methods and any request carrying custom headers or a
 body disable automatic redirects so credentials and non-idempotent bodies cannot be replayed.
-The native runtime keeps one process-wide WinHTTP session, allowing the operating system to pool
-connections while per-request timeout and redirect policy remains isolated. The interpreter uses
+The native runtime keeps one process-wide session/cache, allowing the operating system client to
+pool connections while per-request timeout and redirect policy remains isolated. The interpreter uses
 a deterministic bounded pool of at most 32 origins and two idle connections per origin. Only
 fully framed HTTP/1.1 responses without `Connection: close` return a connection to either path.
 

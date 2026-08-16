@@ -40,7 +40,7 @@ jobs:
 
       - name: Install Linux native dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install --yes build-essential pkg-config libssl-dev device-tree-compiler qemu-system-arm qemu-system-x86
+        run: sudo apt-get update && sudo apt-get install --yes build-essential pkg-config libssl-dev libcurl4-openssl-dev device-tree-compiler qemu-system-arm qemu-system-x86
 
       - name: Verify formatting
         run: cargo fmt --all -- --check

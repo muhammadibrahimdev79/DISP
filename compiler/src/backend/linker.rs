@@ -82,6 +82,9 @@ pub fn compile_and_link(
     }
     if !cfg!(windows) {
         link.push("-pthread".into());
+        if features.http {
+            link.push("-lcurl".into());
+        }
     } else {
         link.push("-lshell32".into());
         link.push("-lbcrypt".into());
