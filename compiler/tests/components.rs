@@ -258,17 +258,17 @@ fn invoke_probe_with_arguments(
     let attempts = 20;
     #[cfg(not(windows))]
     let attempts = 1;
-    for attempt in 0..attempts {
+    for _attempt in 0..attempts {
         #[cfg(windows)]
-        let executable = if attempt == 0 {
+        let executable = if _attempt == 0 {
             original.clone()
         } else {
-            let alternate = launch_root.join(format!("disp-component-probe-{mode}-{attempt}.exe"));
+            let alternate = launch_root.join(format!("disp-component-probe-{mode}-{_attempt}.exe"));
             let source = original.parent().unwrap().join("component.c");
             let output = Command::new("gcc")
                 .arg(&source)
                 .arg("-O2")
-                .arg(format!("-DDISP_PROBE_VARIANT={attempt}"))
+                .arg(format!("-DDISP_PROBE_VARIANT={_attempt}"))
                 .arg("-o")
                 .arg(&alternate)
                 .arg("-ladvapi32")
