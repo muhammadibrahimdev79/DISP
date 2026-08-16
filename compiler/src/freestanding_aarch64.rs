@@ -637,12 +637,6 @@ impl ScalarCompiler {
             .emit(0xb940_0000 | ((offset / 4) << 10) | (base << 5) | target);
     }
 
-    fn emit_ldr_x(&mut self, target: u32, base: u32, offset: u32) {
-        debug_assert!(offset.is_multiple_of(8) && offset / 8 < 4096);
-        self.assembler
-            .emit(0xf940_0000 | ((offset / 8) << 10) | (base << 5) | target);
-    }
-
     fn emit_ldrb(&mut self, target: u32, base: u32, offset: u32) {
         debug_assert!(offset < 4096);
         self.assembler
@@ -655,10 +649,6 @@ impl ScalarCompiler {
 
     fn emit_reverse_w(&mut self, target: u32, source: u32) {
         self.assembler.emit(0x5ac0_0800 | (source << 5) | target);
-    }
-
-    fn emit_reverse_x(&mut self, target: u32, source: u32) {
-        self.assembler.emit(0xdac0_0c00 | (source << 5) | target);
     }
 
     fn emit_add_x_register(&mut self, target: u32, left: u32, right: u32) {
@@ -1124,8 +1114,7 @@ impl ScalarCompiler {
         self.emit_compare_w_immediate(6, 1);
         self.assembler.conditional(1, property_done, self.main_span);
         self.emit_compare_w_immediate(14, 7);
-        self.assembler
-            .conditional(1, self.dtb_failure, self.main_span);
+        self.assembler.conditional(1, property_done, self.main_span);
         let memory_match = self.assembler.label();
         self.branch_if_c_string_equals(16, 18, b"memory\0", memory_match);
         self.assembler.branch(property_done, self.main_span);
@@ -1145,10 +1134,21 @@ impl ScalarCompiler {
         self.emit_compare_w_immediate(14, 16);
         self.assembler
             .conditional(3, self.dtb_failure, self.main_span);
-        self.emit_ldr_x(10, 16, 0);
-        self.emit_reverse_x(10, 10);
-        self.emit_ldr_x(11, 16, 8);
-        self.emit_reverse_x(11, 11);
+        // FDT property payloads are only four-byte aligned. Reconstruct each
+        // two-cell value from aligned word loads so SCTLR alignment checking
+        // cannot fault on a valid `reg` property.
+        self.emit_ldr_w(10, 16, 0);
+        self.emit_reverse_w(10, 10);
+        self.emit_shift_left_x(10, 10, 32);
+        self.emit_ldr_w(15, 16, 4);
+        self.emit_reverse_w(15, 15);
+        self.emit_orr_x(10, 10, 15);
+        self.emit_ldr_w(11, 16, 8);
+        self.emit_reverse_w(11, 11);
+        self.emit_shift_left_x(11, 11, 32);
+        self.emit_ldr_w(15, 16, 12);
+        self.emit_reverse_w(15, 15);
+        self.emit_orr_x(11, 11, 15);
         self.set_dtb_node_flag(2);
         self.assembler.branch(property_done, self.main_span);
 
@@ -3345,6 +3345,54 @@ fn main() {
                 "missing dynamic DTB/MMU instruction {instruction:08x}"
             );
         }
+
+        let aligned_reg_load = [
+            0xb940_020au32, // ldr w10,[x16]
+            0x5ac0_094a,    // rev w10,w10
+            0xd360_7d4a,    // lsl x10,x10,#32
+            0xb940_060f,    // ldr w15,[x16,#4]
+            0x5ac0_09ef,    // rev w15,w15
+            0xaa0f_014a,    // orr x10,x10,x15
+            0xb940_0a0b,    // ldr w11,[x16,#8]
+            0x5ac0_096b,    // rev w11,w11
+            0xd360_7d6b,    // lsl x11,x11,#32
+            0xb940_0e0f,    // ldr w15,[x16,#12]
+            0x5ac0_09ef,    // rev w15,w15
+            0xaa0f_016b,    // orr x11,x11,x15
+        ]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+        assert!(
+            first
+                .windows(aligned_reg_load.len())
+                .any(|bytes| bytes == aligned_reg_load),
+            "FDT two-cell values must use four-byte-aligned word loads"
+        );
+        assert!(
+            !first
+                .windows(4)
+                .any(|bytes| bytes == 0xf940_020au32.to_le_bytes()),
+            "FDT property payloads must not use alignment-sensitive xword loads"
+        );
+
+        let words = first
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let device_type_check = words
+            .windows(2)
+            .position(|pair| pair[0] == 0x7100_1ddf && pair[1] & 0xff00_001f == 0x5400_0001)
+            .expect("the DTB parser must check the memory device_type length");
+        let branch_index = device_type_check + 1;
+        let immediate = ((words[branch_index] >> 5) & 0x7ffff) as i32;
+        let signed_offset = (immediate << 13) >> 13;
+        let mismatch_target = (branch_index as isize + signed_offset as isize) as usize;
+        assert_eq!(
+            words[mismatch_target],
+            0xaa11_03e2, // mov x2,x17 at property_done
+            "unrelated direct-child device_type properties must be ignored safely"
+        );
 
         let root_offset = first.len() - PAGE_TABLE_COUNT * PAGE_BYTES;
         let descriptor = |table: usize, index: usize| {
