@@ -3,7 +3,9 @@ use disp::{
     process_sandbox::{SandboxProfile, SandboxedCommand},
     run_source,
 };
-use std::{fs, path::PathBuf, process::Command, thread, time::Duration};
+use std::{fs, path::PathBuf, process::Command};
+#[cfg(windows)]
+use std::{thread, time::Duration};
 
 const INNER_PROBE: &str = "DISP_SANDBOX_PROBE_INNER";
 
@@ -120,6 +122,7 @@ fn differential_probe(name: &str, source: &str, limits: &[(&str, &str)], test_na
     );
 }
 
+#[cfg(any(target_os = "linux", windows))]
 fn enter_isolated_probe(name: &str, limits: &[(&str, &str)], test_name: &str) -> bool {
     if std::env::var(INNER_PROBE).as_deref() == Ok(name) {
         return true;
@@ -334,6 +337,25 @@ int main(void) {
     int status = 0;
     return waitpid(child, &status, 0) == child ? 0 : 44;
 }
+"#,
+    );
+    let source = format!(
+        r#"
+fn contained() -> Result<bool, IoError> {{
+    output = Process.run(Path("{}"), List.new())?
+    return Ok(!output.success())
+}}
+fn main() {{ print(match contained() {{ Ok(value) => value, Err(error) => false }}) }}
+"#,
+        probe.display()
+    );
+    differential_probe(
+        "linux-nproc",
+        &source,
+        &[("DISP_CHILD_MAX_PROCESSES", "1")],
+        "child_fork_is_bounded_by_linux_nproc_defense_in_depth",
+    );
+}
 
 #[cfg(target_os = "linux")]
 #[test]
@@ -353,25 +375,6 @@ fn linux_hard_profile_configuration_fails_closed() {
     assert!(
         error.to_string().contains("auto, required, or off"),
         "{error}"
-    );
-}
-"#,
-    );
-    let source = format!(
-        r#"
-fn contained() -> Result<bool, IoError> {{
-    output = Process.run(Path("{}"), List.new())?
-    return Ok(!output.success())
-}}
-fn main() {{ print(match contained() {{ Ok(value) => value, Err(error) => false }}) }}
-"#,
-        probe.display()
-    );
-    differential_probe(
-        "linux-nproc",
-        &source,
-        &[("DISP_CHILD_MAX_PROCESSES", "1")],
-        "child_fork_is_bounded_by_linux_nproc_defense_in_depth",
     );
 }
 
