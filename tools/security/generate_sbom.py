@@ -21,11 +21,28 @@ import struct
 import subprocess
 import sys
 import tomllib
+import uuid
 from urllib.parse import quote
 
 
 GENERATOR_VERSION = "1"
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def sbom_serial_number(
+    root_reference: str, components: list[dict], dependencies: list[dict]
+) -> str:
+    """Return the stable RFC 4122 identifier required by GitHub SBOM attestations."""
+    inventory = json.dumps(
+        {
+            "root": root_reference,
+            "components": sorted(components, key=lambda item: item["bom-ref"]),
+            "dependencies": sorted(dependencies, key=lambda item: item["ref"]),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"urn:uuid:{uuid.uuid5(uuid.NAMESPACE_URL, inventory)}"
 
 
 def run(arguments: list[str]) -> str:
@@ -570,6 +587,7 @@ def main() -> int:
     bom = {
         "bomFormat": "CycloneDX",
         "specVersion": "1.6",
+        "serialNumber": sbom_serial_number(root_reference, components, dependencies),
         "version": 1,
         "metadata": metadata_section,
         "components": sorted(components, key=lambda item: item["bom-ref"]),

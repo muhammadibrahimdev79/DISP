@@ -107,7 +107,7 @@ fn assert_linux_release_sbom_policy() {
         "--manifest fuzz/Cargo.toml",
         "verify_sbom.py --require-native target/sbom/disp.cdx.json",
         "verify_sbom.py --require-native target/sbom/crypto-native.cdx.json",
-        "actions/upload-artifact@v4",
+        "actions/upload-artifact@v7",
         "if-no-files-found: error",
     ] {
         assert!(
@@ -127,6 +127,7 @@ fn assert_linux_release_sbom_policy() {
         "sha256_file",
         "CycloneDX",
         "specVersion",
+        "serialNumber",
     ] {
         assert!(
             generator.contains(required),
@@ -135,6 +136,7 @@ fn assert_linux_release_sbom_policy() {
     }
     let verifier = fs::read_to_string(root.join("tools/security/verify_sbom.py")).unwrap();
     assert!(verifier.contains("--require-native"));
+    assert!(verifier.contains("GitHub-attestable UUID serial number"));
     assert!(verifier.contains("dependency target is absent"));
     assert!(verifier.contains("malformed component hash"));
 }

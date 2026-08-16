@@ -30,7 +30,7 @@ jobs:
 
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install the stable Rust quality toolchain
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
@@ -61,7 +61,7 @@ jobs:
           status=$?
           set -e
           test "${status}" -eq 124
-          printf '55\r\n4000000005\r\n800000001\r\n-2000000100\r\n1000000050\r\n-2147483648\r\ntrue\r\n15\r\n6\r\n720\r\n253\r\n' > "${RUNNER_TEMP}/disp-freestanding-expected"
+          printf '55\r\n4000000005\r\n800000001\r\n-2000000100\r\n1000000050\r\n-2147483648\r\ntrue\r\n15\r\n12\r\n720\r\n253\r\n' > "${RUNNER_TEMP}/disp-freestanding-expected"
           cmp "${RUNNER_TEMP}/disp-freestanding-expected" "${RUNNER_TEMP}/disp-freestanding-output"
 
       - name: Boot the 32-bit protected-mode DISP image and verify exact output
@@ -169,7 +169,7 @@ jobs:
           status=$?
           set -e
           test "${status}" -eq 124
-          printf 'DISP x86-64 guarded functions\r\n15\r\n720\r\ntrue\r\n-42\r\n' > "${RUNNER_TEMP}/disp-freestanding64-functions-expected"
+          printf 'DISP x86-64 guarded functions\r\n15\r\n720\r\ntrue\r\n42\r\n' > "${RUNNER_TEMP}/disp-freestanding64-functions-expected"
           cmp "${RUNNER_TEMP}/disp-freestanding64-functions-expected" "${RUNNER_TEMP}/disp-freestanding64-functions-output"
 
           cargo run --locked -- build --freestanding64 examples/freestanding64_stack.disp

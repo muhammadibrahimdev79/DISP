@@ -10,6 +10,7 @@ on:
       - "compiler/fuzz/Cargo.toml"
       - "compiler/fuzz/Cargo.lock"
       - "compiler/.cargo/audit.toml"
+      - "tools/security/**"
       - ".github/workflows/security-audit.yml"
   pull_request:
     paths:
@@ -20,6 +21,7 @@ on:
       - "compiler/fuzz/Cargo.toml"
       - "compiler/fuzz/Cargo.lock"
       - "compiler/.cargo/audit.toml"
+      - "tools/security/**"
       - ".github/workflows/security-audit.yml"
   schedule:
     - cron: "17 3 * * *"
@@ -51,7 +53,7 @@ jobs:
 
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal
@@ -100,7 +102,7 @@ jobs:
           python ../tools/security/verify_sbom.py target/sbom/fuzz.cdx.json
 
       - name: Publish verified CycloneDX SBOMs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: disp-linux-cyclonedx-sboms
           path: compiler/target/sbom/*.cdx.json
@@ -140,7 +142,7 @@ jobs:
 
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install nightly Rust with sanitizer support
         run: rustup toolchain install ${SECURITY_NIGHTLY} --profile minimal
@@ -171,7 +173,7 @@ jobs:
 
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install pinned nightly Rust
         run: rustup toolchain install ${SECURITY_NIGHTLY} --profile minimal
@@ -200,7 +202,7 @@ jobs:
 
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal
@@ -233,7 +235,7 @@ jobs:
           python ../tools/security/verify_sbom.py --require-native target/sbom/crypto-native-windows.cdx.json
 
       - name: Publish verified Windows CycloneDX SBOMs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: disp-windows-cyclonedx-sboms
           path: compiler/target/sbom/*-windows.cdx.json
@@ -278,7 +280,7 @@ jobs:
 
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal
@@ -314,7 +316,7 @@ jobs:
           python ../tools/security/verify_sbom.py --require-native target/sbom/crypto-native-macos.cdx.json
 
       - name: Publish verified macOS CycloneDX SBOMs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: disp-macos-cyclonedx-sboms
           path: compiler/target/sbom/*-macos.cdx.json

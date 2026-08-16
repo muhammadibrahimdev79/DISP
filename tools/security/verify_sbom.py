@@ -7,6 +7,7 @@ import argparse
 import json
 from pathlib import Path
 import re
+import uuid
 
 
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -20,6 +21,13 @@ def main() -> int:
     bom = json.loads(arguments.sbom.read_text(encoding="utf-8"))
     if bom.get("bomFormat") != "CycloneDX" or bom.get("specVersion") != "1.6":
         raise ValueError("SBOM is not CycloneDX 1.6")
+    serial_number = bom.get("serialNumber")
+    if not isinstance(serial_number, str) or not serial_number.startswith("urn:uuid:"):
+        raise ValueError("SBOM lacks a GitHub-attestable UUID serial number")
+    try:
+        uuid.UUID(serial_number.removeprefix("urn:uuid:"))
+    except ValueError as error:
+        raise ValueError("SBOM has a malformed UUID serial number") from error
     components = bom.get("components")
     dependencies = bom.get("dependencies")
     if not isinstance(components, list) or not components:

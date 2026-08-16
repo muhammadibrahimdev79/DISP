@@ -33,5 +33,26 @@ class MachOParserTests(unittest.TestCase):
             generate_sbom.macho_slice_imports(header + b"\0" * 8)
 
 
+class SbomIdentityTests(unittest.TestCase):
+    def test_serial_number_is_deterministic_and_inventory_bound(self) -> None:
+        components = [{"bom-ref": "pkg:cargo/disp@0.1.0", "name": "disp"}]
+        dependencies = [{"ref": "pkg:cargo/disp@0.1.0", "dependsOn": []}]
+        first = generate_sbom.sbom_serial_number(
+            "pkg:cargo/disp@0.1.0", components, dependencies
+        )
+        second = generate_sbom.sbom_serial_number(
+            "pkg:cargo/disp@0.1.0", list(reversed(components)), dependencies
+        )
+        changed = generate_sbom.sbom_serial_number(
+            "pkg:cargo/disp@0.1.0",
+            components + [{"bom-ref": "pkg:cargo/new@1.0.0", "name": "new"}],
+            dependencies,
+        )
+
+        self.assertEqual(first, second)
+        self.assertTrue(first.startswith("urn:uuid:"))
+        self.assertNotEqual(first, changed)
+
+
 if __name__ == "__main__":
     unittest.main()
