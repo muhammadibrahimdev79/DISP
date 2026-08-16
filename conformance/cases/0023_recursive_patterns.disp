@@ -1,0 +1,14 @@
+enum Choice { Left(int) Right(int) Empty }
+
+fn classify(value: Choice) -> int {
+    return match value {
+        Choice.Left(number) | Choice.Right(number) if number > 10 => 3
+        Choice.Left(0 | 1) | Choice.Right(0 | 1) => 2
+        Choice.Left(_) | Choice.Right(_) => 1
+        Choice.Empty => 0
+    }
+}
+
+fn main() {
+    print(classify(Choice.Right(1)))
+}

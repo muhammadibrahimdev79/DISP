@@ -1,0 +1,6 @@
+[package]
+name = "feature-gate"
+version = "1.0.0"
+edition = "1"
+features = ["page-preview"]
+entry = "src/main.disp"

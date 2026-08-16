@@ -1,0 +1,11 @@
+struct Holder<T> { value: T }
+
+fn hold(value: &int) -> Holder<&int> {
+    return Holder { value }
+}
+
+fn main() {
+    let number = 11
+    let holder = hold(&number)
+    print(*holder.value)
+}

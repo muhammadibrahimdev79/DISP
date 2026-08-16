@@ -1,0 +1,9 @@
+fn invalid_uart_access() uses DeviceIo {
+    unsafe uses DeviceIo {
+        Mmio.write_u32(u16(4095), u32(88))
+    }
+}
+
+fn main() {
+    invalid_uart_access()
+}

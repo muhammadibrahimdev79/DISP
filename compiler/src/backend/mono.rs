@@ -1,7 +1,7 @@
 use super::layout::substitute;
 use crate::{
     diagnostics::{Diagnostic, DiagnosticKind, Span},
-    hir, mir,
+    hir, limits, mir,
 };
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
@@ -34,13 +34,26 @@ pub fn collect(program: &mir::Program) -> Result<MonoProgram, Diagnostic> {
         substitutions: vec![],
     };
     let mut queue = VecDeque::from([entry.clone()]);
+    queue.extend(
+        program
+            .functions
+            .iter()
+            .filter(|function| function.exported)
+            .map(|function| FunctionInstance {
+                function: function.id,
+                substitutions: vec![],
+            }),
+    );
     let mut seen = BTreeSet::new();
     while let Some(instance) = queue.pop_front() {
         if !seen.insert(instance.clone()) {
             continue;
         }
-        if seen.len() > 16_384 {
-            return Err(error("monomorphization exceeded 16384 function instances"));
+        if seen.len() > limits::MAX_MONOMORPHIZATIONS {
+            return Err(error(&format!(
+                "monomorphization exceeded {} function instances",
+                limits::MAX_MONOMORPHIZATIONS
+            )));
         }
         let function = program
             .functions
@@ -496,13 +509,21 @@ fn collect_type(
         hir::Type::Task(result) => {
             collect_type(program, result, types, generic_names)?;
         }
-        hir::Type::Mutex(value) | hir::Type::MutexGuard(value) => {
+        hir::Type::Mutex(value) | hir::Type::MutexGuard(value) | hir::Type::Channel(value) => {
             collect_type(program, value, types, generic_names)?;
         }
-        hir::Type::Reference { inner, .. } | hir::Type::RawPointer { inner, .. } => {
+        hir::Type::Reference { inner, .. }
+        | hir::Type::RawPointer { inner, .. }
+        | hir::Type::MemoryPointer { inner, .. } => {
             collect_type(program, inner, types, generic_names)?;
         }
         hir::Type::Function(arguments, result) => {
+            for argument in arguments {
+                collect_type(program, argument, types, generic_names)?;
+            }
+            collect_type(program, result, types, generic_names)?;
+        }
+        hir::Type::CFunction(arguments, result) => {
             for argument in arguments {
                 collect_type(program, argument, types, generic_names)?;
             }
@@ -544,9 +565,10 @@ pub fn resolve_target(
 ) -> Result<Option<FunctionInstance>, Diagnostic> {
     let caller_map = mapping(caller, instance);
     match target {
-        hir::CallTarget::Intrinsic(_) | hir::CallTarget::Data(_) | hir::CallTarget::Callable => {
-            Ok(None)
-        }
+        hir::CallTarget::Intrinsic(_)
+        | hir::CallTarget::Data(_)
+        | hir::CallTarget::Callable
+        | hir::CallTarget::ForeignCallable => Ok(None),
         hir::CallTarget::Function(function) => {
             let callee = program
                 .functions
@@ -652,7 +674,8 @@ fn projected_place_type(
         ty = match (projection, ty) {
             (mir::Projection::SafeDereference, hir::Type::Reference { inner, .. })
             | (mir::Projection::SafeDereference, hir::Type::MutexGuard(inner))
-            | (mir::Projection::RawDereference, hir::Type::RawPointer { inner, .. }) => *inner,
+            | (mir::Projection::RawDereference, hir::Type::RawPointer { inner, .. })
+            | (mir::Projection::RawDereference, hir::Type::MemoryPointer { inner, .. }) => *inner,
             (mir::Projection::Field(index), hir::Type::Struct(id, arguments)) => {
                 let declaration = program.structs.get(id.0)?;
                 let substitutions = declaration
@@ -783,6 +806,16 @@ fn match_type(
                 inner: y,
             },
         ) if a == b => match_type(x, y, inferred),
+        (
+            hir::Type::MemoryPointer {
+                mutable: a,
+                inner: x,
+            },
+            hir::Type::MemoryPointer {
+                mutable: b,
+                inner: y,
+            },
+        ) if a == b => match_type(x, y, inferred),
         (hir::Type::Array(x, a), hir::Type::Array(y, b)) if a == b => match_type(x, y, inferred),
         (hir::Type::Slice(x), hir::Type::Slice(y)) => match_type(x, y, inferred),
         (hir::Type::List(x), hir::Type::List(y)) => match_type(x, y, inferred),
@@ -794,9 +827,20 @@ fn match_type(
         (hir::Type::Future(x), hir::Type::Future(y)) => match_type(x, y, inferred),
         (hir::Type::Task(x), hir::Type::Task(y)) => match_type(x, y, inferred),
         (hir::Type::Mutex(x), hir::Type::Mutex(y))
-        | (hir::Type::MutexGuard(x), hir::Type::MutexGuard(y)) => match_type(x, y, inferred),
+        | (hir::Type::MutexGuard(x), hir::Type::MutexGuard(y))
+        | (hir::Type::Channel(x), hir::Type::Channel(y)) => match_type(x, y, inferred),
         (hir::Type::Result(a, b), hir::Type::Result(x, y)) => {
             match_type(a, x, inferred) && match_type(b, y, inferred)
+        }
+        (
+            hir::Type::CFunction(parameters, result),
+            hir::Type::CFunction(actual_parameters, actual_result),
+        ) if parameters.len() == actual_parameters.len() => {
+            parameters
+                .iter()
+                .zip(actual_parameters)
+                .all(|(parameter, actual)| match_type(parameter, actual, inferred))
+                && match_type(result, actual_result, inferred)
         }
         _ => pattern == concrete,
     }
@@ -838,6 +882,9 @@ pub fn type_code(ty: &hir::Type) -> String {
         hir::Type::CString => "cs".into(),
         hir::Type::CStr => "cz".into(),
         hir::Type::Memory => "mem".into(),
+        hir::Type::SecretBytes => "secret".into(),
+        hir::Type::AeadEnvelope => "aead".into(),
+        hir::Type::Ed25519SigningKey => "edsk".into(),
         hir::Type::Path => "p".into(),
         hir::Type::ProcessOutput => "po".into(),
         hir::Type::ProcessCommand => "pc".into(),
@@ -868,6 +915,7 @@ pub fn type_code(ty: &hir::Type) -> String {
         hir::Type::Task(result) => format!("K{}", type_code(result)),
         hir::Type::Mutex(value) => format!("X{}", type_code(value)),
         hir::Type::MutexGuard(value) => format!("Y{}", type_code(value)),
+        hir::Type::Channel(value) => format!("H{}", type_code(value)),
         hir::Type::AtomicInt => "Z".into(),
         hir::Type::Int { signed, width } => format!(
             "{}{}",
@@ -880,6 +928,9 @@ pub fn type_code(ty: &hir::Type) -> String {
         }
         hir::Type::RawPointer { mutable, inner } => {
             format!("p{}{}", if *mutable { 'm' } else { 'c' }, type_code(inner))
+        }
+        hir::Type::MemoryPointer { mutable, inner } => {
+            format!("q{}{}", if *mutable { 'm' } else { 'c' }, type_code(inner))
         }
         hir::Type::Struct(id, args) => format!(
             "S{}{}",
@@ -895,6 +946,16 @@ pub fn type_code(ty: &hir::Type) -> String {
         hir::Type::Result(a, b) => format!("R{}_{}", type_code(a), type_code(b)),
         hir::Type::Generic(name) => format!("G{}", sanitize(name)),
         hir::Type::Function(_, _) => "fn".into(),
+        hir::Type::CFunction(arguments, result) => format!(
+            "CF{}_{}",
+            arguments
+                .iter()
+                .map(type_code)
+                .collect::<Vec<_>>()
+                .join("_"),
+            type_code(result)
+        ),
+        hir::Type::CRegistration => "c_registration".into(),
         hir::Type::Unknown => "unknown".into(),
     }
 }

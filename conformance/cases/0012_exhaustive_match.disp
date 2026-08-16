@@ -1,0 +1,6 @@
+enum State { Ready, Waiting }
+
+fn main() {
+    let current = State.Ready
+    print(match current { Ready => 1 })
+}

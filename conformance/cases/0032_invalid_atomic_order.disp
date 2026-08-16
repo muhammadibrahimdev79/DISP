@@ -1,0 +1,4 @@
+fn main() {
+    value = AtomicInt.new(0)
+    print(value.load_release())
+}

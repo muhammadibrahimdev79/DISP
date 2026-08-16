@@ -1,0 +1,6 @@
+component_magic="DISPCMP1"
+keystore_magic="DISPKS1\x00"
+record_magic="DISP"
+version_one="\x01"
+public_operation="\x01\x00\x00\x00"
+sign_operation="\x02\x00\x00\x00"

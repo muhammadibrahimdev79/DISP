@@ -80,9 +80,25 @@ pub enum DiagnosticKind {
     Backend,
 }
 
-impl fmt::Display for DiagnosticKind {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let label = match self {
+impl DiagnosticKind {
+    /// Stable category code used by machine-readable diagnostics.
+    ///
+    /// Candidate 1 stabilizes stage-level codes first. More specific leaf codes may be added
+    /// later without changing these category identities.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Lex => "DISP-LEX-0001",
+            Self::Parse => "DISP-PARSE-0001",
+            Self::Resolve => "DISP-RESOLVE-0001",
+            Self::Type => "DISP-TYPE-0001",
+            Self::Runtime => "DISP-RUNTIME-0001",
+            Self::Internal => "DISP-INTERNAL-0001",
+            Self::Backend => "DISP-BACKEND-0001",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
             Self::Lex => "lexer",
             Self::Parse => "parser",
             Self::Resolve => "resolver",
@@ -90,8 +106,13 @@ impl fmt::Display for DiagnosticKind {
             Self::Runtime => "runtime",
             Self::Internal => "internal compiler",
             Self::Backend => "native backend",
-        };
-        formatter.write_str(label)
+        }
+    }
+}
+
+impl fmt::Display for DiagnosticKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.label())
     }
 }
 
@@ -137,6 +158,56 @@ impl Diagnostic {
         }
         rendered
     }
+
+    /// Renders one deterministic JSON object following `disp.diagnostic.v1`.
+    pub fn render_json(&self, file: &str) -> String {
+        let file = self.file.as_deref().unwrap_or(file);
+        let help = self.help.as_ref().map_or_else(
+            || "null".to_owned(),
+            |help| format!("\"{}\"", escape_json(help)),
+        );
+        format!(
+            "{{\"schema\":\"disp.diagnostic.v1\",\"code\":\"{}\",\"severity\":\"error\",\"stage\":\"{}\",\"message\":\"{}\",\"file\":\"{}\",\"span\":{{\"start\":{{\"line\":{},\"column\":{}}},\"end\":{{\"line\":{},\"column\":{}}}}},\"help\":{help}}}",
+            self.kind.code(),
+            self.kind.label(),
+            escape_json(&self.message),
+            escape_json(file),
+            self.span.start.line,
+            self.span.start.column,
+            self.span.end.line,
+            self.span.end.column,
+        )
+    }
+}
+
+pub fn render_driver_json(code: &str, message: &str) -> String {
+    format!(
+        "{{\"schema\":\"disp.diagnostic.v1\",\"code\":\"{}\",\"severity\":\"error\",\"stage\":\"driver\",\"message\":\"{}\",\"file\":null,\"span\":null,\"help\":null}}",
+        escape_json(code),
+        escape_json(message)
+    )
+}
+
+fn escape_json(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\u{08}' => escaped.push_str("\\b"),
+            '\u{0c}' => escaped.push_str("\\f"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if character <= '\u{1f}' => {
+                use fmt::Write;
+                write!(escaped, "\\u{:04x}", character as u32)
+                    .expect("writing to a String cannot fail");
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 impl fmt::Display for Diagnostic {
@@ -150,3 +221,33 @@ impl fmt::Display for Diagnostic {
 }
 
 impl std::error::Error for Diagnostic {}
+
+#[cfg(test)]
+mod tests {
+    use super::{Diagnostic, DiagnosticKind, Position, Span, render_driver_json};
+
+    #[test]
+    fn json_diagnostics_are_deterministic_complete_and_escaped() {
+        let diagnostic = Diagnostic::new(
+            DiagnosticKind::Type,
+            "unknown \"value\"\nnext",
+            Span::new(
+                Position { line: 2, column: 3 },
+                Position { line: 2, column: 8 },
+            ),
+        )
+        .with_help("use \\safe");
+        assert_eq!(
+            diagnostic.render_json("C:\\work\\main.disp"),
+            "{\"schema\":\"disp.diagnostic.v1\",\"code\":\"DISP-TYPE-0001\",\"severity\":\"error\",\"stage\":\"type\",\"message\":\"unknown \\\"value\\\"\\nnext\",\"file\":\"C:\\\\work\\\\main.disp\",\"span\":{\"start\":{\"line\":2,\"column\":3},\"end\":{\"line\":2,\"column\":8}},\"help\":\"use \\\\safe\"}"
+        );
+    }
+
+    #[test]
+    fn driver_json_has_explicit_null_location() {
+        assert_eq!(
+            render_driver_json("DISP-DRIVER-0001", "bad argument\nnext"),
+            "{\"schema\":\"disp.diagnostic.v1\",\"code\":\"DISP-DRIVER-0001\",\"severity\":\"error\",\"stage\":\"driver\",\"message\":\"bad argument\\nnext\",\"file\":null,\"span\":null,\"help\":null}"
+        );
+    }
+}

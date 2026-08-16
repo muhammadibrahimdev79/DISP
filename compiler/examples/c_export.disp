@@ -1,0 +1,9 @@
+export C fn example_add(left: CInt, right: CInt) -> CInt uses Pure {
+    return left + right
+}
+
+export C fn example_divide(left: CInt, right: CInt) -> CInt uses Pure {
+    return left / right
+}
+
+fn main() {}

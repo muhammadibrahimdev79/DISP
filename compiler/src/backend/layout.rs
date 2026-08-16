@@ -63,6 +63,9 @@ impl<'a> LayoutEngine<'a> {
             hir::Type::String
             | hir::Type::CString
             | hir::Type::Memory
+            | hir::Type::SecretBytes
+            | hir::Type::AeadEnvelope
+            | hir::Type::Ed25519SigningKey
             | hir::Type::Path
             | hir::Type::Url
             | hir::Type::Json => aggregate(&[
@@ -155,29 +158,36 @@ impl<'a> LayoutEngine<'a> {
                 u64::from(self.target.pointer_width) / 8,
                 self.target.pointer_alignment,
             ),
-            hir::Type::Mutex(_) | hir::Type::MutexGuard(_) | hir::Type::AtomicInt => {
-                aggregate(&[self.target.pointer_alignment])
-            }
+            hir::Type::Mutex(_)
+            | hir::Type::MutexGuard(_)
+            | hir::Type::Channel(_)
+            | hir::Type::AtomicInt => aggregate(&[self.target.pointer_alignment]),
             hir::Type::Instant | hir::Type::Duration => scalar(8, 8),
             hir::Type::ProcessCommand => aggregate(&[
+                // program: data, len, cap
                 self.target.pointer_alignment,
                 self.target.pointer_alignment,
                 self.target.pointer_alignment,
+                // arguments: data, len, cap
                 self.target.pointer_alignment,
                 self.target.pointer_alignment,
+                self.target.pointer_alignment,
+                // directory: data, len, cap, followed by its presence tag
+                self.target.pointer_alignment,
+                self.target.pointer_alignment,
+                self.target.pointer_alignment,
+                1,
+                // environment: keys, values, len, cap, followed by clear flag
                 self.target.pointer_alignment,
                 self.target.pointer_alignment,
                 self.target.pointer_alignment,
                 self.target.pointer_alignment,
                 1,
+                // standard input: data, len, cap
                 self.target.pointer_alignment,
                 self.target.pointer_alignment,
                 self.target.pointer_alignment,
-                self.target.pointer_alignment,
-                1,
-                self.target.pointer_alignment,
-                self.target.pointer_alignment,
-                self.target.pointer_alignment,
+                // timeout and its presence tag
                 8,
                 1,
             ]),
@@ -211,10 +221,25 @@ impl<'a> LayoutEngine<'a> {
                 );
                 aggregate_layout(&[pointer.clone(), pointer.clone(), pointer])
             }
-            hir::Type::Reference { .. } | hir::Type::RawPointer { .. } => scalar(
+            hir::Type::CRegistration => aggregate(&[
+                self.target.pointer_alignment,
+                self.target.pointer_alignment,
+                self.target.pointer_alignment,
+                1,
+            ]),
+            hir::Type::Reference { .. }
+            | hir::Type::RawPointer { .. }
+            | hir::Type::CFunction(_, _) => scalar(
                 u64::from(self.target.pointer_width) / 8,
                 self.target.pointer_alignment,
             ),
+            hir::Type::MemoryPointer { .. } => {
+                let word = scalar(
+                    u64::from(self.target.pointer_width) / 8,
+                    self.target.pointer_alignment,
+                );
+                aggregate_layout(&[word.clone(), word.clone(), word.clone(), word.clone(), word])
+            }
             hir::Type::Struct(id, arguments) => {
                 let declaration = self
                     .program
@@ -365,6 +390,10 @@ pub fn substitute(ty: &hir::Type, substitutions: &HashMap<String, hir::Type>) ->
             mutable: *mutable,
             inner: Box::new(substitute(inner, substitutions)),
         },
+        hir::Type::MemoryPointer { mutable, inner } => hir::Type::MemoryPointer {
+            mutable: *mutable,
+            inner: Box::new(substitute(inner, substitutions)),
+        },
         hir::Type::Struct(id, args) => hir::Type::Struct(
             *id,
             args.iter().map(|x| substitute(x, substitutions)).collect(),
@@ -382,6 +411,10 @@ pub fn substitute(ty: &hir::Type, substitutions: &HashMap<String, hir::Type>) ->
             args.iter().map(|x| substitute(x, substitutions)).collect(),
             Box::new(substitute(result, substitutions)),
         ),
+        hir::Type::CFunction(args, result) => hir::Type::CFunction(
+            args.iter().map(|x| substitute(x, substitutions)).collect(),
+            Box::new(substitute(result, substitutions)),
+        ),
         hir::Type::Array(element, length) => {
             hir::Type::Array(Box::new(substitute(element, substitutions)), *length)
         }
@@ -392,6 +425,7 @@ pub fn substitute(ty: &hir::Type, substitutions: &HashMap<String, hir::Type>) ->
         hir::Type::MutexGuard(value) => {
             hir::Type::MutexGuard(Box::new(substitute(value, substitutions)))
         }
+        hir::Type::Channel(value) => hir::Type::Channel(Box::new(substitute(value, substitutions))),
         _ => ty.clone(),
     }
 }

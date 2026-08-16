@@ -1,0 +1,8 @@
+async fn answer() -> int {
+    await Async.yield()
+    return 42
+}
+
+async fn main() {
+    print(await answer())
+}

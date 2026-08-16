@@ -165,6 +165,18 @@ fn main() { let a = Point { x: 1, y: 2 } let b = a print(a.x + b.y) }
         r#"struct Text { value: String } impl Copy for Text {} fn main() {}"#,
         "Copy",
     );
+
+    let generic = r#"
+struct Pair<T: Copy> { left: T, right: T }
+impl<T: Copy> Copy for Pair<T> {}
+fn duplicate<T: Copy>(value: T) -> T { return value }
+fn main() { let pair = Pair { left: 1, right: 2 } let other = duplicate(pair) print(pair.left + other.right) }
+"#;
+    assert_eq!(run_source(generic).unwrap(), ["3"]);
+    rejects(
+        r#"struct Token<T> { value: int } impl<T: Copy> Copy for Token<T> {} fn main() {}"#,
+        "must cover every permitted instantiation",
+    );
 }
 
 #[test]

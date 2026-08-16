@@ -1,12 +1,14 @@
 use crate::ast::{
-    AssignmentOperator, BinaryOperator, BindingKind, Block, ClosureBody, DataOrder,
-    EnumDeclaration, Expr, Expression, ExternalAbi, ExternalFunction, FieldDeclaration, Function,
-    FunctionSignature, GenericParameter, Implementation, ImportDeclaration, ImportItem, MatchArm,
-    ModuleDeclaration, Parameter, Pattern, Program, Spanned, Statement, StructDeclaration,
-    StructFieldValue, TraitDeclaration, TypeName, TypeQualifier, UnaryOperator, VariantDeclaration,
+    AssignmentOperator, BinaryOperator, BindingKind, Block, Capability, CapabilityUse, ClosureBody,
+    DataOrder, EnumDeclaration, Expr, Expression, ExternalAbi, ExternalFunction, FieldDeclaration,
+    Function, FunctionSignature, GenericParameter, Implementation, ImportDeclaration, ImportItem,
+    MatchArm, ModuleDeclaration, Parameter, Pattern, Program, Spanned, Statement,
+    StructDeclaration, StructFieldValue, StructPatternField, TraitDeclaration, TypeName,
+    TypeQualifier, UnaryOperator, VariantDeclaration,
 };
 use crate::diagnostics::{Diagnostic, DiagnosticKind, Position, Span};
 use crate::lexer::{Token, TokenKind};
+use crate::limits;
 
 pub struct Parser {
     tokens: Vec<Token>,
@@ -79,6 +81,19 @@ impl Parser {
                     });
                 }
                 functions.push(declaration);
+            } else if self.check(&TokenKind::Export) {
+                if public {
+                    return Err(Diagnostic::new(
+                        DiagnosticKind::Parse,
+                        "`export C` already defines external visibility and cannot be combined with `pub`",
+                        self.previous().span,
+                    ));
+                }
+                if self.export_declaration_is_struct() {
+                    structs.push(self.parse_export_struct()?);
+                } else {
+                    functions.push(self.parse_export_function()?);
+                }
             } else if self.check(&TokenKind::Extern) {
                 let declarations = self.parse_extern_block()?;
                 if public {
@@ -265,6 +280,7 @@ impl Parser {
             name,
             name_span,
             data,
+            c_abi: false,
             generics,
             fields,
             span: start.through(end),
@@ -352,9 +368,14 @@ impl Parser {
         } else {
             None
         };
+        let capabilities = self.parse_capabilities()?;
         self.match_token(&TokenKind::Semicolon);
         self.match_token(&TokenKind::Comma);
-        let end = return_type.as_ref().map_or(name_span, |ty| ty.span);
+        let end = capabilities
+            .as_ref()
+            .and_then(|uses| uses.last().map(|item| item.span))
+            .or_else(|| return_type.as_ref().map(|ty| ty.span))
+            .unwrap_or(name_span);
         Ok(FunctionSignature {
             asynchronous,
             name,
@@ -362,6 +383,7 @@ impl Parser {
             generics,
             parameters,
             return_type,
+            capabilities,
             span: start.through(end),
         })
     }
@@ -487,6 +509,7 @@ impl Parser {
         } else {
             None
         };
+        let capabilities = self.parse_capabilities()?;
         let body = if self.match_token(&TokenKind::Equal) {
             if return_type.is_none() {
                 return Err(Diagnostic::new(
@@ -515,10 +538,56 @@ impl Parser {
             generics,
             parameters,
             return_type,
+            capabilities,
             body,
             external: None,
+            exported: false,
             span,
         })
+    }
+
+    fn parse_export_function(&mut self) -> Result<Function, Diagnostic> {
+        let start = self.expect(TokenKind::Export, "expected `export`")?.span;
+        let (abi, abi_span) = self.expect_identifier("expected ABI name after `export`")?;
+        if abi != "C" {
+            return Err(Diagnostic::new(
+                DiagnosticKind::Parse,
+                format!("unsupported export ABI `{abi}`"),
+                abi_span,
+            )
+            .with_help("the stable exported ABI is written as `export C fn name(...)`"));
+        }
+        let mut function = self.parse_function()?;
+        function.exported = true;
+        function.span = start.through(function.span);
+        Ok(function)
+    }
+
+    fn export_declaration_is_struct(&self) -> bool {
+        matches!(
+            (
+                self.tokens.get(self.current + 1).map(|token| &token.kind),
+                self.tokens.get(self.current + 2).map(|token| &token.kind),
+            ),
+            (Some(TokenKind::Identifier(abi)), Some(TokenKind::Struct)) if abi == "C"
+        )
+    }
+
+    fn parse_export_struct(&mut self) -> Result<StructDeclaration, Diagnostic> {
+        let start = self.expect(TokenKind::Export, "expected `export`")?.span;
+        let (abi, abi_span) = self.expect_identifier("expected ABI name after `export`")?;
+        if abi != "C" {
+            return Err(Diagnostic::new(
+                DiagnosticKind::Parse,
+                format!("unsupported export ABI `{abi}`"),
+                abi_span,
+            )
+            .with_help("a stable record layout is written as `export C struct Name { ... }`"));
+        }
+        let mut declaration = self.parse_struct(false)?;
+        declaration.c_abi = true;
+        declaration.span = start.through(declaration.span);
+        Ok(declaration)
     }
 
     fn parse_extern_block(&mut self) -> Result<Vec<Function>, Diagnostic> {
@@ -585,6 +654,10 @@ impl Parser {
                 generics,
                 parameters,
                 return_type,
+                capabilities: Some(vec![CapabilityUse {
+                    capability: Capability::Foreign,
+                    span: function_start,
+                }]),
                 body: Block {
                     statements: vec![],
                     span: end,
@@ -594,6 +667,7 @@ impl Parser {
                     library: library.clone(),
                     link_name: name.clone(),
                 }),
+                exported: false,
                 span: function_start.through(end),
             });
         }
@@ -609,6 +683,58 @@ impl Parser {
             ));
         }
         Ok(functions)
+    }
+
+    fn parse_capabilities(&mut self) -> Result<Option<Vec<CapabilityUse>>, Diagnostic> {
+        let TokenKind::Identifier(keyword) = &self.peek().kind else {
+            return Ok(None);
+        };
+        if keyword != "uses" {
+            return Ok(None);
+        }
+        let uses_span = self.advance().span;
+        let (first, first_span) =
+            self.expect_identifier("expected `Pure` or a capability after `uses`")?;
+        if first == "Pure" {
+            if self.match_token(&TokenKind::Comma) {
+                return Err(Diagnostic::new(
+                    DiagnosticKind::Parse,
+                    "`Pure` cannot be combined with capabilities",
+                    uses_span.through(self.previous().span),
+                ));
+            }
+            return Ok(Some(vec![]));
+        }
+
+        let mut capabilities = Vec::new();
+        let mut current = Some((first, first_span));
+        while let Some((name, span)) = current.take() {
+            let capability = Capability::from_name(&name).ok_or_else(|| {
+                Diagnostic::new(
+                    DiagnosticKind::Parse,
+                    format!("unknown capability `{name}`"),
+                    span,
+                )
+                .with_help(
+                    "use `FileSystem`, `Network`, `Process`, `Foreign`, `RawMemory`, `DeviceIo`, `Timer`, `Random`, `Gpu`, `Ui`, or `Pure`",
+                )
+            })?;
+            if capabilities
+                .iter()
+                .any(|item: &CapabilityUse| item.capability == capability)
+            {
+                return Err(Diagnostic::new(
+                    DiagnosticKind::Parse,
+                    format!("duplicate capability `{name}`"),
+                    span,
+                ));
+            }
+            capabilities.push(CapabilityUse { capability, span });
+            if self.match_token(&TokenKind::Comma) {
+                current = Some(self.expect_identifier("expected capability after `,`")?);
+            }
+        }
+        Ok(Some(capabilities))
     }
 
     fn parse_generic_parameters(&mut self) -> Result<Vec<GenericParameter>, Diagnostic> {
@@ -722,10 +848,31 @@ impl Parser {
             return Ok(ty);
         }
         let raw_mut = self.match_token(&TokenKind::Mut);
-        let (name, start) = self.expect_identifier("expected type name")?;
+        let (mut name, start) = self.expect_identifier("expected type name")?;
         let mut arguments = Vec::new();
         let mut end = start;
+        if self.match_token(&TokenKind::Dot) {
+            if name != "Self" {
+                return Err(Diagnostic::new(
+                    DiagnosticKind::Parse,
+                    "Candidate 1 associated type projections must start with `Self`",
+                    start,
+                ));
+            }
+            let (associated, associated_span) =
+                self.expect_identifier("expected associated type name after `Self.`")?;
+            name.push('.');
+            name.push_str(&associated);
+            end = associated_span;
+        }
         if self.match_token(&TokenKind::Less) {
+            if name.contains('.') {
+                return Err(Diagnostic::new(
+                    DiagnosticKind::Parse,
+                    "associated type projections cannot take type arguments",
+                    end,
+                ));
+            }
             loop {
                 arguments.push(self.parse_type_name()?);
                 if !self.match_token(&TokenKind::Comma) {
@@ -801,10 +948,11 @@ impl Parser {
         }
         if self.match_token(&TokenKind::Unsafe) {
             let start = self.previous().span;
+            let capabilities = self.parse_capabilities()?;
             let body = self.parse_block()?;
             return Ok(Spanned {
                 span: start.through(body.span),
-                node: Statement::Unsafe(body),
+                node: Statement::Unsafe { capabilities, body },
             });
         }
         if self.match_token(&TokenKind::Break) {
@@ -1020,10 +1168,13 @@ impl Parser {
                 break;
             }
             operator_count += 1;
-            if operator_count > 256 {
+            if operator_count > limits::MAX_OPERATOR_CHAIN {
                 return Err(Diagnostic::new(
                     DiagnosticKind::Parse,
-                    "operator chain exceeds the safety limit of 256",
+                    format!(
+                        "operator chain exceeds the safety limit of {}",
+                        limits::MAX_OPERATOR_CHAIN
+                    ),
                     self.peek().span,
                 ));
             }
@@ -1201,10 +1352,13 @@ impl Parser {
         loop {
             if self.match_token(&TokenKind::LeftParen) {
                 call_count += 1;
-                if call_count > 256 {
+                if call_count > limits::MAX_CALL_CHAIN {
                     return Err(Diagnostic::new(
                         DiagnosticKind::Parse,
-                        "call chain exceeds the safety limit of 256",
+                        format!(
+                            "call chain exceeds the safety limit of {}",
+                            limits::MAX_CALL_CHAIN
+                        ),
                         self.previous().span,
                     ));
                 }
@@ -1624,11 +1778,18 @@ impl Parser {
         let mut arms = Vec::new();
         while !self.check(&TokenKind::RightBrace) && !self.check(&TokenKind::Eof) {
             let pattern = self.parse_pattern()?;
+            let guard = if self.match_token(&TokenKind::If) {
+                Some(self.parse_expression()?)
+            } else {
+                None
+            };
             self.expect(TokenKind::FatArrow, "expected `=>` after match pattern")?;
             let arm_value = self.parse_expression()?;
             let span = pattern.span.through(arm_value.span);
             arms.push(MatchArm {
                 pattern,
+                alternative_group: None,
+                guard,
                 value: arm_value,
                 span,
             });
@@ -1647,9 +1808,43 @@ impl Parser {
     }
 
     fn parse_pattern(&mut self) -> Result<Spanned<Pattern>, Diagnostic> {
+        let first = self.parse_pattern_atom()?;
+        if !self.match_token(&TokenKind::Or) {
+            return Ok(first);
+        }
+        let start = first.span;
+        let mut alternatives = vec![first];
+        loop {
+            alternatives.push(self.parse_pattern_atom()?);
+            if !self.match_token(&TokenKind::Or) {
+                break;
+            }
+        }
+        let end = alternatives.last().unwrap().span;
+        Ok(Spanned {
+            node: Pattern::Or(alternatives),
+            span: start.through(end),
+        })
+    }
+
+    fn parse_pattern_atom(&mut self) -> Result<Spanned<Pattern>, Diagnostic> {
         let token = self.advance();
         let start = token.span;
         let node = match token.kind {
+            TokenKind::Minus => {
+                let magnitude = self.advance();
+                let TokenKind::Integer(value) = magnitude.kind else {
+                    return Err(Diagnostic::new(
+                        DiagnosticKind::Parse,
+                        "expected integer literal after `-` in pattern",
+                        magnitude.span,
+                    ));
+                };
+                return Ok(Spanned {
+                    node: Pattern::NegativeInteger(value),
+                    span: start.through(magnitude.span),
+                });
+            }
             TokenKind::Integer(value) => Pattern::Integer(value),
             TokenKind::String(value) => Pattern::String(value),
             TokenKind::Character(value) => Pattern::Character(value),
@@ -1657,6 +1852,46 @@ impl Parser {
             TokenKind::False => Pattern::Bool(false),
             TokenKind::Identifier(name) if name == "_" => Pattern::Wildcard,
             TokenKind::Identifier(name) if is_type_style(&name) => {
+                if self.match_token(&TokenKind::LeftBrace) {
+                    let mut fields = Vec::new();
+                    let mut rest = false;
+                    while !self.check(&TokenKind::RightBrace) {
+                        if self.match_token(&TokenKind::Range) {
+                            rest = true;
+                            self.match_token(&TokenKind::Comma);
+                            break;
+                        }
+                        let (field_name, field_span) =
+                            self.expect_identifier("expected field in struct pattern")?;
+                        let pattern = if self.match_token(&TokenKind::Colon) {
+                            self.parse_pattern()?
+                        } else {
+                            Spanned {
+                                node: Pattern::Binding(field_name.clone()),
+                                span: field_span,
+                            }
+                        };
+                        fields.push(StructPatternField {
+                            name: field_name,
+                            name_span: field_span,
+                            pattern,
+                        });
+                        if !self.match_token(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    let end = self
+                        .expect(TokenKind::RightBrace, "expected `}` after struct pattern")?
+                        .span;
+                    return Ok(Spanned {
+                        node: Pattern::Struct {
+                            type_name: name,
+                            fields,
+                            rest,
+                        },
+                        span: start.through(end),
+                    });
+                }
                 let (type_name, variant) = if self.match_token(&TokenKind::Dot) {
                     let (variant, _) = self.expect_identifier("expected variant after `.`")?;
                     (Some(name), variant)
@@ -1802,11 +2037,16 @@ impl Parser {
         &mut self,
         parse: impl FnOnce(&mut Self) -> Result<T, Diagnostic>,
     ) -> Result<T, Diagnostic> {
-        const MAX_RECURSION_DEPTH: usize = 64;
-        if self.recursion_depth >= MAX_RECURSION_DEPTH {
+        // A recursive expression level crosses several precedence-parser frames. Keep this
+        // below the point where the public `check_source` API can exhaust a normal 1 MiB host
+        // thread stack; the CLI's larger driver stack is defense in depth, not a requirement.
+        if self.recursion_depth >= limits::MAX_EXPRESSION_DEPTH {
             return Err(Diagnostic::new(
                 DiagnosticKind::Parse,
-                format!("expression nesting exceeds the limit of {MAX_RECURSION_DEPTH}"),
+                format!(
+                    "expression nesting exceeds the limit of {}",
+                    limits::MAX_EXPRESSION_DEPTH
+                ),
                 self.peek().span,
             ));
         }

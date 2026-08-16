@@ -180,6 +180,11 @@ print(started.elapsed().millis())
 `Time.unix_seconds()` is the wall-clock operation. Keeping it separate prevents clock
 adjustments from corrupting elapsed-time measurements.
 
+`Time.ticks() -> u32` exposes a wrapping monotonic counter in fixed 10 millisecond units and carries
+the distinct `Timer` effect. Hosted targets derive it from their monotonic provider. The x86-64
+freestanding profile requires the function containing the operation to declare `uses Timer`, then
+provides ticks through its bounded IRQ0 service.
+
 ## Programs, environment, and child processes
 
 `fn main(args: List<String>)` receives only arguments supplied after the command-line
@@ -242,7 +247,8 @@ boundary. A `Thread<T>` that leaves scope without an explicit `join()` is joined
 deterministic cleanup, so it cannot outlive resources owned by the process.
 
 `Mutex<T>` is explicitly shared. Its guard owns the lock and releases it when the guard
-leaves scope:
+leaves scope. The mutex is recursive for its owning thread and becomes available to another
+thread after the last nested guard is released:
 
 ```disp
 counter = Mutex.new(0)
@@ -252,9 +258,45 @@ guard = shared.lock()
 ```
 
 `AtomicInt` provides sequentially consistent `load`, `store`, `add`, and `fetch_add`
-operations for counters that do not need a larger protected value. `share()` is explicit
-for both synchronization types, keeping accidental shared ownership visible without
-exposing reference-counting or platform handles.
+operations for counters that do not need a larger protected value. Explicit ordered forms
+are also available: loads support `_relaxed`, `_acquire`, and `_seq_cst`; stores support
+`_relaxed`, `_release`, and `_seq_cst`; `add` and `fetch_add` support all five relaxed,
+acquire, release, acquire-release, and sequentially consistent suffixes. Invalid order and
+operation combinations are absent and fail type checking. `share()` is explicit for both
+synchronization types, keeping accidental shared ownership visible without exposing
+reference-counting or platform handles. The complete contract is in `CONCURRENCY.md`.
+
+Bounded `Channel<T>` queues transfer owned messages between threads with explicit backpressure:
+
+```disp
+var jobs: Channel<String> = Channel.bounded(64)?
+worker = spawn consume(jobs.share())
+jobs.send("compile")
+jobs.close()
+worker.join()
+```
+
+`send` consumes its message and blocks while the queue is full. `receive` blocks while an open
+queue is empty and returns `Option<T>`; after `close`, buffered messages are drained before `None`.
+Closing wakes all waiters, and the final handle deterministically drops messages still queued.
+
+Async calls create lazy, linear `Future<T>` values. `Async.spawn` moves a future into a structured
+`Task<T>`. Awaiting consumes the task and returns its result; explicit cancellation also consumes
+the handle, while completion inspection is non-consuming:
+
+```disp
+task = Async.spawn(render(frame))
+if task.is_finished() {
+    print(await task)
+} else {
+    task.cancel()
+}
+```
+
+Leaving a task unconsumed cancels it during deterministic scope cleanup. `cancel()` completes the
+task's owned-state cleanup before returning. Timeouts use `Duration` and begin when the lazy
+operation is first polled, not when its future is constructed. The full lifecycle contract and
+Pass 016 audit matrix are in `ASYNC.md`.
 
 A leading dereference assignment on the line after another expression is treated as a
 new statement. This resolves the otherwise ambiguous `call()\n*guard += 1` spelling
@@ -302,12 +344,163 @@ parameters.
 The portable aliases are `CInt`, `CUInt`, `CSize`, `CSSize`, `CChar`, `CUChar`, `CShort`,
 `CUShort`, `CLongLong`, `CULongLong`, `CFloat`, and `CDouble`. Fixed-width DISP numeric
 types and explicit raw pointers are also ABI-safe. Owned DISP aggregates such as
-`String`, `CString`, `List`, and user structs never cross the C boundary implicitly.
+`String`, `CString`, `List`, and ordinary user structs never cross the C boundary
+implicitly. Plain value records can opt into a checked stable layout explicitly:
+
+```disp
+export C struct PacketHeader {
+    flags: u8,
+    payload_length: u32,
+    sequence: u64,
+}
+impl Copy for PacketHeader {}
+
+export C fn advance(header: PacketHeader) -> PacketHeader uses Pure {
+    return PacketHeader {
+        flags: header.flags,
+        payload_length: header.payload_length,
+        sequence: header.sequence + 1,
+    }
+}
+```
+
+The generated type is named `disp_c_PacketHeader`. Its C/C++ declaration retains the source
+field names and carries compile-time assertions for every offset, its total size, and alignment.
+C ABI records must be non-empty and non-generic and may contain only ABI scalars, explicit stable
+raw pointers, or other exported C records; owned runtime values and private structs are rejected.
+The fixed-record contract is compiled and inspected under both Windows x86-64 and i686 C calling
+conventions; this is ABI evidence, not a claim that DISP currently ships an i686 runtime.
 
 Native compilation can call any correctly declared linked symbol. The interpreter has
 deterministic semantic-oracle support for `abs`, `strlen`, and `sqrt`; other foreign
 functions produce a controlled diagnostic requiring native execution rather than
 inventing foreign behavior.
+
+`disp header app.disp` writes `app.h`; for a project directory it writes
+`disp_ffi_v1.h`. The header is a deterministic description of every checked `extern C`
+import and `export C fn` in the complete lowered program. It defines `DISP_C_ABI_VERSION` as `1`, uses
+exact-width C types plus `intptr_t`/`uintptr_t`, emits stable typedefs for supported raw
+pointers, includes C++ linkage guards, and rejects a raw pointer whose pointee has no
+stable public C representation. Output is limited to 16 MiB and installed transactionally.
+This header lets C and C++ compile against the exact contract DISP expects or provides.
+
+A deliberately narrow first export profile is available for native embedding:
+
+```disp
+export C fn add(left: CInt, right: CInt) -> CInt uses Pure {
+    return left + right
+}
+```
+
+`disp build --library app.disp` produces a host shared library and `app.h`. An exported function
+returns `DISP_C_STATUS_OK`, `DISP_C_STATUS_PANIC`, or `DISP_C_STATUS_INVALID_ARGUMENT`; a non-unit
+DISP result is committed through the final `out_result` pointer only on success. Checked failures
+are contained at the ABI boundary and described by the thread-local `disp_c_last_error()` string.
+The header also declares an exact `disp_c_callback_add` function-pointer type for the example.
+A C host may store and invoke the exported symbol through this type; it retains the same status,
+out-result, and failure-containment contract.
+Exports are currently synchronous, non-generic, explicitly authority-bounded, and limited to
+ABI-safe scalars, explicit C records, raw pointers, and `CFunction` signatures. An export
+normally declares explicit
+`uses Pure`, or may declare exactly `uses Foreign` when it invokes a typed
+context-free `CFunction`; all other authority is rejected. Until cleanup-aware failure containment
+lands, its complete direct-call graph
+must be allocation-free and cannot own managed storage, call indirectly or into runtime/data
+intrinsics, spawn, or await. Synchronous scalar-only helpers and recursion are accepted after the
+same restriction is proved transitively. C-to-DISP callbacks are supported through generated export
+types. Same-thread nested foreign re-entry is denied. Each C host thread must call
+`disp_c_thread_attach()` before entering an export and `disp_c_thread_detach()` after its final call.
+Attachment and failure state are thread-local, so distinct attached C threads may enter concurrently.
+Resource-owning exports and asynchronous callbacks are not implemented yet.
+
+DISP can also hold and invoke a context-free C function pointer without confusing it with a closure:
+
+```disp
+extern C { fn abs(value: CInt) -> CInt }
+
+fn invoke(callback: CFunction<fn(CInt) -> CInt>, value: CInt) -> CInt uses Foreign {
+    unsafe uses Foreign {
+        return callback(value)
+    }
+}
+```
+
+Only a named, non-generic `extern C` function with the exact signature becomes a `CFunction` value.
+Invocation requires an explicit `Foreign` unsafe contract and checks null before entering C. The
+pointer is Copy but currently thread-affine. DISP closures and ordinary functions never convert to
+this type implicitly, and no closure environment crosses the ABI. Same-thread C→DISP→C→DISP re-entry
+is denied before the nested body executes;
+the inner wrapper returns `DISP_C_STATUS_INVALID_ARGUMENT` while the outer containment target remains
+active.
+
+DISP can adopt an opaque C context together with its exact release function:
+
+```disp
+extern C {
+    fn acquire() -> mut ptr<Unit>
+    fn release(context: mut ptr<Unit>)
+}
+
+fn use_provider() uses Foreign {
+    unsafe uses Foreign {
+        registration = CRegistration.adopt(acquire(), release)
+        print(registration.is_active())
+        // registration.close() may consume it early; otherwise scope exit releases it.
+    }
+}
+```
+
+`CRegistration` is non-Copy and thread-affine. `close()` consumes it, while native scope cleanup
+releases an active registration exactly once. The callback is cleared and the handle is marked
+inactive before provider code runs. Attaching a C thread does not make this thread-affine handle
+transferable. For providers that may still have callbacks in flight, use
+`CRegistration.adopt_async(context, quiesce, release)`. Cleanup clears the handle, invokes the exact
+quiesce callback to stop and join provider work, and only then releases the context. This is an
+explicit unsafe assertion that the foreign quiesce function really waits for every in-flight call.
+
+A checked export wrapper can be passed to a C provider explicitly:
+
+```disp
+extern C {
+    fn register(callback: CFunction<fn(CInt, mut ptr<CInt>) -> CInt>)
+}
+export C fn on_value(value: CInt) -> CInt uses Pure { return value + 1 }
+
+fn install() uses Foreign {
+    unsafe uses Foreign { register(CExport.callback(on_value)) }
+}
+```
+
+The handle points to the status/out-result wrapper, not the internal DISP function. Ordinary
+functions and closures are rejected. Provider threads must attach before invocation, and retained
+providers must quiesce before library unload.
+
+For a captured handler, registration and ownership transfer are atomic:
+
+```disp
+registration = CRegistration.register_async(
+    move |value: CInt| value + offset,
+    provider_register,
+    provider_quiesce,
+    provider_release
+)
+```
+
+The provider register function receives a signature-specific checked trampoline plus an opaque
+context. The linear registration owns moved Send-compatible captures, including resource-owning
+values such as `String`; borrowed views, pointers, secrets, guards, functions, and registrations are
+rejected. Every invocation borrows the reusable environment. Cleanup first quiesces all provider
+calls, then recursively drops the capture environment, then releases the provider context. Handler
+allocation and cleanup-bearing local work remain outside the current checked callback profile.
+
+Checked C exports may create heap-only owned locals such as `String`. Export entry starts a
+thread-local allocation transaction: ordinary return performs normal typed cleanup, while a
+contained checked failure reclaims every still-owned managed allocation, restores call-depth
+accounting, preserves the caller's output, and returns panic status. `CRegistration` also installs
+a typed rollback hook immediately after acquisition. Contained failure invokes live hooks in reverse
+order, including provider quiescence where required, before reclaiming allocation storage. Other
+handles, tasks, threads, callable environments, and secrets remain rejected until each has an
+explicit type-specific rollback hook.
 
 ## System memory
 
@@ -327,25 +520,38 @@ and `copy_from` are safe, bounds-checked operations; copying uses overlap-safe s
 The allocation is released deterministically on normal scope exit, return, `?`
 propagation, and other compiler-generated control-flow cleanup paths.
 
-Raw pointer views are available without transferring ownership. Pointer arithmetic,
-reads, and writes remain explicit and require `unsafe`:
+`Memory.as_ptr()` and `Memory.as_mut_ptr()` create checked `MemoryPtr<u8>` and
+`MemoryMutPtr<u8>` views without transferring allocation ownership. Their arithmetic,
+reads, and writes remain explicit and require a `RawMemory`-bounded unsafe region:
 
 ```disp
-unsafe {
+unsafe uses RawMemory {
     pointer = memory.as_mut_ptr()
     pointer.write(u8(7))
     pointer.offset(1).write(u8(8))
 }
 ```
 
-Raw pointer operations currently accept only `Copy` element types. Raw pointers are not
-sent across thread boundaries, and owned DISP values never become raw allocations
-implicitly. Once code enters `unsafe`, it is responsible for pointer lifetime,
-alignment, and bounds; safe `Memory` methods remain the preferred interface.
+Checked pointer operations accept only `Copy` element types. A checked pointer is a fat
+value containing the current address, allocation base and byte length, and its element
+size and alignment contract. Offsets may reach one-past the allocation but cannot leave
+it; reads and writes reject one-past, incomplete, or misaligned access before native C
+performs a dereference. The ownership checker keeps the source `Memory` loan live through
+copies, offsets, aggregates, assignments, and direct calls, rejects owner movement or
+conflicting access, and prevents a pointer from escaping its allocation lifetime.
 
-## SQLite data foundation
+`MemoryPtr<T>` is shared and `MemoryMutPtr<T>` is exclusive. Neither checked pointer kind
+can cross a thread or C ABI boundary. They are distinct from thin `ptr<T>` / `mut ptr<T>`,
+which exist for explicitly trusted foreign-memory contracts and receive no implicit
+conversion from owned DISP memory. Unsafe capability containment remains active for both;
+safe `Memory` methods remain the simplest interface.
 
-`Database` is an owned non-Copy SQLite connection. File paths remain nominal, while an
+## Legacy SQLite compatibility boundary
+
+`Database` is a preview-only owned non-Copy SQLite compatibility connection. The bootstrap resolves
+the system library lazily only after explicit construction, so the compiler and native DataStore do
+not statically depend on SQLite. It is not the DISP Data engine and is scheduled to become an
+optional isolated connector before 1.0. File paths remain nominal, while an
 in-memory database needs no configuration:
 
 ```disp
@@ -417,6 +623,10 @@ primary-key insertion/upsert, and guarded removal. External values are evaluated
 `DataStore` and `Database` are distinct nominal types, so a data store cannot invoke raw
 SQL methods.
 
+PostgreSQL support belongs to an optional typed connector rather than `DataStore` internals.
+Connector use requires explicit database/network capabilities; native `DataStore` programs retain
+identical semantics when PostgreSQL and every other external database connector are absent.
+
 `data open Path(...)` creates or opens a durable `DataStore` backed by DISP's native v2
 storage format. The file is split into fixed 4096-byte pages with header, page, and payload
 integrity checks. Each mutation commits only changed pages through a synced write-ahead log;
@@ -425,6 +635,58 @@ prevents a second process or store from mutating the same path concurrently, and
 released deterministically when the store is dropped. Version 1 snapshots remain readable and
 migrate on their next successful mutation. Interpreter and native execution share the exact
 format and recovery behavior.
+
+## Secure operating-system randomness
+
+```disp
+fn nonce() -> Result<List<u8>, CryptoError> uses Random {
+    return Crypto.random_bytes(12)
+}
+```
+
+`Crypto.random_bytes` returns between 1 and 1,048,576 bytes from the operating system's secure
+random provider. It returns a typed error if the length is invalid or the provider fails. Calling it
+requires the `Random` capability; an omitted function contract infers that capability, while a
+`uses Pure` contract is rejected. The native backend uses `BCryptGenRandom` on Windows and the
+`getrandom` system call on Linux, with no deterministic fallback.
+
+The returned `List<u8>` is deliberately public byte material suitable for nonces, salts, identifiers,
+and challenges. Secret material uses an opaque source type instead:
+
+```disp
+fn key() -> Result<SecretBytes, CryptoError> uses Random {
+    return Crypto.random_secret(32)
+}
+```
+
+`SecretBytes` is owned and non-Copy, cannot cross a spawned-thread boundary, cannot be indexed,
+serialized, extracted, directly printed, or compared with `==`/`!=`, and exposes only `len()`,
+`is_empty()`, and `constant_time_equals(other)`. Nested formatting is always redacted. Both engines
+enforce the same 1 through 1,048,576-byte range; native cleanup zeroizes the allocation before
+release and interpreter cleanup delegates to the zeroizing bootstrap secret owner.
+
+Public byte storage can be deliberately transferred into opaque storage with
+`Crypto.import_secret(bytes)`. The input is consumed, and failed imports are wiped before release;
+the operation cannot erase any earlier copies made by the program.
+
+SHA-256 and keyed authentication are Pure operations:
+
+```disp
+fn authenticate(key: SecretBytes, message: List<u8>) -> Result<bool, CryptoError> uses Pure {
+    authenticator = Crypto.hmac_sha256(key, message)?
+    return Crypto.hmac_sha256_verify(key, message, authenticator)
+}
+```
+
+`Crypto.sha256`, `Crypto.hmac_sha256`, and `Crypto.hmac_sha256_verify` borrow their inputs and cap
+messages at 16 MiB. HMAC verification is the supported authenticator comparison path. Native
+programs delegate to Windows CNG or Linux AF_ALG; provider failure remains a typed `CryptoError`.
+
+Key derivation uses `Crypto.hkdf_sha256(salt, input, info, output_length)`. Salt and info are public
+`List<u8>` values, input key material is borrowed `SecretBytes`, and output is a new opaque
+`SecretBytes`. Empty salt selects the RFC 5869 default. Salt and info are limited to 1 MiB each and
+output length to 1 through 8,160 bytes. Derivation is Pure and uses the same native HMAC providers;
+all intermediate key material is zeroized before release.
 
 ## Collection loops
 

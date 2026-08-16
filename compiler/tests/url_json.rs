@@ -67,7 +67,30 @@ fn native(name: &str, source: &str, emit_c: bool) -> (String, Option<String>) {
             Err(error) => panic!("native URL/JSON execution failed: {error}"),
         }
     }
-    panic!("Windows Application Control repeatedly blocked URL/JSON test executable")
+    let fallback = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!(
+            "disp-url-json-launch-{}-{}.exe",
+            std::process::id(),
+            NEXT_PATH.fetch_add(1, Ordering::Relaxed)
+        ));
+    fs::copy(&artifacts.executable, &fallback)
+        .unwrap_or_else(|error| panic!("could not stage URL/JSON launch fallback: {error}"));
+    let output = Command::new(&fallback)
+        .output()
+        .unwrap_or_else(|error| panic!("native URL/JSON fallback execution failed: {error}"));
+    fs::remove_file(&fallback).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .replace("\r\n", "\n"),
+        generated,
+    )
 }
 
 fn one_request_server() -> (u16, thread::JoinHandle<()>) {

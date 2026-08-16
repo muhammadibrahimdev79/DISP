@@ -32,6 +32,7 @@ pub struct Function {
     pub span: Span,
     pub generic_parameters: Vec<String>,
     pub external: Option<hir::ExternalFunction>,
+    pub exported: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -229,6 +230,7 @@ struct Builder<'a> {
     current: BlockId,
     live: Vec<LocalId>,
     loops: Vec<LoopFrame>,
+    guard_places: HashMap<hir::LocalId, Place>,
 }
 
 impl<'a> Builder<'a> {
@@ -244,9 +246,13 @@ impl<'a> Builder<'a> {
         };
         let mut locals = vec![return_local];
         let mut source_locals = HashMap::new();
-        for local in &function.locals {
+        for (source_index, local) in function.locals.iter().enumerate() {
             let id = LocalId(locals.len());
             source_locals.insert(local.id, id);
+            // A closure environment owns its captures. Calls borrow those slots;
+            // the callable drop glue destroys them exactly once when the
+            // environment itself is released.
+            let capture = source_index < function.capture_count;
             locals.push(Local {
                 id,
                 name: local.name.clone(),
@@ -257,7 +263,7 @@ impl<'a> Builder<'a> {
                     LocalKind::User
                 },
                 span: local.span,
-                needs_drop: !local.ty.is_copy(program),
+                needs_drop: !capture && !local.ty.is_copy(program),
                 mutable: local.mutable,
             });
         }
@@ -274,6 +280,7 @@ impl<'a> Builder<'a> {
             current: BlockId(0),
             live: Vec::new(),
             loops: Vec::new(),
+            guard_places: HashMap::new(),
         }
     }
 
@@ -300,6 +307,7 @@ impl<'a> Builder<'a> {
             span: self.function.span,
             generic_parameters: self.function.generic_parameters.clone(),
             external: self.function.external.clone(),
+            exported: self.function.exported,
         })
     }
 
@@ -625,7 +633,7 @@ impl<'a> Builder<'a> {
                 self.live.pop();
                 self.push(StatementKind::StorageDead(item), statement.span);
             }
-            hir::StatementKind::Unsafe(block) => self.lower_block(block, true)?,
+            hir::StatementKind::Unsafe { body, .. } => self.lower_block(body, true)?,
             hir::StatementKind::Break | hir::StatementKind::Continue => {
                 let frame = self.loops.last().ok_or_else(|| {
                     Diagnostic::new(
@@ -671,6 +679,9 @@ impl<'a> Builder<'a> {
             }
             hir::ExprKind::Constant(x) => Ok(Operand::Constant(lower_constant(x))),
             hir::ExprKind::Local(x) => {
+                if let Some(place) = self.guard_places.get(x) {
+                    return Ok(Operand::Copy(place.clone()));
+                }
                 let local = self.source_locals[x];
                 Ok(if expr.ty.is_copy(self.program) {
                     Operand::Copy(self.place(local))
@@ -991,6 +1002,16 @@ impl<'a> Builder<'a> {
                 || (index == 2
                     && matches!(&call.target, hir::CallTarget::Intrinsic(name) if name == "Memory.copy_from"))
                 || matches!(&call.target, hir::CallTarget::Intrinsic(name) if name == "Path.new" || name == "Path.join" || name.starts_with("File.") || name.starts_with("Directory.") || name == "Database.open" || name == "DataStore.open" || ((name == "Database.execute" || name == "Database.query") && (index == 1 || index == 2)))
+                || matches!(&call.target, hir::CallTarget::Intrinsic(name) if name == "Crypto.sha256" || name == "Crypto.hmac_sha256" || name == "Crypto.hmac_sha256_verify")
+                || matches!(&call.target, hir::CallTarget::Intrinsic(name) if name == "Crypto.hkdf_sha256" && index < 3)
+                || matches!(&call.target, hir::CallTarget::Intrinsic(name) if matches!(name.as_str(), "Crypto.aes256_gcm_siv_seal" | "Crypto.aes256_gcm_siv_open"))
+                || matches!(&call.target, hir::CallTarget::Intrinsic(name) if matches!(name.as_str(), "Crypto.encode_aead_envelope" | "Crypto.decode_aead_envelope"))
+                || matches!(&call.target, hir::CallTarget::Intrinsic(name) if matches!(name.as_str(), "Crypto.ed25519_public_key" | "Crypto.ed25519_sign" | "Crypto.ed25519_verify"))
+                || matches!(&call.target, hir::CallTarget::Intrinsic(name) if name == "Crypto.ed25519_key_id")
+                || matches!(&call.target, hir::CallTarget::Intrinsic(name) if name == "Crypto.ed25519_verify_keyed")
+                || matches!(&call.target, hir::CallTarget::Intrinsic(name) if name == "Crypto.ed25519_verify_lifecycle" && index < 4)
+                || matches!(&call.target, hir::CallTarget::Intrinsic(name) if matches!(name.as_str(), "Crypto.encode_ed25519_public_key" | "Crypto.decode_ed25519_public_key" | "Crypto.encode_ed25519_signature" | "Crypto.decode_ed25519_signature"))
+                || matches!(&call.target, hir::CallTarget::Intrinsic(name) if matches!(name.as_str(), "Crypto.argon2id_hash_password" | "Crypto.argon2id_verify_password"))
             {
                 Some(hir::ReceiverMode::Shared)
             } else {
@@ -1101,7 +1122,11 @@ impl<'a> Builder<'a> {
 
     fn expr_place(&self, expression: &hir::Expr) -> Option<Place> {
         match &expression.kind {
-            hir::ExprKind::Local(local) => Some(self.place(self.source_locals[local])),
+            hir::ExprKind::Local(local) => self
+                .guard_places
+                .get(local)
+                .cloned()
+                .or_else(|| Some(self.place(self.source_locals[local]))),
             hir::ExprKind::Move(place) | hir::ExprKind::Borrow { place, .. } => {
                 self.static_place_from_hir(place)
             }
@@ -1135,49 +1160,50 @@ impl<'a> Builder<'a> {
     ) -> Result<Operand, Diagnostic> {
         let value_ty = value.ty.clone();
         let value = self.lower_expr(value)?;
-        let value_local = self.materialize(value, value_ty, span);
+        let value_local = self.materialize(value, value_ty.clone(), span);
         let destination = self.temp(ty.clone(), span);
         let join = self.new_block();
+        let dispatch = self.current;
         let arm_blocks = arms.iter().map(|_| self.new_block()).collect::<Vec<_>>();
-        let otherwise = arms
-            .iter()
-            .position(|arm| {
-                matches!(
-                    arm.pattern,
-                    hir::Pattern::Wildcard | hir::Pattern::Binding(_)
-                )
-            })
-            .map(|i| arm_blocks[i])
-            .unwrap_or_else(|| self.new_block());
-        let enum_targets = arms
-            .iter()
-            .enumerate()
-            .filter_map(|(i, arm)| match arm.pattern {
-                hir::Pattern::Variant { variant_id, .. } => Some((variant_id, arm_blocks[i])),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        if !enum_targets.is_empty() {
-            self.terminate(Terminator::SwitchEnum {
-                discriminant: Operand::Copy(self.place(value_local)),
-                targets: enum_targets,
-                otherwise,
-            });
-        } else {
-            let value_targets = arms
-                .iter()
-                .enumerate()
-                .filter_map(|(i, arm)| match &arm.pattern {
-                    hir::Pattern::Constant(c) => Some((lower_constant(c), arm_blocks[i])),
-                    _ => None,
-                })
-                .collect();
-            self.terminate(Terminator::SwitchValue {
-                discriminant: Operand::Copy(self.place(value_local)),
-                targets: value_targets,
-                otherwise,
-            });
+        let no_match = self.new_block();
+        self.current = no_match;
+        self.terminate(Terminator::Unreachable);
+        let source = self.place(value_local);
+        let mut next = no_match;
+        for (arm, success) in arms.iter().zip(&arm_blocks).rev() {
+            let pattern_success = if let Some(guard) = &arm.guard {
+                let guard_block = self.new_block();
+                self.current = guard_block;
+                let guard_depth = self.live.len();
+                self.collect_guard_places(&arm.pattern, &source);
+                let condition = self.lower_expr(guard)?;
+                self.guard_places.clear();
+                let guard_end = self.current;
+                let true_cleanup = self.new_block();
+                let false_cleanup = self.new_block();
+                self.current = guard_end;
+                self.terminate(Terminator::SwitchBool {
+                    condition,
+                    true_block: true_cleanup,
+                    false_block: false_cleanup,
+                });
+                self.current = true_cleanup;
+                self.emit_drops_to(guard_depth, guard.span);
+                let cleanup = self.blocks[true_cleanup.0].statements.clone();
+                self.live.truncate(guard_depth);
+                self.terminate(Terminator::Goto(*success));
+                self.current = false_cleanup;
+                self.blocks[false_cleanup.0].statements = cleanup;
+                self.terminate(Terminator::Goto(next));
+                guard_block
+            } else {
+                *success
+            };
+            next =
+                self.lower_pattern_branch(&arm.pattern, &source, &value_ty, pattern_success, next);
         }
+        self.current = dispatch;
+        self.terminate(Terminator::Goto(next));
         for (arm, block) in arms.iter().zip(arm_blocks) {
             self.current = block;
             let arm_depth = self.live.len();
@@ -1194,17 +1220,6 @@ impl<'a> Builder<'a> {
                 self.terminate(Terminator::Goto(join));
             }
         }
-        if self.open(otherwise)
-            && !arms.iter().any(|arm| {
-                matches!(
-                    arm.pattern,
-                    hir::Pattern::Wildcard | hir::Pattern::Binding(_)
-                )
-            })
-        {
-            self.current = otherwise;
-            self.terminate(Terminator::Unreachable);
-        }
         self.current = join;
         self.set_initialized(destination, true, span);
         Ok(if ty.is_copy(self.program) {
@@ -1212,6 +1227,105 @@ impl<'a> Builder<'a> {
         } else {
             Operand::Move(self.place(destination))
         })
+    }
+
+    fn lower_pattern_branch(
+        &mut self,
+        pattern: &hir::Pattern,
+        source: &Place,
+        source_ty: &hir::Type,
+        success: BlockId,
+        failure: BlockId,
+    ) -> BlockId {
+        match pattern {
+            hir::Pattern::Wildcard | hir::Pattern::Binding(_) => success,
+            hir::Pattern::Constant(constant) => {
+                let entry = self.new_block();
+                self.current = entry;
+                self.terminate(Terminator::SwitchValue {
+                    discriminant: Operand::Copy(source.clone()),
+                    targets: vec![(lower_constant(constant), success)],
+                    otherwise: failure,
+                });
+                entry
+            }
+            hir::Pattern::Struct { fields, .. } => {
+                let field_types = self.struct_field_types(source_ty);
+                let mut nested_success = success;
+                for (index, argument) in fields.iter().rev() {
+                    let mut field = source.clone();
+                    field.projections.push(Projection::Field(*index));
+                    nested_success = self.lower_pattern_branch(
+                        argument,
+                        &field,
+                        field_types.get(*index).unwrap_or(&hir::Type::Unknown),
+                        nested_success,
+                        failure,
+                    );
+                }
+                nested_success
+            }
+            hir::Pattern::Variant {
+                variant_id,
+                arguments,
+                ..
+            } => {
+                let payload_types = self.variant_payload_types(source_ty, *variant_id);
+                let mut nested_success = success;
+                for (index, (argument, payload_ty)) in
+                    arguments.iter().zip(&payload_types).enumerate().rev()
+                {
+                    let mut payload = source.clone();
+                    payload
+                        .projections
+                        .push(Projection::VariantField(*variant_id, index));
+                    nested_success = self.lower_pattern_branch(
+                        argument,
+                        &payload,
+                        payload_ty,
+                        nested_success,
+                        failure,
+                    );
+                }
+                let entry = self.new_block();
+                self.current = entry;
+                self.terminate(Terminator::SwitchEnum {
+                    discriminant: Operand::Copy(source.clone()),
+                    targets: vec![(*variant_id, nested_success)],
+                    otherwise: failure,
+                });
+                entry
+            }
+        }
+    }
+
+    fn collect_guard_places(&mut self, pattern: &hir::Pattern, source: &Place) {
+        match pattern {
+            hir::Pattern::Binding(local) => {
+                self.guard_places.insert(*local, source.clone());
+            }
+            hir::Pattern::Struct { fields, .. } => {
+                for (index, pattern) in fields {
+                    let mut field = source.clone();
+                    field.projections.push(Projection::Field(*index));
+                    self.collect_guard_places(pattern, &field);
+                }
+            }
+            hir::Pattern::Variant {
+                variant_id,
+                arguments,
+                ..
+            } => {
+                for (index, pattern) in arguments.iter().enumerate() {
+                    let mut payload = source.clone();
+                    payload
+                        .projections
+                        .push(Projection::VariantField(*variant_id, index));
+                    self.collect_guard_places(pattern, &payload);
+                }
+            }
+            hir::Pattern::Wildcard | hir::Pattern::Constant(_) => {}
+        }
     }
 
     fn lower_try(
@@ -1311,6 +1425,34 @@ impl<'a> Builder<'a> {
                 self.set_initialized(target, true, span);
                 !copied
             }
+            hir::Pattern::Struct { fields, .. } => {
+                let field_types = self.struct_field_types(source_ty);
+                let mut moved = HashSet::new();
+                for (index, argument) in fields {
+                    let mut field = source.clone();
+                    field.projections.push(Projection::Field(*index));
+                    if self.bind_pattern_place(argument, &field, &field_types[*index], span) {
+                        moved.insert(*index);
+                    }
+                }
+                if !moved.is_empty() {
+                    for (index, field_ty) in field_types.iter().enumerate() {
+                        if moved.contains(&index) || field_ty.is_copy(self.program) {
+                            continue;
+                        }
+                        let mut field = source.clone();
+                        field.projections.push(Projection::Field(index));
+                        self.push(
+                            StatementKind::Drop {
+                                place: field,
+                                flag: None,
+                            },
+                            span,
+                        );
+                    }
+                }
+                !moved.is_empty()
+            }
             hir::Pattern::Variant {
                 variant_id,
                 arguments,
@@ -1385,6 +1527,23 @@ impl<'a> Builder<'a> {
             }
             _ => vec![],
         }
+    }
+    fn struct_field_types(&self, source: &hir::Type) -> Vec<hir::Type> {
+        let hir::Type::Struct(id, arguments) = source else {
+            return vec![];
+        };
+        let declaration = &self.program.structs[id.0];
+        let substitutions = declaration
+            .generic_parameters
+            .iter()
+            .cloned()
+            .zip(arguments.iter().cloned())
+            .collect::<HashMap<_, _>>();
+        declaration
+            .fields
+            .iter()
+            .map(|field| hir::substitute_type(&field.ty, &substitutions))
+            .collect()
     }
     fn temp(&mut self, ty: hir::Type, span: Span) -> LocalId {
         let id = LocalId(self.locals.len());
@@ -1610,10 +1769,14 @@ impl<'a> Builder<'a> {
         }
     }
     fn place_from_hir(&mut self, place: &hir::Place) -> Result<Place, Diagnostic> {
-        let mut lowered = Place {
-            local: self.source_locals[&place.local],
-            projections: vec![],
-        };
+        let mut lowered = self
+            .guard_places
+            .get(&place.local)
+            .cloned()
+            .unwrap_or_else(|| Place {
+                local: self.source_locals[&place.local],
+                projections: vec![],
+            });
         for projection in &place.projections {
             lowered.projections.push(match projection {
                 hir::Projection::Field(x) => Projection::Field(*x),
@@ -1644,10 +1807,14 @@ impl<'a> Builder<'a> {
         Ok(lowered)
     }
     fn static_place_from_hir(&self, place: &hir::Place) -> Option<Place> {
-        let mut lowered = Place {
-            local: self.source_locals[&place.local],
-            projections: vec![],
-        };
+        let mut lowered = self
+            .guard_places
+            .get(&place.local)
+            .cloned()
+            .unwrap_or_else(|| Place {
+                local: self.source_locals[&place.local],
+                projections: vec![],
+            });
         for projection in &place.projections {
             lowered.projections.push(match projection {
                 hir::Projection::Field(x) => Projection::Field(*x),
@@ -1941,7 +2108,8 @@ fn check_place(
         ty = match (projection, ty) {
             (Projection::SafeDereference, hir::Type::Reference { inner, .. })
             | (Projection::SafeDereference, hir::Type::MutexGuard(inner))
-            | (Projection::RawDereference, hir::Type::RawPointer { inner, .. }) => *inner,
+            | (Projection::RawDereference, hir::Type::RawPointer { inner, .. })
+            | (Projection::RawDereference, hir::Type::MemoryPointer { inner, .. }) => *inner,
             (Projection::Field(index), hir::Type::Struct(id, arguments)) => {
                 let declaration = program.structs.get(id.0).ok_or_else(|| {
                     Diagnostic::new(

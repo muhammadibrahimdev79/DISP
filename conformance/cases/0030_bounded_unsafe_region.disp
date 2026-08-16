@@ -1,0 +1,7 @@
+fn read(value: ptr<int>) -> int uses Foreign {
+    unsafe uses Foreign {
+        return *value
+    }
+}
+
+fn main() uses Pure {}

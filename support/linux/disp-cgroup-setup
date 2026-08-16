@@ -1,0 +1,62 @@
+#!/bin/sh
+set -eu
+
+cgroup_root=/sys/fs/cgroup
+disp_root=${cgroup_root}/disp
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "disp-cgroup-setup: root authority is required" >&2
+    exit 1
+fi
+if [ ! -f "${cgroup_root}/cgroup.controllers" ]; then
+    echo "disp-cgroup-setup: cgroup v2 unified hierarchy is required" >&2
+    exit 1
+fi
+
+controllers=$(cat "${cgroup_root}/cgroup.controllers")
+case " ${controllers} " in
+    *" memory "*) ;;
+    *) echo "disp-cgroup-setup: memory controller is unavailable" >&2; exit 1 ;;
+esac
+case " ${controllers} " in
+    *" pids "*) ;;
+    *) echo "disp-cgroup-setup: pids controller is unavailable" >&2; exit 1 ;;
+esac
+case " ${controllers} " in
+    *" cpu "*) ;;
+    *) echo "disp-cgroup-setup: cpu controller is unavailable" >&2; exit 1 ;;
+esac
+
+current=$(cat "${cgroup_root}/cgroup.subtree_control")
+enable=
+case " ${current} " in *" memory "*) ;; *) enable="${enable} +memory" ;; esac
+case " ${current} " in *" pids "*) ;; *) enable="${enable} +pids" ;; esac
+case " ${current} " in *" cpu "*) ;; *) enable="${enable} +cpu" ;; esac
+if [ -n "${enable}" ]; then
+    printf '%s\n' "${enable# }" > "${cgroup_root}/cgroup.subtree_control"
+fi
+
+mkdir -p "${disp_root}"
+chown 0:0 "${disp_root}"
+chmod 0755 "${disp_root}"
+
+disp_controllers=$(cat "${disp_root}/cgroup.controllers")
+for controller in cpu memory pids; do
+    case " ${disp_controllers} " in
+        *" ${controller} "*) ;;
+        *) echo "disp-cgroup-setup: ${controller} was not delegated to DISP" >&2; exit 1 ;;
+    esac
+done
+disp_current=$(cat "${disp_root}/cgroup.subtree_control")
+disp_enable=
+case " ${disp_current} " in *" memory "*) ;; *) disp_enable="${disp_enable} +memory" ;; esac
+case " ${disp_current} " in *" pids "*) ;; *) disp_enable="${disp_enable} +pids" ;; esac
+case " ${disp_current} " in *" cpu "*) ;; *) disp_enable="${disp_enable} +cpu" ;; esac
+if [ -n "${disp_enable}" ]; then
+    printf '%s\n' "${disp_enable# }" > "${disp_root}/cgroup.subtree_control"
+fi
+
+if [ "$(stat -c '%u:%g:%a' "${disp_root}")" != "0:0:755" ]; then
+    echo "disp-cgroup-setup: trusted cgroup root permissions were not established" >&2
+    exit 1
+fi

@@ -211,6 +211,28 @@ async fn main() { print(await inspect()) }"#;
 }
 
 #[test]
+fn explicit_cancellation_releases_a_started_udp_receive() {
+    let source = r#"async fn inspect() -> Result<bool, NetworkError> {
+bound = UdpSocket.bind(SocketAddress("127.0.0.1", 0))
+var socket = bound?
+task = Async.spawn(socket.receive_from_async_timeout(8, Duration.from_seconds(30)))
+await Async.yield()
+task.cancel()
+socket.close()
+return Ok(true)
+}
+async fn main() { print(await inspect()) }"#;
+    let Some((actual, generated)) = native("explicit-cancel-polled", source, true) else {
+        return;
+    };
+    assert_eq!(actual, "Result.Ok(true)\n");
+    let generated = generated.unwrap();
+    assert!(generated.contains("disp_task_cancel"));
+    assert!(generated.contains("disp_udp_io_drop"));
+    assert!(generated.contains("state->socket->receive_busy"));
+}
+
+#[test]
 fn udp_bind_conflicts_close_and_drop_cleanup_are_differential() {
     let source = r#"fn reserve() -> Result<uint, NetworkError> {
 bound = UdpSocket.bind(SocketAddress("127.0.0.1", 0))

@@ -1,0 +1,534 @@
+name: Compiler CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compiler-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compiler:
+    name: ${{ matrix.os }} / Rust stable
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+
+    defaults:
+      run:
+        working-directory: compiler
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v6
+
+      - name: Install the stable Rust quality toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      - name: Select stable Rust
+        run: rustup default stable
+
+      - name: Install Linux native dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes build-essential pkg-config libssl-dev device-tree-compiler qemu-system-arm qemu-system-x86
+
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+
+      - name: Boot the freestanding DISP image and verify exact output
+        if: runner.os == 'Linux'
+        run: |
+          cargo run --locked -- build --freestanding examples/freestanding_multisector.disp
+          image=examples/build/freestanding_multisector-x86-bios.img
+          test "$(stat --format=%s "${image}")" -gt 512
+          test "$(( $(stat --format=%s "${image}") % 512 ))" -eq 0
+          set +e
+          timeout 3s qemu-system-x86_64 \
+            -drive format=raw,file="${image}" \
+            -display none -monitor none -serial none \
+            -debugcon "file:${RUNNER_TEMP}/disp-freestanding-output" \
+            -no-reboot -no-shutdown
+          status=$?
+          set -e
+          test "${status}" -eq 124
+          printf '55\r\n4000000005\r\n800000001\r\n-2000000100\r\n1000000050\r\n-2147483648\r\ntrue\r\n15\r\n6\r\n720\r\n253\r\n' > "${RUNNER_TEMP}/disp-freestanding-expected"
+          cmp "${RUNNER_TEMP}/disp-freestanding-expected" "${RUNNER_TEMP}/disp-freestanding-output"
+
+      - name: Boot the 32-bit protected-mode DISP image and verify exact output
+        if: runner.os == 'Linux'
+        run: |
+          cargo run --locked -- build --freestanding32 examples/protected32_hello.disp
+          image=examples/build/protected32_hello-x86-protected32.img
+          test "$(stat --format=%s "${image}")" -gt 512
+          test "$(( $(stat --format=%s "${image}") % 512 ))" -eq 0
+          set +e
+          timeout 3s qemu-system-x86_64 \
+            -drive format=raw,file="${image}" \
+            -display none -monitor none -serial none \
+            -debugcon "file:${RUNNER_TEMP}/disp-protected32-output" \
+            -no-reboot -no-shutdown
+          status=$?
+          set -e
+          test "${status}" -eq 124
+          printf 'Hello from 32-bit protected DISP\r\nFlat segments, bounded paging\r\n55\r\ntrue\r\n253\r\n65535\r\n4000000005\r\n-2000000100\r\n1000000050\r\ntrue\r\n-2147483648\r\n15\r\n720\r\ntrue\r\n35\r\n7\r\n' > "${RUNNER_TEMP}/disp-protected32-expected"
+          cmp "${RUNNER_TEMP}/disp-protected32-expected" "${RUNNER_TEMP}/disp-protected32-output"
+
+          cargo run --locked -- build --freestanding32 examples/protected32_bounds.disp
+          bounds_image=examples/build/protected32_bounds-x86-protected32.img
+          set +e
+          timeout 3s qemu-system-x86_64 \
+            -drive format=raw,file="${bounds_image}" \
+            -display none -monitor none -serial none \
+            -debugcon "file:${RUNNER_TEMP}/disp-protected32-bounds-output" \
+            -no-reboot -no-shutdown
+          status=$?
+          set -e
+          test "${status}" -eq 124
+          printf 'protected32 index out of bounds\r\n' > "${RUNNER_TEMP}/disp-protected32-bounds-expected"
+          cmp "${RUNNER_TEMP}/disp-protected32-bounds-expected" "${RUNNER_TEMP}/disp-protected32-bounds-output"
+
+          cargo run --locked -- build --freestanding32 examples/protected32_port.disp
+          port_image=examples/build/protected32_port-x86-protected32.img
+          set +e
+          timeout 3s qemu-system-x86_64 \
+            -drive format=raw,file="${port_image}" \
+            -display none -monitor none -serial none \
+            -debugcon "file:${RUNNER_TEMP}/disp-protected32-port-output" \
+            -no-reboot -no-shutdown
+          status=$?
+          set -e
+          test "${status}" -eq 124
+          printf 'Port I/O authorized\r\n' > "${RUNNER_TEMP}/disp-protected32-port-expected"
+          cmp "${RUNNER_TEMP}/disp-protected32-port-expected" "${RUNNER_TEMP}/disp-protected32-port-output"
+
+      - name: Boot the x86-64 long-mode DISP image and verify exact output
+        if: runner.os == 'Linux'
+        run: |
+          cargo run --locked -- build --freestanding64 examples/freestanding64_hello.disp
+          image=examples/build/freestanding64_hello-x86_64-long.img
+          test "$(stat --format=%s "${image}")" -gt 512
+          test "$(( $(stat --format=%s "${image}") % 512 ))" -eq 0
+          set +e
+          timeout 3s qemu-system-x86_64 \
+            -drive format=raw,file="${image}" \
+            -display none -monitor none -serial none \
+            -debugcon "file:${RUNNER_TEMP}/disp-freestanding64-output" \
+            -no-reboot -no-shutdown
+          status=$?
+          set -e
+          test "${status}" -eq 124
+          printf 'Hello from 64-bit DISP\r\nLong mode, four-level paging, 64-bit IDT\r\n' > "${RUNNER_TEMP}/disp-freestanding64-expected"
+          cmp "${RUNNER_TEMP}/disp-freestanding64-expected" "${RUNNER_TEMP}/disp-freestanding64-output"
+
+          cargo run --locked -- build --freestanding64 examples/freestanding64_scalars.disp
+          scalar_image=examples/build/freestanding64_scalars-x86_64-long.img
+          set +e
+          timeout 3s qemu-system-x86_64 \
+            -drive format=raw,file="${scalar_image}" \
+            -display none -monitor none -serial none \
+            -debugcon "file:${RUNNER_TEMP}/disp-freestanding64-scalars-output" \
+            -no-reboot -no-shutdown
+          status=$?
+          set -e
+          test "${status}" -eq 124
+          printf 'DISP x86-64 checked scalar profile\r\n55\r\ntrue\r\n-42\r\n255\r\n' > "${RUNNER_TEMP}/disp-freestanding64-scalars-expected"
+          cmp "${RUNNER_TEMP}/disp-freestanding64-scalars-expected" "${RUNNER_TEMP}/disp-freestanding64-scalars-output"
+
+          cargo run --locked -- build --freestanding64 examples/freestanding64_overflow.disp
+          overflow_image=examples/build/freestanding64_overflow-x86_64-long.img
+          set +e
+          timeout 3s qemu-system-x86_64 \
+            -drive format=raw,file="${overflow_image}" \
+            -display none -monitor none -serial none \
+            -debugcon "file:${RUNNER_TEMP}/disp-freestanding64-overflow-output" \
+            -no-reboot -no-shutdown
+          status=$?
+          set -e
+          test "${status}" -eq 124
+          printf 'x86-64 arithmetic failure\r\n' > "${RUNNER_TEMP}/disp-freestanding64-overflow-expected"
+          cmp "${RUNNER_TEMP}/disp-freestanding64-overflow-expected" "${RUNNER_TEMP}/disp-freestanding64-overflow-output"
+
+          cargo run --locked -- build --freestanding64 examples/freestanding64_functions.disp
+          functions_image=examples/build/freestanding64_functions-x86_64-long.img
+          set +e
+          timeout 3s qemu-system-x86_64 \
+            -drive format=raw,file="${functions_image}" \
+            -display none -monitor none -serial none \
+            -debugcon "file:${RUNNER_TEMP}/disp-freestanding64-functions-output" \
+            -no-reboot -no-shutdown
+          status=$?
+          set -e
+          test "${status}" -eq 124
+          printf 'DISP x86-64 guarded functions\r\n15\r\n720\r\ntrue\r\n-42\r\n' > "${RUNNER_TEMP}/disp-freestanding64-functions-expected"
+          cmp "${RUNNER_TEMP}/disp-freestanding64-functions-expected" "${RUNNER_TEMP}/disp-freestanding64-functions-output"
+
+          cargo run --locked -- build --freestanding64 examples/freestanding64_stack.disp
+          stack_image=examples/build/freestanding64_stack-x86_64-long.img
+          set +e
+          timeout 3s qemu-system-x86_64 \
+            -drive format=raw,file="${stack_image}" \
+            -display none -monitor none -serial none \
+            -debugcon "file:${RUNNER_TEMP}/disp-freestanding64-stack-output" \
+            -no-reboot -no-shutdown
+          status=$?
+          set -e
+          test "${status}" -eq 124
+          printf 'x86-64 stack limit exceeded\r\n' > "${RUNNER_TEMP}/disp-freestanding64-stack-expected"
+          cmp "${RUNNER_TEMP}/disp-freestanding64-stack-expected" "${RUNNER_TEMP}/disp-freestanding64-stack-output"
+
+          cargo run --locked -- build --freestanding64 examples/freestanding64_arrays.disp
+          arrays_image=examples/build/freestanding64_arrays-x86_64-long.img
+          set +e
+          timeout 3s qemu-system-x86_64 \
+            -drive format=raw,file="${arrays_image}" \
+            -display none -monitor none -serial none \
+            -debugcon "file:${RUNNER_TEMP}/disp-freestanding64-arrays-output" \
+            -no-reboot -no-shutdown
+          status=$?
+          set -e
+          test "${status}" -eq 124
+          printf 'DISP x86-64 checked fixed arrays\r\n35\r\n7\r\n' > "${RUNNER_TEMP}/disp-freestanding64-arrays-expected"
+          cmp "${RUNNER_TEMP}/disp-freestanding64-arrays-expected" "${RUNNER_TEMP}/disp-freestanding64-arrays-output"
+
+          cargo run --locked -- build --freestanding64 examples/freestanding64_bounds.disp
+          bounds64_image=examples/build/freestanding64_bounds-x86_64-long.img
+          set +e
+          timeout 3s qemu-system-x86_64 \
+            -drive format=raw,file="${bounds64_image}" \
+            -display none -monitor none -serial none \
+            -debugcon "file:${RUNNER_TEMP}/disp-freestanding64-bounds-output" \
+            -no-reboot -no-shutdown
+          status=$?
+          set -e
+          test "${status}" -eq 124
+          printf 'x86-64 index out of bounds\r\n' > "${RUNNER_TEMP}/disp-freestanding64-bounds-expected"
+          cmp "${RUNNER_TEMP}/disp-freestanding64-bounds-expected" "${RUNNER_TEMP}/disp-freestanding64-bounds-output"
+
+          cargo run --locked -- build --freestanding64 examples/freestanding64_port.disp
+          port64_image=examples/build/freestanding64_port-x86_64-long.img
+          set +e
+          timeout 3s qemu-system-x86_64 \
+            -drive format=raw,file="${port64_image}" \
+            -display none -monitor none -serial none \
+            -debugcon "file:${RUNNER_TEMP}/disp-freestanding64-port-output" \
+            -no-reboot -no-shutdown
+          status=$?
+          set -e
+          test "${status}" -eq 124
+          printf 'Port I/O authorized in x86-64\r\n' > "${RUNNER_TEMP}/disp-freestanding64-port-expected"
+          cmp "${RUNNER_TEMP}/disp-freestanding64-port-expected" "${RUNNER_TEMP}/disp-freestanding64-port-output"
+
+          cargo run --locked -- build --freestanding64 examples/freestanding64_timer.disp
+          timer64_image=examples/build/freestanding64_timer-x86_64-long.img
+          set +e
+          timeout 3s qemu-system-x86_64 \
+            -drive format=raw,file="${timer64_image}" \
+            -display none -monitor none -serial none \
+            -debugcon "file:${RUNNER_TEMP}/disp-freestanding64-timer-output" \
+            -no-reboot -no-shutdown
+          status=$?
+          set -e
+          test "${status}" -eq 124
+          printf 'DISP x86-64 capability timer active\r\n' > "${RUNNER_TEMP}/disp-freestanding64-timer-expected"
+          cmp "${RUNNER_TEMP}/disp-freestanding64-timer-expected" "${RUNNER_TEMP}/disp-freestanding64-timer-output"
+
+      - name: Boot the direct AArch64 DISP image and verify exact output
+        if: runner.os == 'Linux'
+        run: |
+          cargo run --locked -- build --freestanding-aarch64 examples/freestanding_aarch64_hello.disp
+          image=examples/build/freestanding_aarch64_hello-aarch64-virt-8.2.img
+          test "$(stat --format=%s "${image}")" -ge 64
+          test "$(( $(stat --format=%s "${image}") % 8 ))" -eq 0
+          set +e
+          timeout 3s qemu-system-aarch64 \
+            -machine virt-8.2 -cpu cortex-a53 -m 128M \
+            -kernel "${image}" \
+            -display none -monitor none \
+            -serial "file:${RUNNER_TEMP}/disp-aarch64-output" \
+            -no-reboot -no-shutdown
+          status=$?
+          set -e
+          test "${status}" -eq 124
+          printf 'Hello from AArch64 DISP\r\nDirect non-x86 machine code\r\n' > "${RUNNER_TEMP}/disp-aarch64-expected"
+          cmp "${RUNNER_TEMP}/disp-aarch64-expected" "${RUNNER_TEMP}/disp-aarch64-output"
+
+          cargo run --locked -- build --freestanding-aarch64 examples/freestanding_aarch64_scalars.disp
+          scalar_image=examples/build/freestanding_aarch64_scalars-aarch64-virt-8.2.img
+          set +e
+          timeout 3s qemu-system-aarch64 \
+            -machine virt-8.2 -cpu cortex-a53 -m 128M \
+            -kernel "${scalar_image}" \
+            -display none -monitor none \
+            -serial "file:${RUNNER_TEMP}/disp-aarch64-scalar-output" \
+            -no-reboot -no-shutdown
+          status=$?
+          set -e
+          test "${status}" -eq 124
+          printf 'AArch64 checked scalar control\r\n' > "${RUNNER_TEMP}/disp-aarch64-scalar-expected"
+          cmp "${RUNNER_TEMP}/disp-aarch64-scalar-expected" "${RUNNER_TEMP}/disp-aarch64-scalar-output"
+
+          cargo run --locked -- build --freestanding-aarch64 examples/freestanding_aarch64_exact_scalars.disp
+          exact_image=examples/build/freestanding_aarch64_exact_scalars-aarch64-virt-8.2.img
+          set +e
+          timeout 3s qemu-system-aarch64 \
+            -machine virt-8.2 -cpu cortex-a53 -m 128M \
+            -kernel "${exact_image}" \
+            -display none -monitor none \
+            -serial "file:${RUNNER_TEMP}/disp-aarch64-exact-output" \
+            -no-reboot -no-shutdown
+          status=$?
+          set -e
+          test "${status}" -eq 124
+          printf 'AArch64 exact scalar output\r\n255\r\n20000\r\n-42\r\n-2147483648\r\ntrue\r\n' > "${RUNNER_TEMP}/disp-aarch64-exact-expected"
+          cmp "${RUNNER_TEMP}/disp-aarch64-exact-expected" "${RUNNER_TEMP}/disp-aarch64-exact-output"
+
+          cargo run --locked -- build --freestanding-aarch64 examples/freestanding_aarch64_functions.disp
+          functions_image=examples/build/freestanding_aarch64_functions-aarch64-virt-8.2.img
+          set +e
+          timeout 3s qemu-system-aarch64 \
+            -machine virt-8.2 -cpu cortex-a53 -m 128M \
+            -kernel "${functions_image}" \
+            -display none -monitor none \
+            -serial "file:${RUNNER_TEMP}/disp-aarch64-functions-output" \
+            -no-reboot -no-shutdown
+          status=$?
+          set -e
+          test "${status}" -eq 124
+          printf 'AArch64 guarded functions\r\n720\r\n255\r\n65535\r\n-42\r\ntrue\r\n' > "${RUNNER_TEMP}/disp-aarch64-functions-expected"
+          cmp "${RUNNER_TEMP}/disp-aarch64-functions-expected" "${RUNNER_TEMP}/disp-aarch64-functions-output"
+
+          cargo run --locked -- build --freestanding-aarch64 examples/freestanding_aarch64_stack.disp
+          stack_image=examples/build/freestanding_aarch64_stack-aarch64-virt-8.2.img
+          set +e
+          timeout 3s qemu-system-aarch64 \
+            -machine virt-8.2 -cpu cortex-a53 -m 128M \
+            -kernel "${stack_image}" \
+            -display none -monitor none \
+            -serial "file:${RUNNER_TEMP}/disp-aarch64-stack-output" \
+            -no-reboot -no-shutdown
+          status=$?
+          set -e
+          test "${status}" -eq 124
+          printf '[DISP stack exhausted]\r\n' > "${RUNNER_TEMP}/disp-aarch64-stack-expected"
+          cmp "${RUNNER_TEMP}/disp-aarch64-stack-expected" "${RUNNER_TEMP}/disp-aarch64-stack-output"
+
+          cargo run --locked -- build --freestanding-aarch64 examples/freestanding_aarch64_arrays.disp
+          arrays_image=examples/build/freestanding_aarch64_arrays-aarch64-virt-8.2.img
+          set +e
+          timeout 3s qemu-system-aarch64 \
+            -machine virt-8.2 -cpu cortex-a53 -m 128M \
+            -kernel "${arrays_image}" \
+            -display none -monitor none \
+            -serial "file:${RUNNER_TEMP}/disp-aarch64-arrays-output" \
+            -no-reboot -no-shutdown
+          status=$?
+          set -e
+          test "${status}" -eq 124
+          printf 'AArch64 checked fixed arrays\r\n35\r\n7\r\n20000\r\n-42\r\ntrue\r\n' > "${RUNNER_TEMP}/disp-aarch64-arrays-expected"
+          cmp "${RUNNER_TEMP}/disp-aarch64-arrays-expected" "${RUNNER_TEMP}/disp-aarch64-arrays-output"
+
+          cargo run --locked -- build --freestanding-aarch64 examples/freestanding_aarch64_bounds.disp
+          bounds_image=examples/build/freestanding_aarch64_bounds-aarch64-virt-8.2.img
+          set +e
+          timeout 3s qemu-system-aarch64 \
+            -machine virt-8.2 -cpu cortex-a53 -m 128M \
+            -kernel "${bounds_image}" \
+            -display none -monitor none \
+            -serial "file:${RUNNER_TEMP}/disp-aarch64-bounds-output" \
+            -no-reboot -no-shutdown
+          status=$?
+          set -e
+          test "${status}" -eq 124
+          printf '[DISP index out of bounds]\r\n' > "${RUNNER_TEMP}/disp-aarch64-bounds-expected"
+          cmp "${RUNNER_TEMP}/disp-aarch64-bounds-expected" "${RUNNER_TEMP}/disp-aarch64-bounds-output"
+
+          cargo run --locked -- build --freestanding-aarch64 examples/freestanding_aarch64_exceptions.disp
+          exception_image=examples/build/freestanding_aarch64_exceptions-aarch64-virt-8.2.img
+          test "$(od -An -tx1 -j128 -N4 "${exception_image}" | tr -d ' \n')" = '1f2003d5'
+          set +e
+          timeout 3s qemu-system-aarch64 \
+            -machine virt-8.2 -cpu cortex-a53 -m 128M \
+            -kernel "${exception_image}" \
+            -display none -monitor none \
+            -serial "file:${RUNNER_TEMP}/disp-aarch64-exception-ready-output" \
+            -no-reboot -no-shutdown
+          status=$?
+          set -e
+          test "${status}" -eq 124
+          printf 'AArch64 exception vectors active\r\n' > "${RUNNER_TEMP}/disp-aarch64-exception-ready-expected"
+          cmp "${RUNNER_TEMP}/disp-aarch64-exception-ready-expected" "${RUNNER_TEMP}/disp-aarch64-exception-ready-output"
+
+          exception_probe="${RUNNER_TEMP}/disp-aarch64-exception-probe.img"
+          cp "${exception_image}" "${exception_probe}"
+          printf '\240\210\040\324' | dd of="${exception_probe}" bs=1 seek=128 conv=notrunc status=none
+          set +e
+          timeout 3s qemu-system-aarch64 \
+            -machine virt-8.2 -cpu cortex-a53 -m 128M \
+            -kernel "${exception_probe}" \
+            -display none -monitor none \
+            -serial "file:${RUNNER_TEMP}/disp-aarch64-exception-probe-output" \
+            -no-reboot -no-shutdown
+          status=$?
+          set -e
+          test "${status}" -eq 124
+          printf '[DISP synchronous exception]\r\n' > "${RUNNER_TEMP}/disp-aarch64-exception-probe-expected"
+          cmp "${RUNNER_TEMP}/disp-aarch64-exception-probe-expected" "${RUNNER_TEMP}/disp-aarch64-exception-probe-output"
+
+          cargo run --locked -- build --freestanding-aarch64 examples/freestanding_aarch64_mmu.disp
+          mmu_image=examples/build/freestanding_aarch64_mmu-aarch64-virt-8.2.img
+          test "$(od -An -tx1 -j280 -N4 "${mmu_image}" | tr -d ' \n')" = '1f2003d5'
+          set +e
+          timeout 3s qemu-system-aarch64 \
+            -machine virt-8.2 -cpu cortex-a53 -m 128M \
+            -kernel "${mmu_image}" \
+            -display none -monitor none \
+            -serial "file:${RUNNER_TEMP}/disp-aarch64-mmu-output" \
+            -no-reboot -no-shutdown
+          status=$?
+          set -e
+          test "${status}" -eq 124
+          printf 'AArch64 MMU W^X active\r\n' > "${RUNNER_TEMP}/disp-aarch64-mmu-expected"
+          cmp "${RUNNER_TEMP}/disp-aarch64-mmu-expected" "${RUNNER_TEMP}/disp-aarch64-mmu-output"
+
+          mmu_probe="${RUNNER_TEMP}/disp-aarch64-mmu-probe.img"
+          cp "${mmu_image}" "${mmu_probe}"
+          printf '\237\003\000\271' | dd of="${mmu_probe}" bs=1 seek=280 conv=notrunc status=none
+          set +e
+          timeout 3s qemu-system-aarch64 \
+            -machine virt-8.2 -cpu cortex-a53 -m 128M \
+            -kernel "${mmu_probe}" \
+            -display none -monitor none \
+            -serial "file:${RUNNER_TEMP}/disp-aarch64-mmu-probe-output" \
+            -no-reboot -no-shutdown
+          status=$?
+          set -e
+          test "${status}" -eq 124
+          printf '[DISP memory protection fault]\r\n' > "${RUNNER_TEMP}/disp-aarch64-mmu-probe-expected"
+          cmp "${RUNNER_TEMP}/disp-aarch64-mmu-probe-expected" "${RUNNER_TEMP}/disp-aarch64-mmu-probe-output"
+
+          cargo run --locked -- build --freestanding-aarch64 examples/freestanding_aarch64_overflow.disp
+          overflow_image=examples/build/freestanding_aarch64_overflow-aarch64-virt-8.2.img
+          set +e
+          timeout 3s qemu-system-aarch64 \
+            -machine virt-8.2 -cpu cortex-a53 -m 128M \
+            -kernel "${overflow_image}" \
+            -display none -monitor none \
+            -serial "file:${RUNNER_TEMP}/disp-aarch64-overflow-output" \
+            -no-reboot -no-shutdown
+          status=$?
+          set -e
+          test "${status}" -eq 124
+          printf '[DISP arithmetic fault]\r\n' > "${RUNNER_TEMP}/disp-aarch64-overflow-expected"
+          cmp "${RUNNER_TEMP}/disp-aarch64-overflow-expected" "${RUNNER_TEMP}/disp-aarch64-overflow-output"
+
+          cargo run --locked -- build --freestanding-aarch64 examples/freestanding_aarch64_dtb.disp
+          dtb_image=examples/build/freestanding_aarch64_dtb-aarch64-virt-8.2.img
+          dtc -I dts -O dtb -o "${RUNNER_TEMP}/disp-aarch64-test.dtb" examples/freestanding_aarch64_test.dts
+          set +e
+          timeout 3s qemu-system-aarch64 \
+            -machine virt-8.2 -cpu cortex-a53 -m 128M \
+            -kernel "${dtb_image}" -dtb "${RUNNER_TEMP}/disp-aarch64-test.dtb" \
+            -display none -monitor none \
+            -serial "file:${RUNNER_TEMP}/disp-aarch64-dtb-output" \
+            -no-reboot -no-shutdown
+          status=$?
+          set -e
+          test "${status}" -eq 124
+          printf 'AArch64 DTB discovery active\r\n' > "${RUNNER_TEMP}/disp-aarch64-dtb-expected"
+          cmp "${RUNNER_TEMP}/disp-aarch64-dtb-expected" "${RUNNER_TEMP}/disp-aarch64-dtb-output"
+
+          cargo run --locked -- build --freestanding-aarch64 examples/freestanding_aarch64_mmio.disp
+          mmio_image=examples/build/freestanding_aarch64_mmio-aarch64-virt-8.2.img
+          set +e
+          timeout 3s qemu-system-aarch64 \
+            -machine virt-8.2 -cpu cortex-a53 -m 128M \
+            -kernel "${mmio_image}" \
+            -display none -monitor none \
+            -serial "file:${RUNNER_TEMP}/disp-aarch64-mmio-output" \
+            -no-reboot -no-shutdown
+          status=$?
+          set -e
+          test "${status}" -eq 124
+          printf 'MMIO capability access active\r\n' > "${RUNNER_TEMP}/disp-aarch64-mmio-expected"
+          cmp "${RUNNER_TEMP}/disp-aarch64-mmio-expected" "${RUNNER_TEMP}/disp-aarch64-mmio-output"
+
+          cargo run --locked -- build --freestanding-aarch64 examples/freestanding_aarch64_mmio_bounds.disp
+          mmio_bounds_image=examples/build/freestanding_aarch64_mmio_bounds-aarch64-virt-8.2.img
+          set +e
+          timeout 3s qemu-system-aarch64 \
+            -machine virt-8.2 -cpu cortex-a53 -m 128M \
+            -kernel "${mmio_bounds_image}" \
+            -display none -monitor none \
+            -serial "file:${RUNNER_TEMP}/disp-aarch64-mmio-bounds-output" \
+            -no-reboot -no-shutdown
+          status=$?
+          set -e
+          test "${status}" -eq 124
+          printf '[DISP device access fault]\r\n' > "${RUNNER_TEMP}/disp-aarch64-mmio-bounds-expected"
+          cmp "${RUNNER_TEMP}/disp-aarch64-mmio-bounds-expected" "${RUNNER_TEMP}/disp-aarch64-mmio-bounds-output"
+
+      - name: Reject compiler warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build the default compiler without a static SQLite dependency
+        run: cargo build
+
+      - name: Verify the Linux compiler has no static SQLite dependency
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          if readelf -d target/debug/disp | grep -qi sqlite; then
+            echo "default compiler must not import SQLite" >&2
+            exit 1
+          fi
+
+      - name: Verify the Windows compiler has no static SQLite dependency
+        if: runner.os == 'Windows'
+        run: python ../tools/verify_pe_imports.py target/debug/disp.exe --forbid winsqlite3.dll --forbid sqlite3.dll
+
+      - name: Compile the trusted Linux cgroup launcher
+        if: runner.os == 'Linux'
+        run: |
+          cc -std=c11 -O2 -D_FORTIFY_SOURCE=3 -fstack-protector-strong -fPIE \
+            -Wall -Wextra -Werror ../support/linux/disp-cgroup-launch.c \
+            -Wl,-z,relro,-z,now -pie -o "${RUNNER_TEMP}/disp-cgroup-launch"
+          sh -n ../support/linux/disp-cgroup-setup
+          sh -n ../support/linux/install-cgroup-helper.sh
+          sh -n ../support/linux/test-cgroup-helper.sh
+          set +e
+          "${RUNNER_TEMP}/disp-cgroup-launch" 67108864 10000 4 5000 /bin/true
+          status=$?
+          set -e
+          test "${status}" -eq 125
+
+      - name: Execute Linux fallback sandbox probes
+        if: runner.os == 'Linux'
+        env:
+          DISP_LINUX_HARD_SANDBOX: off
+        run: cargo test --test sandbox --test components -- --nocapture
+
+      - name: Install and attack the privileged Linux boundary
+        if: runner.os == 'Linux'
+        run: |
+          sudo sh ../support/linux/install-cgroup-helper.sh
+          sh ../support/linux/test-cgroup-helper.sh
+
+      - name: Execute every target through the required Linux hard profile
+        if: runner.os == 'Linux'
+        env:
+          DISP_LINUX_HARD_SANDBOX: required
+        run: cargo test --all-targets --no-fail-fast
+
+      - name: Execute every Windows target
+        if: runner.os == 'Windows'
+        run: cargo test --all-targets --no-fail-fast

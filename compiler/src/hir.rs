@@ -31,6 +31,9 @@ pub enum Type {
     CString,
     CStr,
     Memory,
+    SecretBytes,
+    AeadEnvelope,
+    Ed25519SigningKey,
     Path,
     Url,
     Json,
@@ -60,17 +63,21 @@ pub enum Type {
     Task(Box<Type>),
     Mutex(Box<Type>),
     MutexGuard(Box<Type>),
+    Channel(Box<Type>),
     AtomicInt,
     Int { signed: bool, width: Option<u16> },
     Float { width: u16 },
     Reference { mutable: bool, inner: Box<Type> },
     RawPointer { mutable: bool, inner: Box<Type> },
+    MemoryPointer { mutable: bool, inner: Box<Type> },
     Struct(StructId, Vec<Type>),
     Enum(EnumId, Vec<Type>),
     Option(Box<Type>),
     Result(Box<Type>, Box<Type>),
     Generic(String),
     Function(Vec<Type>, Box<Type>),
+    CFunction(Vec<Type>, Box<Type>),
+    CRegistration,
     Unknown,
 }
 
@@ -86,7 +93,9 @@ impl Type {
             | Self::Duration
             | Self::IpAddress
             | Self::Reference { .. }
-            | Self::RawPointer { .. } => true,
+            | Self::RawPointer { .. }
+            | Self::MemoryPointer { .. }
+            | Self::CFunction(_, _) => true,
             Self::Struct(id, _) => program.copy_types.contains(&TypeId(id.0)),
             Self::Enum(id, _) => program
                 .copy_types
@@ -98,6 +107,9 @@ impl Type {
             Self::String
             | Self::CString
             | Self::Memory
+            | Self::SecretBytes
+            | Self::AeadEnvelope
+            | Self::Ed25519SigningKey
             | Self::Path
             | Self::Url
             | Self::Json
@@ -117,6 +129,7 @@ impl Type {
             | Self::Task(_)
             | Self::Mutex(_)
             | Self::MutexGuard(_)
+            | Self::Channel(_)
             | Self::AtomicInt
             | Self::ProcessCommand
             | Self::ChildProcess
@@ -125,6 +138,7 @@ impl Type {
             | Self::DataStore
             | Self::Generic(_)
             | Self::Function(_, _)
+            | Self::CRegistration
             | Self::Unknown => false,
         }
     }
@@ -189,6 +203,7 @@ pub struct Struct {
     pub type_id: TypeId,
     pub name: String,
     pub data: bool,
+    pub c_abi: bool,
     pub fields: Vec<Field>,
     pub span: Span,
     pub generic_parameters: Vec<String>,
@@ -252,6 +267,7 @@ pub struct Function {
     pub generic_parameters: Vec<String>,
     pub owner_impl: Option<ImplId>,
     pub external: Option<ExternalFunction>,
+    pub exported: bool,
     pub span: Span,
 }
 
@@ -324,7 +340,10 @@ pub enum StatementKind {
         body: Block,
     },
     Loop(Block),
-    Unsafe(Block),
+    Unsafe {
+        capabilities: Option<Vec<ast::Capability>>,
+        body: Block,
+    },
     Break,
     Continue,
 }
@@ -410,6 +429,7 @@ pub enum CallTarget {
     Function(FunctionId),
     TraitMethod { trait_id: TraitId, method: usize },
     Callable,
+    ForeignCallable,
     Intrinsic(String),
     Data(DataPlanId),
 }
@@ -424,6 +444,7 @@ pub enum ReceiverMode {
 #[derive(Debug, Clone)]
 pub struct MatchArm {
     pub pattern: Pattern,
+    pub guard: Option<Expr>,
     pub value: Expr,
     pub span: Span,
 }
@@ -433,6 +454,10 @@ pub enum Pattern {
     Wildcard,
     Binding(LocalId),
     Constant(Constant),
+    Struct {
+        struct_id: StructId,
+        fields: Vec<(usize, Pattern)>,
+    },
     Variant {
         enum_id: EnumId,
         variant_id: VariantId,
@@ -539,6 +564,7 @@ impl<'a> Lowering<'a> {
                 type_id: TypeId(index),
                 name: declaration.name.clone(),
                 data: declaration.data,
+                c_abi: declaration.c_abi,
                 fields: declaration
                     .fields
                     .iter()
@@ -755,6 +781,7 @@ impl<'a> Lowering<'a> {
                 library: external.library.clone(),
                 link_name: external.link_name.clone(),
             }),
+            exported: function.exported,
             span: function.span,
         })
     }
@@ -786,6 +813,11 @@ impl<'a> Lowering<'a> {
                     Box::new(self.lower_type(result)),
                 )
             }
+            "CFunction" if ty.arguments.len() == 1 => match self.lower_type(&ty.arguments[0]) {
+                Type::Function(parameters, result) => Type::CFunction(parameters, result),
+                _ => Type::Unknown,
+            },
+            "CRegistration" => Type::CRegistration,
             "unit" | "Unit" => Type::Unit,
             "bool" => Type::Bool,
             "char" => Type::Char,
@@ -794,6 +826,17 @@ impl<'a> Lowering<'a> {
             "CString" => Type::CString,
             "CStr" => Type::CStr,
             "Memory" => Type::Memory,
+            "SecretBytes" => Type::SecretBytes,
+            "AeadEnvelope" => Type::AeadEnvelope,
+            "Ed25519SigningKey" => Type::Ed25519SigningKey,
+            "MemoryPtr" if ty.arguments.len() == 1 => Type::MemoryPointer {
+                mutable: false,
+                inner: Box::new(self.lower_type(&ty.arguments[0])),
+            },
+            "MemoryMutPtr" if ty.arguments.len() == 1 => Type::MemoryPointer {
+                mutable: true,
+                inner: Box::new(self.lower_type(&ty.arguments[0])),
+            },
             "CInt" => Type::Int {
                 signed: true,
                 width: Some(32),
@@ -859,6 +902,7 @@ impl<'a> Lowering<'a> {
             "NetworkError" => Type::Generic("NetworkError".into()),
             "HttpError" => Type::Generic("HttpError".into()),
             "DataError" => Type::Generic("DataError".into()),
+            "CryptoError" => Type::Generic("CryptoError".into()),
             "[]" => Type::Slice(Box::new(
                 ty.arguments
                     .first()
@@ -919,6 +963,12 @@ impl<'a> Lowering<'a> {
                 ty.arguments
                     .first()
                     .map(|x| self.lower_type(x))
+                    .unwrap_or(Type::Unknown),
+            )),
+            "Channel" => Type::Channel(Box::new(
+                ty.arguments
+                    .first()
+                    .map(|value| self.lower_type(value))
                     .unwrap_or(Type::Unknown),
             )),
             "AtomicInt" => Type::AtomicInt,
@@ -1269,7 +1319,15 @@ impl FunctionLowering<'_, '_> {
                 }
             }
             ast::Statement::Loop(body) => StatementKind::Loop(self.lower_block(body)?),
-            ast::Statement::Unsafe(body) => StatementKind::Unsafe(self.lower_block(body)?),
+            ast::Statement::Unsafe { capabilities, body } => StatementKind::Unsafe {
+                capabilities: capabilities.as_ref().map(|capabilities| {
+                    capabilities
+                        .iter()
+                        .map(|capability| capability.capability)
+                        .collect()
+                }),
+                body: self.lower_block(body)?,
+            },
             ast::Statement::Break => StatementKind::Break,
             ast::Statement::Continue => StatementKind::Continue,
         };
@@ -1553,6 +1611,7 @@ impl FunctionLowering<'_, '_> {
                     generic_parameters: closure.generic_parameters,
                     owner_impl: None,
                     external: None,
+                    exported: false,
                     span: expression.span,
                 });
                 (
@@ -1662,28 +1721,43 @@ impl FunctionLowering<'_, '_> {
                     }
                 } else if let Some(function) = self.root.function_names.get(name).copied() {
                     let f = &self.root.ast.functions[function.0];
-                    (
-                        ExprKind::Function(function),
-                        Type::Function(
-                            f.parameters
-                                .iter()
-                                .map(|x| self.lower_type(&x.ty))
-                                .collect(),
-                            Box::new(if f.asynchronous {
-                                Type::Future(Box::new(
-                                    f.return_type
-                                        .as_ref()
-                                        .map(|x| self.lower_type(x))
-                                        .unwrap_or(Type::Unit),
-                                ))
-                            } else {
-                                f.return_type
-                                    .as_ref()
-                                    .map(|x| self.lower_type(x))
-                                    .unwrap_or(Type::Unit)
-                            }),
-                        ),
-                    )
+                    let result = f
+                        .return_type
+                        .as_ref()
+                        .map(|x| self.lower_type(x))
+                        .unwrap_or(Type::Unit);
+                    if f.external.is_some() {
+                        (
+                            ExprKind::Function(function),
+                            Type::CFunction(
+                                f.parameters
+                                    .iter()
+                                    .map(|x| self.lower_type(&x.ty))
+                                    .collect(),
+                                Box::new(result),
+                            ),
+                        )
+                    } else {
+                        (
+                            ExprKind::Function(function),
+                            Type::Function(
+                                f.parameters
+                                    .iter()
+                                    .map(|x| self.lower_type(&x.ty))
+                                    .collect(),
+                                Box::new(if f.asynchronous {
+                                    Type::Future(Box::new(
+                                        f.return_type
+                                            .as_ref()
+                                            .map(|x| self.lower_type(x))
+                                            .unwrap_or(Type::Unit),
+                                    ))
+                                } else {
+                                    result
+                                }),
+                            ),
+                        )
+                    }
                 } else if let Some((enum_id, variant_id)) = self.find_variant(name) {
                     (
                         ExprKind::Variant {
@@ -1807,7 +1881,9 @@ impl FunctionLowering<'_, '_> {
                 let x = self.lower_expr(x)?;
                 let (ty, raw) = match &x.ty {
                     Type::Reference { inner, .. } => ((**inner).clone(), false),
-                    Type::RawPointer { inner, .. } => ((**inner).clone(), true),
+                    Type::RawPointer { inner, .. } | Type::MemoryPointer { inner, .. } => {
+                        ((**inner).clone(), true)
+                    }
                     Type::MutexGuard(inner) => ((**inner).clone(), false),
                     _ => (Type::Unknown, false),
                 };
@@ -1866,11 +1942,17 @@ impl FunctionLowering<'_, '_> {
                     self.scopes.push(HashMap::new());
                     let pattern =
                         self.lower_pattern(&arm.pattern.node, &value.ty, arm.pattern.span)?;
+                    let guard = arm
+                        .guard
+                        .as_ref()
+                        .map(|guard| self.lower_expr(guard))
+                        .transpose()?;
                     let arm_value = self.lower_expr(&arm.value)?;
                     result_ty = merge_types(&result_ty, &arm_value.ty);
                     self.scopes.pop();
                     lowered.push(MatchArm {
                         pattern,
+                        guard,
                         value: arm_value,
                         span: arm.span,
                     });
@@ -2348,10 +2430,13 @@ impl FunctionLowering<'_, '_> {
                         .iter()
                         .map(|x| self.lower_expr(x))
                         .collect::<Result<Vec<_>, _>>()?;
-                    let element = args
-                        .first()
-                        .map(|value| value.ty.clone())
-                        .unwrap_or(Type::Unknown);
+                    let element = if field == "of" {
+                        args.first()
+                            .map(|value| value.ty.clone())
+                            .unwrap_or(Type::Unknown)
+                    } else {
+                        Type::Unknown
+                    };
                     return Ok(Expr {
                         kind: ExprKind::Call(Call {
                             target: CallTarget::Intrinsic(format!("List.{field}")),
@@ -2383,6 +2468,25 @@ impl FunctionLowering<'_, '_> {
                         span,
                     });
                 }
+                if owner == "Channel" {
+                    let args = arguments
+                        .iter()
+                        .map(|x| self.lower_expr(x))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    return Ok(Expr {
+                        kind: ExprKind::Call(Call {
+                            target: CallTarget::Intrinsic(format!("Channel.{field}")),
+                            arguments: args,
+                            receiver: None,
+                            substitutions: vec![],
+                        }),
+                        ty: Type::Result(
+                            Box::new(Type::Channel(Box::new(Type::Unknown))),
+                            Box::new(Type::String),
+                        ),
+                        span,
+                    });
+                }
                 if owner == "AtomicInt" {
                     let args = arguments
                         .iter()
@@ -2404,14 +2508,20 @@ impl FunctionLowering<'_, '_> {
                         .iter()
                         .map(|x| self.lower_expr(x))
                         .collect::<Result<Vec<_>, _>>()?;
-                    let key = args
-                        .first()
-                        .map(|value| value.ty.clone())
-                        .unwrap_or(Type::Unknown);
-                    let value = args
-                        .get(1)
-                        .map(|value| value.ty.clone())
-                        .unwrap_or(Type::Unknown);
+                    let key = if field == "of" {
+                        args.first()
+                            .map(|value| value.ty.clone())
+                            .unwrap_or(Type::Unknown)
+                    } else {
+                        Type::Unknown
+                    };
+                    let value = if field == "of" {
+                        args.get(1)
+                            .map(|value| value.ty.clone())
+                            .unwrap_or(Type::Unknown)
+                    } else {
+                        Type::Unknown
+                    };
                     return Ok(Expr {
                         kind: ExprKind::Call(Call {
                             target: CallTarget::Intrinsic(format!("Map.{field}")),
@@ -2428,10 +2538,13 @@ impl FunctionLowering<'_, '_> {
                         .iter()
                         .map(|x| self.lower_expr(x))
                         .collect::<Result<Vec<_>, _>>()?;
-                    let element = args
-                        .first()
-                        .map(|value| value.ty.clone())
-                        .unwrap_or(Type::Unknown);
+                    let element = if field == "of" {
+                        args.first()
+                            .map(|value| value.ty.clone())
+                            .unwrap_or(Type::Unknown)
+                    } else {
+                        Type::Unknown
+                    };
                     return Ok(Expr {
                         kind: ExprKind::Call(Call {
                             target: CallTarget::Intrinsic(format!("Set.{field}")),
@@ -2440,6 +2553,45 @@ impl FunctionLowering<'_, '_> {
                             substitutions: vec![element.clone()],
                         }),
                         ty: Type::Set(Box::new(element)),
+                        span,
+                    });
+                }
+                if owner == "CExport" && field == "callback" {
+                    let ast::Expression::Identifier(name) = &arguments[0].node else {
+                        unreachable!("type checking requires a named exported function")
+                    };
+                    let target = self.root.function_names[name];
+                    let function = &self.root.ast.functions[target.0];
+                    let mut parameters = function
+                        .parameters
+                        .iter()
+                        .map(|parameter| self.lower_type(&parameter.ty))
+                        .collect::<Vec<_>>();
+                    let result = function
+                        .return_type
+                        .as_ref()
+                        .map(|result| self.lower_type(result))
+                        .unwrap_or(Type::Unit);
+                    if !matches!(result, Type::Unit) {
+                        parameters.push(Type::RawPointer {
+                            mutable: true,
+                            inner: Box::new(result),
+                        });
+                    }
+                    return Ok(Expr {
+                        kind: ExprKind::Call(Call {
+                            target: CallTarget::Intrinsic(format!("CExport.callback:{name}")),
+                            arguments: vec![],
+                            receiver: None,
+                            substitutions: vec![],
+                        }),
+                        ty: Type::CFunction(
+                            parameters,
+                            Box::new(Type::Int {
+                                signed: true,
+                                width: Some(32),
+                            }),
+                        ),
                         span,
                     });
                 }
@@ -2454,6 +2606,10 @@ impl FunctionLowering<'_, '_> {
                         | "Process"
                         | "Database"
                         | "DataStore"
+                        | "Crypto"
+                        | "CRegistration"
+                        | "Port"
+                        | "Mmio"
                 ) {
                     let args = arguments
                         .iter()
@@ -2489,6 +2645,10 @@ impl FunctionLowering<'_, '_> {
                             signed: false,
                             width: None,
                         },
+                        ("Time", "ticks") => Type::Int {
+                            signed: false,
+                            width: Some(32),
+                        },
                         ("Time", "sleep") => Type::Unit,
                         ("Duration", _) => Type::Duration,
                         ("Environment", "arguments") => Type::List(Box::new(Type::String)),
@@ -2501,11 +2661,140 @@ impl FunctionLowering<'_, '_> {
                             Box::new(Type::Database),
                             Box::new(Type::Generic("DataError".into())),
                         ),
+                        ("Crypto", "random_bytes") => Type::Result(
+                            Box::new(Type::List(Box::new(Type::Int {
+                                signed: false,
+                                width: Some(8),
+                            }))),
+                            Box::new(Type::Generic("CryptoError".into())),
+                        ),
+                        ("Crypto", "random_secret" | "import_secret") => Type::Result(
+                            Box::new(Type::SecretBytes),
+                            Box::new(Type::Generic("CryptoError".into())),
+                        ),
+                        ("Crypto", "sha256" | "hmac_sha256") => Type::Result(
+                            Box::new(Type::List(Box::new(Type::Int {
+                                signed: false,
+                                width: Some(8),
+                            }))),
+                            Box::new(Type::Generic("CryptoError".into())),
+                        ),
+                        ("Crypto", "hmac_sha256_verify") => Type::Result(
+                            Box::new(Type::Bool),
+                            Box::new(Type::Generic("CryptoError".into())),
+                        ),
+                        ("Crypto", "hkdf_sha256") => Type::Result(
+                            Box::new(Type::SecretBytes),
+                            Box::new(Type::Generic("CryptoError".into())),
+                        ),
+                        ("Crypto", "aes256_gcm_siv_seal") => Type::Result(
+                            Box::new(Type::AeadEnvelope),
+                            Box::new(Type::Generic("CryptoError".into())),
+                        ),
+                        ("Crypto", "aes256_gcm_siv_open") => Type::Result(
+                            Box::new(Type::SecretBytes),
+                            Box::new(Type::Generic("CryptoError".into())),
+                        ),
+                        ("Crypto", "encode_aead_envelope") => Type::Result(
+                            Box::new(Type::List(Box::new(Type::Int {
+                                signed: false,
+                                width: Some(8),
+                            }))),
+                            Box::new(Type::Generic("CryptoError".into())),
+                        ),
+                        ("Crypto", "decode_aead_envelope") => Type::Result(
+                            Box::new(Type::AeadEnvelope),
+                            Box::new(Type::Generic("CryptoError".into())),
+                        ),
+                        ("Crypto", "ed25519_generate") => Type::Result(
+                            Box::new(Type::Ed25519SigningKey),
+                            Box::new(Type::Generic("CryptoError".into())),
+                        ),
+                        ("Crypto", "ed25519_public_key" | "ed25519_sign") => Type::Result(
+                            Box::new(Type::List(Box::new(Type::Int {
+                                signed: false,
+                                width: Some(8),
+                            }))),
+                            Box::new(Type::Generic("CryptoError".into())),
+                        ),
+                        ("Crypto", "ed25519_verify") => Type::Result(
+                            Box::new(Type::Bool),
+                            Box::new(Type::Generic("CryptoError".into())),
+                        ),
+                        ("Crypto", "ed25519_key_id") => Type::Result(
+                            Box::new(Type::List(Box::new(Type::Int {
+                                signed: false,
+                                width: Some(8),
+                            }))),
+                            Box::new(Type::Generic("CryptoError".into())),
+                        ),
+                        ("Crypto", "ed25519_verify_keyed") => Type::Result(
+                            Box::new(Type::Bool),
+                            Box::new(Type::Generic("CryptoError".into())),
+                        ),
+                        ("Crypto", "ed25519_verify_lifecycle") => Type::Result(
+                            Box::new(Type::Bool),
+                            Box::new(Type::Generic("CryptoError".into())),
+                        ),
+                        (
+                            "Crypto",
+                            "encode_ed25519_public_key"
+                            | "decode_ed25519_public_key"
+                            | "encode_ed25519_signature"
+                            | "decode_ed25519_signature",
+                        ) => Type::Result(
+                            Box::new(Type::List(Box::new(Type::Int {
+                                signed: false,
+                                width: Some(8),
+                            }))),
+                            Box::new(Type::Generic("CryptoError".into())),
+                        ),
+                        ("Crypto", "argon2id_hash_password") => Type::Result(
+                            Box::new(Type::String),
+                            Box::new(Type::Generic("CryptoError".into())),
+                        ),
+                        ("Crypto", "argon2id_verify_password") => Type::Result(
+                            Box::new(Type::Bool),
+                            Box::new(Type::Generic("CryptoError".into())),
+                        ),
+                        ("CRegistration", "adopt" | "adopt_async" | "register_async") => {
+                            Type::CRegistration
+                        }
+                        ("Port", "read_u8") => Type::Int {
+                            signed: false,
+                            width: Some(8),
+                        },
+                        ("Port", "write_u8") => Type::Unit,
+                        ("Mmio", "read_u8") => Type::Int {
+                            signed: false,
+                            width: Some(8),
+                        },
+                        ("Mmio", "read_u16") => Type::Int {
+                            signed: false,
+                            width: Some(16),
+                        },
+                        ("Mmio", "read_u32") => Type::Int {
+                            signed: false,
+                            width: Some(32),
+                        },
+                        ("Mmio", "write_u8" | "write_u16" | "write_u32") => Type::Unit,
                         _ => Type::Unknown,
+                    };
+                    let intrinsic = if owner == "CRegistration" && field == "register_async" {
+                        let target = match &args[0].kind {
+                            ExprKind::Function(target)
+                            | ExprKind::Closure {
+                                function: target, ..
+                            } => *target,
+                            _ => unreachable!("type checking requires a direct callback handler"),
+                        };
+                        format!("CRegistration.register_async:{}", target.0)
+                    } else {
+                        format!("{owner}.{field}")
                     };
                     return Ok(Expr {
                         kind: ExprKind::Call(Call {
-                            target: CallTarget::Intrinsic(format!("{owner}.{field}")),
+                            target: CallTarget::Intrinsic(intrinsic),
                             arguments: args,
                             receiver: None,
                             substitutions: vec![],
@@ -3386,6 +3675,29 @@ impl FunctionLowering<'_, '_> {
                     span,
                 });
             }
+            if matches!(receiver.ty, Type::Task(_))
+                && matches!(field.as_str(), "cancel" | "is_finished")
+            {
+                let mode = if field == "cancel" {
+                    ReceiverMode::Move
+                } else {
+                    ReceiverMode::Shared
+                };
+                return Ok(Expr {
+                    kind: ExprKind::Call(Call {
+                        target: CallTarget::Intrinsic(format!("Task.{field}")),
+                        arguments: vec![receiver],
+                        receiver: Some(mode),
+                        substitutions: vec![],
+                    }),
+                    ty: if field == "cancel" {
+                        Type::Unit
+                    } else {
+                        Type::Bool
+                    },
+                    span,
+                });
+            }
             if let Type::Mutex(value) = receiver.ty.clone()
                 && matches!(field.as_str(), "share" | "lock")
             {
@@ -3404,12 +3716,41 @@ impl FunctionLowering<'_, '_> {
                     span,
                 });
             }
-            if matches!(receiver.ty, Type::AtomicInt)
+            if let Type::Channel(value) = receiver.ty.clone()
                 && matches!(
                     field.as_str(),
-                    "share" | "load" | "store" | "add" | "fetch_add"
+                    "share" | "send" | "receive" | "close" | "len" | "capacity" | "is_closed"
                 )
             {
+                let mut args = vec![receiver];
+                args.extend(
+                    arguments
+                        .iter()
+                        .map(|x| self.lower_expr(x))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+                return Ok(Expr {
+                    kind: ExprKind::Call(Call {
+                        target: CallTarget::Intrinsic(format!("Channel.{field}")),
+                        arguments: args,
+                        receiver: Some(ReceiverMode::Shared),
+                        substitutions: vec![(*value).clone()],
+                    }),
+                    ty: match field.as_str() {
+                        "share" => Type::Channel(value),
+                        "send" | "is_closed" => Type::Bool,
+                        "receive" => Type::Option(value),
+                        "close" => Type::Unit,
+                        "len" | "capacity" => Type::Int {
+                            signed: false,
+                            width: None,
+                        },
+                        _ => unreachable!(),
+                    },
+                    span,
+                });
+            }
+            if matches!(receiver.ty, Type::AtomicInt) && atomic_int_method(field) {
                 let mut args = vec![receiver];
                 args.extend(
                     arguments
@@ -3426,7 +3767,7 @@ impl FunctionLowering<'_, '_> {
                     }),
                     ty: match field.as_str() {
                         "share" => Type::AtomicInt,
-                        "store" => Type::Unit,
+                        name if name.starts_with("store") => Type::Unit,
                         _ => Type::Int {
                             signed: true,
                             width: None,
@@ -3458,6 +3799,34 @@ impl FunctionLowering<'_, '_> {
                         "to_string" => Type::String,
                         "as_c_str" if matches!(receiver_ty, Type::CString) => Type::CStr,
                         _ => Type::Unknown,
+                    },
+                    span,
+                });
+            }
+            if matches!(receiver.ty, Type::SecretBytes)
+                && matches!(field.as_str(), "len" | "is_empty" | "constant_time_equals")
+            {
+                let mut args = vec![receiver];
+                args.extend(
+                    arguments
+                        .iter()
+                        .map(|x| self.lower_expr(x))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+                return Ok(Expr {
+                    kind: ExprKind::Call(Call {
+                        target: CallTarget::Intrinsic(format!("SecretBytes.{field}")),
+                        arguments: args,
+                        receiver: Some(ReceiverMode::Shared),
+                        substitutions: vec![],
+                    }),
+                    ty: if field == "len" {
+                        Type::Int {
+                            signed: false,
+                            width: None,
+                        }
+                    } else {
+                        Type::Bool
                     },
                     span,
                 });
@@ -3508,14 +3877,14 @@ impl FunctionLowering<'_, '_> {
                             signed: false,
                             width: Some(8),
                         },
-                        "as_ptr" => Type::RawPointer {
+                        "as_ptr" => Type::MemoryPointer {
                             mutable: false,
                             inner: Box::new(Type::Int {
                                 signed: false,
                                 width: Some(8),
                             }),
                         },
-                        "as_mut_ptr" => Type::RawPointer {
+                        "as_mut_ptr" => Type::MemoryPointer {
                             mutable: true,
                             inner: Box::new(Type::Int {
                                 signed: false,
@@ -3527,9 +3896,11 @@ impl FunctionLowering<'_, '_> {
                     span,
                 });
             }
-            if let Type::RawPointer { mutable, inner } = receiver.ty.clone()
+            if let Type::RawPointer { mutable, inner } | Type::MemoryPointer { mutable, inner } =
+                receiver.ty.clone()
                 && matches!(field.as_str(), "offset" | "read" | "write")
             {
+                let checked = matches!(receiver.ty, Type::MemoryPointer { .. });
                 let mut args = vec![receiver];
                 args.extend(
                     arguments
@@ -3539,12 +3910,20 @@ impl FunctionLowering<'_, '_> {
                 );
                 return Ok(Expr {
                     kind: ExprKind::Call(Call {
-                        target: CallTarget::Intrinsic(format!("RawPointer.{field}")),
+                        target: CallTarget::Intrinsic(format!(
+                            "{}.{field}",
+                            if checked {
+                                "MemoryPointer"
+                            } else {
+                                "RawPointer"
+                            }
+                        )),
                         arguments: args,
                         receiver: None,
                         substitutions: vec![(*inner).clone()],
                     }),
                     ty: match field.as_str() {
+                        "offset" if checked => Type::MemoryPointer { mutable, inner },
                         "offset" => Type::RawPointer { mutable, inner },
                         "read" => *inner,
                         _ => Type::Unit,
@@ -3657,6 +4036,28 @@ impl FunctionLowering<'_, '_> {
                         substitutions: vec![],
                     }),
                     ty: Type::Unit,
+                    span,
+                });
+            }
+            if matches!(receiver.ty, Type::CRegistration)
+                && matches!(field.as_str(), "close" | "is_active")
+            {
+                return Ok(Expr {
+                    kind: ExprKind::Call(Call {
+                        target: CallTarget::Intrinsic(format!("CRegistration.{field}")),
+                        arguments: vec![receiver],
+                        receiver: Some(if field == "close" {
+                            ReceiverMode::Move
+                        } else {
+                            ReceiverMode::Shared
+                        }),
+                        substitutions: vec![],
+                    }),
+                    ty: if field == "close" {
+                        Type::Unit
+                    } else {
+                        Type::Bool
+                    },
                     span,
                 });
             }
@@ -3909,12 +4310,18 @@ impl FunctionLowering<'_, '_> {
             }
         }
         let callable = self.lower_expr(callee)?;
-        let Type::Function(parameters, result) = callable.ty.clone() else {
-            return Err(Diagnostic::new(
-                DiagnosticKind::Internal,
-                "HIR lowering encountered an unresolved call target",
-                span,
-            ));
+        let (parameters, result, target) = match callable.ty.clone() {
+            Type::Function(parameters, result) => (parameters, result, CallTarget::Callable),
+            Type::CFunction(parameters, result) => {
+                (parameters, result, CallTarget::ForeignCallable)
+            }
+            _ => {
+                return Err(Diagnostic::new(
+                    DiagnosticKind::Internal,
+                    "HIR lowering encountered an unresolved call target",
+                    span,
+                ));
+            }
         };
         let mut args = Vec::with_capacity(arguments.len() + 1);
         args.push(callable);
@@ -3938,9 +4345,13 @@ impl FunctionLowering<'_, '_> {
         }
         Ok(Expr {
             kind: ExprKind::Call(Call {
-                target: CallTarget::Callable,
+                receiver: if matches!(target, CallTarget::Callable) {
+                    Some(ReceiverMode::Shared)
+                } else {
+                    None
+                },
+                target,
                 arguments: args,
-                receiver: Some(ReceiverMode::Shared),
                 substitutions: vec![],
             }),
             ty: *result,
@@ -4003,7 +4414,9 @@ impl FunctionLowering<'_, '_> {
             ast::Expression::Dereference(x) => {
                 let mut place = self.lower_place(x)?;
                 let projection = match self.place_type(&place) {
-                    Type::RawPointer { .. } => Projection::RawDereference,
+                    Type::RawPointer { .. } | Type::MemoryPointer { .. } => {
+                        Projection::RawDereference
+                    }
                     _ => Projection::SafeDereference,
                 };
                 place.projections.push(projection);
@@ -4021,7 +4434,10 @@ impl FunctionLowering<'_, '_> {
         for projection in &place.projections {
             match projection {
                 Projection::SafeDereference | Projection::RawDereference => {
-                    if let Type::Reference { inner, .. } | Type::RawPointer { inner, .. } = ty {
+                    if let Type::Reference { inner, .. }
+                    | Type::RawPointer { inner, .. }
+                    | Type::MemoryPointer { inner, .. } = ty
+                    {
                         ty = *inner
                     }
                 }
@@ -4139,14 +4555,75 @@ impl FunctionLowering<'_, '_> {
         span: Span,
     ) -> Result<Pattern, Diagnostic> {
         Ok(match pattern {
+            ast::Pattern::Or(_) => {
+                return Err(Diagnostic::new(
+                    DiagnosticKind::Internal,
+                    "unexpanded `|` pattern reached HIR lowering",
+                    span,
+                ));
+            }
             ast::Pattern::Wildcard => Pattern::Wildcard,
             ast::Pattern::Binding(name) => {
                 Pattern::Binding(self.declare(name, matched.clone(), false, false, span)?)
             }
             ast::Pattern::Integer(x) => Pattern::Constant(Constant::Unsigned(*x, None)),
+            ast::Pattern::NegativeInteger(magnitude) => {
+                let value = if *magnitude <= i128::MAX as u128 {
+                    -(*magnitude as i128)
+                } else if *magnitude == (1_u128 << 127) {
+                    i128::MIN
+                } else {
+                    return Err(Diagnostic::new(
+                        DiagnosticKind::Internal,
+                        "validated negative pattern exceeded i128",
+                        span,
+                    ));
+                };
+                Pattern::Constant(Constant::Signed(value, None))
+            }
             ast::Pattern::String(x) => Pattern::Constant(Constant::String(x.clone())),
             ast::Pattern::Character(x) => Pattern::Constant(Constant::Char(*x)),
             ast::Pattern::Bool(x) => Pattern::Constant(Constant::Bool(*x)),
+            ast::Pattern::Struct {
+                type_name, fields, ..
+            } => {
+                let struct_id = self.root.struct_names[type_name];
+                let declaration = &self.root.ast.structs[struct_id.0];
+                let substitutions = match matched {
+                    Type::Struct(_, arguments) => declaration
+                        .generics
+                        .iter()
+                        .map(|generic| generic.name.clone())
+                        .zip(arguments.iter().cloned())
+                        .collect(),
+                    _ => HashMap::new(),
+                };
+                Pattern::Struct {
+                    struct_id,
+                    fields: fields
+                        .iter()
+                        .map(|field| {
+                            let index = declaration
+                                .fields
+                                .iter()
+                                .position(|candidate| candidate.name == field.name)
+                                .unwrap();
+                            let field_ty = substitute_type(
+                                &self.lower_type(&declaration.fields[index].ty),
+                                &substitutions,
+                            );
+                            Ok((
+                                index,
+                                self.lower_pattern(
+                                    &field.pattern.node,
+                                    &field_ty,
+                                    field.pattern.span,
+                                )?,
+                            ))
+                        })
+                        .collect::<Result<_, Diagnostic>>()?,
+                }
+            }
             ast::Pattern::Variant {
                 type_name,
                 variant,
@@ -4398,14 +4875,19 @@ fn surface_type_is_copy(ty: &Type) -> bool {
         | Type::Float { .. }
         | Type::Reference { .. }
         | Type::RawPointer { .. }
+        | Type::MemoryPointer { .. }
         | Type::Str
         | Type::CStr
         | Type::Slice(_) => true,
+        Type::CFunction(_, _) => true,
         Type::Array(element, _) | Type::Option(element) => surface_type_is_copy(element),
         Type::Result(ok, error) => surface_type_is_copy(ok) && surface_type_is_copy(error),
         Type::String
         | Type::CString
         | Type::Memory
+        | Type::SecretBytes
+        | Type::AeadEnvelope
+        | Type::Ed25519SigningKey
         | Type::Path
         | Type::ProcessCommand
         | Type::ChildProcess
@@ -4431,11 +4913,13 @@ fn surface_type_is_copy(ty: &Type) -> bool {
         | Type::Task(_)
         | Type::Mutex(_)
         | Type::MutexGuard(_)
+        | Type::Channel(_)
         | Type::AtomicInt
         | Type::Struct(_, _)
         | Type::Enum(_, _)
         | Type::Generic(_)
         | Type::Function(_, _)
+        | Type::CRegistration
         | Type::Unknown => false,
         Type::Instant | Type::Duration => true,
     }
@@ -4545,12 +5029,40 @@ fn infer_named_type(
         | Type::Future(element)
         | Type::Task(element)
         | Type::Mutex(element)
-        | Type::MutexGuard(element) => std::slice::from_ref(element),
+        | Type::MutexGuard(element)
+        | Type::Channel(element) => std::slice::from_ref(element),
         _ => &[],
     };
     for (template, actual) in template.arguments.iter().zip(actual_arguments) {
         infer_named_type(template, actual, generics, inferred);
     }
+}
+
+fn atomic_int_method(name: &str) -> bool {
+    matches!(
+        name,
+        "share"
+            | "load"
+            | "load_relaxed"
+            | "load_acquire"
+            | "load_seq_cst"
+            | "store"
+            | "store_relaxed"
+            | "store_release"
+            | "store_seq_cst"
+            | "add"
+            | "add_relaxed"
+            | "add_acquire"
+            | "add_release"
+            | "add_acq_rel"
+            | "add_seq_cst"
+            | "fetch_add"
+            | "fetch_add_relaxed"
+            | "fetch_add_acquire"
+            | "fetch_add_release"
+            | "fetch_add_acq_rel"
+            | "fetch_add_seq_cst"
+    )
 }
 
 fn infer_hir_type(pattern: &Type, concrete: &Type, inferred: &mut HashMap<String, Type>) -> bool {
@@ -4592,9 +5104,9 @@ fn infer_hir_type(pattern: &Type, concrete: &Type, inferred: &mut HashMap<String
             infer_hir_type(x, y, inferred)
         }
         (Type::Task(x), Type::Task(y)) => infer_hir_type(x, y, inferred),
-        (Type::Mutex(x), Type::Mutex(y)) | (Type::MutexGuard(x), Type::MutexGuard(y)) => {
-            infer_hir_type(x, y, inferred)
-        }
+        (Type::Mutex(x), Type::Mutex(y))
+        | (Type::MutexGuard(x), Type::MutexGuard(y))
+        | (Type::Channel(x), Type::Channel(y)) => infer_hir_type(x, y, inferred),
         (
             Type::Reference {
                 mutable: a,
@@ -4611,6 +5123,16 @@ fn infer_hir_type(pattern: &Type, concrete: &Type, inferred: &mut HashMap<String
                 inner: x,
             },
             Type::RawPointer {
+                mutable: b,
+                inner: y,
+            },
+        ) if a == b => infer_hir_type(x, y, inferred),
+        (
+            Type::MemoryPointer {
+                mutable: a,
+                inner: x,
+            },
+            Type::MemoryPointer {
                 mutable: b,
                 inner: y,
             },
@@ -4633,6 +5155,10 @@ pub(crate) fn substitute_type(ty: &Type, substitutions: &HashMap<String, Type>) 
             inner: Box::new(substitute_type(inner, substitutions)),
         },
         Type::RawPointer { mutable, inner } => Type::RawPointer {
+            mutable: *mutable,
+            inner: Box::new(substitute_type(inner, substitutions)),
+        },
+        Type::MemoryPointer { mutable, inner } => Type::MemoryPointer {
             mutable: *mutable,
             inner: Box::new(substitute_type(inner, substitutions)),
         },
@@ -4668,11 +5194,19 @@ pub(crate) fn substitute_type(ty: &Type, substitutions: &HashMap<String, Type>) 
         Type::MutexGuard(inner) => {
             Type::MutexGuard(Box::new(substitute_type(inner, substitutions)))
         }
+        Type::Channel(inner) => Type::Channel(Box::new(substitute_type(inner, substitutions))),
         Type::Result(ok, error) => Type::Result(
             Box::new(substitute_type(ok, substitutions)),
             Box::new(substitute_type(error, substitutions)),
         ),
         Type::Function(arguments, result) => Type::Function(
+            arguments
+                .iter()
+                .map(|argument| substitute_type(argument, substitutions))
+                .collect(),
+            Box::new(substitute_type(result, substitutions)),
+        ),
+        Type::CFunction(arguments, result) => Type::CFunction(
             arguments
                 .iter()
                 .map(|argument| substitute_type(argument, substitutions))
@@ -4712,7 +5246,8 @@ fn fill_unknown(actual: &mut Type, expected: &Type) {
         (Type::Future(actual), Type::Future(expected)) => fill_unknown(actual, expected),
         (Type::Task(actual), Type::Task(expected)) => fill_unknown(actual, expected),
         (Type::Mutex(actual), Type::Mutex(expected))
-        | (Type::MutexGuard(actual), Type::MutexGuard(expected)) => fill_unknown(actual, expected),
+        | (Type::MutexGuard(actual), Type::MutexGuard(expected))
+        | (Type::Channel(actual), Type::Channel(expected)) => fill_unknown(actual, expected),
         (Type::Result(actual_ok, actual_error), Type::Result(expected_ok, expected_error)) => {
             fill_unknown(actual_ok, expected_ok);
             fill_unknown(actual_error, expected_error);
@@ -4726,6 +5261,12 @@ fn fill_unknown(actual: &mut Type, expected: &Type) {
         | (
             Type::RawPointer { inner: actual, .. },
             Type::RawPointer {
+                inner: expected, ..
+            },
+        )
+        | (
+            Type::MemoryPointer { inner: actual, .. },
+            Type::MemoryPointer {
                 inner: expected, ..
             },
         ) => {
@@ -4797,6 +5338,11 @@ fn coerce_contextual(actual: &mut Expr, expected: &Type) {
                     error
                 };
                 coerce_contextual(value, expected);
+            }
+        }
+        (ExprKind::Try(operand), expected) => {
+            if let Type::Result(_, error) = operand.ty.clone() {
+                coerce_contextual(operand, &Type::Result(Box::new(expected.clone()), error));
             }
         }
         _ => {}
@@ -4881,7 +5427,7 @@ fn validate_semantics_block(
                 validate_semantics_expr(iterable, functions, data_plans)?;
                 validate_semantics_block(body, functions, data_plans)?;
             }
-            StatementKind::Loop(block) | StatementKind::Unsafe(block) => {
+            StatementKind::Loop(block) | StatementKind::Unsafe { body: block, .. } => {
                 validate_semantics_block(block, functions, data_plans)?
             }
             StatementKind::Break | StatementKind::Continue => {}
@@ -4976,6 +5522,9 @@ fn validate_semantics_expr(
         ExprKind::Match { value, arms } => {
             validate_semantics_expr(value, functions, data_plans)?;
             for arm in arms {
+                if let Some(guard) = &arm.guard {
+                    validate_semantics_expr(guard, functions, data_plans)?;
+                }
                 validate_semantics_expr(&arm.value, functions, data_plans)?;
             }
         }
@@ -4994,6 +5543,7 @@ fn contains_unknown(ty: &Type) -> bool {
         Type::Unknown => true,
         Type::Reference { inner, .. }
         | Type::RawPointer { inner, .. }
+        | Type::MemoryPointer { inner, .. }
         | Type::Option(inner)
         | Type::Slice(inner)
         | Type::List(inner)
@@ -5006,7 +5556,7 @@ fn contains_unknown(ty: &Type) -> bool {
         Type::Struct(_, arguments) | Type::Enum(_, arguments) => {
             arguments.iter().any(contains_unknown)
         }
-        Type::Function(arguments, result) => {
+        Type::Function(arguments, result) | Type::CFunction(arguments, result) => {
             arguments.iter().any(contains_unknown) || contains_unknown(result)
         }
         _ => false,
@@ -5093,7 +5643,9 @@ fn validate_block(block: &Block, locals: usize) -> Result<(), Diagnostic> {
                 check(iterable)?;
                 validate_block(body, locals)?;
             }
-            StatementKind::Loop(x) | StatementKind::Unsafe(x) => validate_block(x, locals)?,
+            StatementKind::Loop(x) | StatementKind::Unsafe { body: x, .. } => {
+                validate_block(x, locals)?
+            }
             StatementKind::Break | StatementKind::Continue => {}
         }
     }
@@ -5158,6 +5710,9 @@ fn validate_expr(expr: &Expr, locals: usize) -> Result<(), Diagnostic> {
         ExprKind::Match { value, arms } => {
             validate_expr(value, locals)?;
             for arm in arms {
+                if let Some(guard) = &arm.guard {
+                    validate_expr(guard, locals)?;
+                }
                 validate_expr(&arm.value, locals)?;
             }
         }

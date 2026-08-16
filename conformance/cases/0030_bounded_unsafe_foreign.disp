@@ -1,0 +1,13 @@
+extern C {
+    fn abs(value: CInt) -> CInt
+}
+
+fn absolute(value: CInt) -> CInt uses Foreign {
+    unsafe uses Foreign {
+        return abs(value)
+    }
+}
+
+fn main() uses Foreign {
+    print(absolute(-7))
+}

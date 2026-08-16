@@ -264,6 +264,41 @@ async fn main() {{ print(await cancel(SocketAddress("127.0.0.1", {port}))) }}"#
 }
 
 #[test]
+fn explicit_cancellation_releases_a_started_socket_operation() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut byte = [0];
+        assert_eq!(stream.read(&mut byte).unwrap(), 0);
+    });
+    let source = format!(
+        r#"async fn cancel(address: SocketAddress) -> Result<bool, NetworkError> {{
+connected = await Async.connect(address)
+var stream = connected?
+task = Async.spawn(stream.read_async_timeout(1, Duration.from_seconds(30)))
+await Async.yield()
+task.cancel()
+stream.close()
+return Ok(true)
+}}
+async fn main() {{ print(await cancel(SocketAddress("127.0.0.1", {port}))) }}"#
+    );
+    let Some((actual, generated)) = native("explicit-cancel-polled-read", &source, true) else {
+        return;
+    };
+    assert_eq!(actual, "Result.Ok(true)\n");
+    server.join().unwrap();
+    let generated = generated.unwrap();
+    assert!(generated.contains("disp_task_cancel"));
+    assert!(generated.contains("disp_socket_io_drop"));
+    assert!(generated.contains("if(state->claimed)atomic_store_explicit"));
+}
+
+#[test]
 fn async_stream_types_mutability_and_source_spans_are_checked() {
     let bad_timeout = check_source(
         "async fn main() { future = Async.connect_timeout(SocketAddress(\"x\", 1), 10) }",

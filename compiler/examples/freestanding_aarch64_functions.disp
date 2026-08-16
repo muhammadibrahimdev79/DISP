@@ -1,0 +1,19 @@
+fn factorial(n: u32) -> u32 {
+    if n <= 1 {
+        return 1
+    }
+    return n * factorial(n - 1)
+}
+
+fn show_exact(byte: u8, word: u16, signed: i32, ready: bool) {
+    print(byte)
+    print(word)
+    print(signed)
+    print(ready)
+}
+
+fn main() {
+    print("AArch64 guarded functions")
+    print(factorial(6))
+    show_exact(u8(255), u16(65535), -42, true)
+}

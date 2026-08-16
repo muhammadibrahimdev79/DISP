@@ -8,7 +8,7 @@ use super::{
     abi::AbiProgram, allocator::C_ALLOCATOR, layout::substitute, mono, native_types,
     runtime::C_RUNTIME,
 };
-use crate::{ast, diagnostics::Diagnostic, hir, mir};
+use crate::{ast, diagnostics::Diagnostic, hir, limits, mir};
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fmt::Write,
@@ -19,6 +19,7 @@ pub fn generate(
     instances: &mono::MonoProgram,
     abi: &AbiProgram,
     declarations: &str,
+    library: bool,
 ) -> Result<Option<String>, Diagnostic> {
     if !instances.instances.iter().all(|instance| {
         let function = &program.functions[instance.function.0];
@@ -30,7 +31,8 @@ pub fn generate(
     }) {
         return Ok(None);
     }
-    let mut output = String::from(C_ALLOCATOR);
+    let mut output = limits::native_prelude();
+    output.push_str(C_ALLOCATOR);
     output.push_str(declarations);
     emit_source_map(program, &mut output);
     output.push_str(C_RUNTIME);
@@ -47,6 +49,26 @@ pub fn generate(
         .unwrap();
         prototype(program, instance, &mut output);
     }
+    let context_callbacks = c_context_callback_types(program, instances);
+    let exported = instances
+        .instances
+        .iter()
+        .filter(|instance| program.functions[instance.function.0].exported)
+        .collect::<Vec<_>>();
+    if !exported.is_empty() || !context_callbacks.is_empty() {
+        output.push_str(
+            "#ifdef _WIN32\n#define DISP_C_EXPORT __declspec(dllexport)\n#else\n#define DISP_C_EXPORT __attribute__((visibility(\"default\")))\n#endif\n\
+             DISP_C_EXPORT const char *disp_c_last_error(void){return disp_ffi_last_error;}\n\
+             DISP_C_EXPORT int32_t disp_c_thread_attach(void){if(disp_ffi_thread_attached){snprintf(disp_ffi_last_error,sizeof(disp_ffi_last_error),\"current thread is already attached to DISP\");return 4;}disp_ffi_thread_attached=true;disp_ffi_last_error[0]=0;return 0;}\n\
+             DISP_C_EXPORT int32_t disp_c_thread_detach(void){if(!disp_ffi_thread_attached){snprintf(disp_ffi_last_error,sizeof(disp_ffi_last_error),\"current thread is not attached to DISP\");return 3;}if(disp_ffi_panic_target){snprintf(disp_ffi_last_error,sizeof(disp_ffi_last_error),\"cannot detach during an active DISP export\");return 5;}disp_ffi_thread_attached=false;disp_ffi_last_error[0]=0;return 0;}\n",
+        );
+        for instance in &exported {
+            export_prototype(program, instance, &mut output);
+        }
+    }
+    for callback in &context_callbacks {
+        emit_c_context_callback(callback, &mut output);
+    }
     for result in task_result_types(program, instances) {
         task_result_drop_wrapper(program, &result, &mut output);
     }
@@ -61,6 +83,14 @@ pub fn generate(
     }
     for instance in &instances.instances {
         function(program, instance, &mut output)?;
+    }
+    if !exported.is_empty() {
+        for instance in exported {
+            export_wrapper(program, instance, &mut output);
+        }
+    }
+    if library {
+        return Ok(Some(output));
     }
     let entry_function = &program.functions[instances.entry.function.0];
     let entry_arguments = if entry_function.argument_count == 1 {
@@ -99,6 +129,190 @@ pub fn generate(
         .unwrap();
     }
     Ok(Some(output))
+}
+
+fn c_context_callback_name(handler: &hir::Type) -> String {
+    format!("disp_c_context_callback_{}", mono::type_code(handler))
+}
+
+fn c_context_callback_types(
+    program: &mir::Program,
+    instances: &mono::MonoProgram,
+) -> BTreeSet<hir::Type> {
+    let mut handlers = BTreeSet::new();
+    for instance in &instances.instances {
+        let function = &program.functions[instance.function.0];
+        let substitutions = mono::mapping(function, instance);
+        for block in &function.blocks {
+            if let mir::Terminator::Call {
+                target: hir::CallTarget::Intrinsic(name),
+                arguments,
+                ..
+            } = &block.terminator
+                && name.starts_with("CRegistration.register_async:")
+            {
+                handlers.insert(operand_ty(program, function, &arguments[0], &substitutions));
+            }
+        }
+    }
+    handlers
+}
+
+fn emit_c_context_callback(handler: &hir::Type, output: &mut String) {
+    let hir::Type::Function(parameters, result) = handler else {
+        unreachable!("validated captured callback handler has function type")
+    };
+    write!(
+        output,
+        "static int32_t {}(void *raw",
+        c_context_callback_name(handler)
+    )
+    .unwrap();
+    for (index, parameter) in parameters.iter().enumerate() {
+        write!(
+            output,
+            ",{} a{}",
+            native_types::c_type(parameter),
+            index + 1
+        )
+        .unwrap();
+    }
+    let has_result = !matches!(**result, hir::Type::Unit);
+    if has_result {
+        write!(output, ",{} *out_result", native_types::c_type(result)).unwrap();
+    }
+    output.push_str("){if(!disp_ffi_thread_attached){snprintf(disp_ffi_last_error,sizeof(disp_ffi_last_error),\"current thread is not attached to DISP\");return 3;}if(disp_ffi_panic_target){snprintf(disp_ffi_last_error,sizeof(disp_ffi_last_error),\"nested DISP C callback entry is unavailable\");return 2;}if(!raw){snprintf(disp_ffi_last_error,sizeof(disp_ffi_last_error),\"DISP callback context is null\");return 2;}");
+    if has_result {
+        output.push_str("if(!out_result){snprintf(disp_ffi_last_error,sizeof(disp_ffi_last_error),\"callback result pointer is null\");return 2;}");
+    }
+    output.push_str("disp_native_callable *callback=(disp_native_callable*)raw;if(!callback->code){snprintf(disp_ffi_last_error,sizeof(disp_ffi_last_error),\"DISP callback code is null\");return 2;}jmp_buf target;disp_ffi_panic_target=&target;if(setjmp(target)){disp_ffi_panic_target=NULL;return 1;}");
+    let mut signature = format!("{} (*)(void *", native_types::c_type(result));
+    for parameter in parameters {
+        write!(signature, ",{}", native_types::c_type(parameter)).unwrap();
+    }
+    signature.push(')');
+    let arguments = (0..parameters.len())
+        .map(|index| format!(",a{}", index + 1))
+        .collect::<String>();
+    if has_result {
+        write!(
+            output,
+            "{} value=(({})callback->code)(callback->env{});",
+            native_types::c_type(result),
+            signature,
+            arguments
+        )
+        .unwrap();
+    } else {
+        write!(
+            output,
+            "(void)((({})callback->code)(callback->env{}));",
+            signature, arguments
+        )
+        .unwrap();
+    }
+    output.push_str("disp_ffi_panic_target=NULL;disp_ffi_last_error[0]=0;");
+    if has_result {
+        output.push_str("*out_result=value;");
+    }
+    output.push_str("return 0;}\n");
+}
+
+fn export_prototype(
+    program: &mir::Program,
+    instance: &mono::FunctionInstance,
+    output: &mut String,
+) {
+    let function = &program.functions[instance.function.0];
+    let substitutions = mono::mapping(function, instance);
+    let result_ty = substitute(&function.locals[function.return_local.0].ty, &substitutions);
+    write!(output, "DISP_C_EXPORT int32_t {}(", function.name).unwrap();
+    let mut count = 0usize;
+    for index in 0..function.argument_count {
+        if count > 0 {
+            output.push(',');
+        }
+        let local = mir::LocalId(index + 1);
+        write!(
+            output,
+            "{} a{}",
+            c_local_type(function, local, &substitutions),
+            index + 1
+        )
+        .unwrap();
+        count += 1;
+    }
+    if !matches!(result_ty, hir::Type::Unit) {
+        if count > 0 {
+            output.push(',');
+        }
+        write!(output, "{} *out_result", native_types::c_type(&result_ty)).unwrap();
+        count += 1;
+    }
+    if count == 0 {
+        output.push_str("void");
+    }
+    output.push_str(");\n");
+}
+
+fn export_wrapper(program: &mir::Program, instance: &mono::FunctionInstance, output: &mut String) {
+    let function = &program.functions[instance.function.0];
+    let substitutions = mono::mapping(function, instance);
+    let result_ty = substitute(&function.locals[function.return_local.0].ty, &substitutions);
+    write!(output, "DISP_C_EXPORT int32_t {}(", function.name).unwrap();
+    let mut count = 0usize;
+    for index in 0..function.argument_count {
+        if count > 0 {
+            output.push(',');
+        }
+        let local = mir::LocalId(index + 1);
+        write!(
+            output,
+            "{} a{}",
+            c_local_type(function, local, &substitutions),
+            index + 1
+        )
+        .unwrap();
+        count += 1;
+    }
+    let has_result = !matches!(result_ty, hir::Type::Unit);
+    if has_result {
+        if count > 0 {
+            output.push(',');
+        }
+        write!(output, "{} *out_result", native_types::c_type(&result_ty)).unwrap();
+        count += 1;
+    }
+    if count == 0 {
+        output.push_str("void");
+    }
+    output.push_str("){if(!disp_ffi_thread_attached){snprintf(disp_ffi_last_error,sizeof(disp_ffi_last_error),\"current thread is not attached to DISP\");return 3;}if(disp_ffi_panic_target){snprintf(disp_ffi_last_error,sizeof(disp_ffi_last_error),\"nested DISP C export entry is unavailable\");return 2;}");
+    if has_result {
+        output.push_str("if(!out_result){snprintf(disp_ffi_last_error,sizeof(disp_ffi_last_error),\"export result pointer is null\");return 2;}");
+    }
+    output.push_str("jmp_buf _target;disp_ffi_panic_target=&_target;if(setjmp(_target)){disp_ffi_allocation_boundary_abort();disp_ffi_panic_target=NULL;return 1;}disp_ffi_allocation_boundary_begin();");
+    if has_result {
+        write!(
+            output,
+            "{} _result={}(",
+            native_types::c_type(&result_ty),
+            mono::mangle(program, instance)
+        )
+        .unwrap();
+    } else {
+        write!(output, "{}(", mono::mangle(program, instance)).unwrap();
+    }
+    for index in 0..function.argument_count {
+        if index > 0 {
+            output.push(',');
+        }
+        write!(output, "a{}", index + 1).unwrap();
+    }
+    output.push_str(");disp_ffi_allocation_boundary_finish();disp_ffi_panic_target=NULL;disp_ffi_last_error[0]=0;");
+    if has_result {
+        output.push_str("*out_result=_result;");
+    }
+    output.push_str("return 0;}\n");
 }
 
 fn json_codec_types(
@@ -1056,6 +1270,34 @@ fn thread_wrapper(program: &mir::Program, target: &mono::FunctionInstance, outpu
     writeln!(output, ");disp_dealloc(context);}}").unwrap();
 }
 
+fn atomic_operation(name: &str) -> Option<&'static str> {
+    if name == "load" || name.starts_with("load_") {
+        Some("load")
+    } else if name == "store" || name.starts_with("store_") {
+        Some("store")
+    } else if name == "add" || name.starts_with("add_") {
+        Some("add")
+    } else if name == "fetch_add" || name.starts_with("fetch_add_") {
+        Some("fetch_add")
+    } else {
+        None
+    }
+}
+
+fn atomic_c_order(name: &str) -> &'static str {
+    if name.ends_with("_relaxed") {
+        "memory_order_relaxed"
+    } else if name.ends_with("_acquire") {
+        "memory_order_acquire"
+    } else if name.ends_with("_release") {
+        "memory_order_release"
+    } else if name.ends_with("_acq_rel") {
+        "memory_order_acq_rel"
+    } else {
+        "memory_order_seq_cst"
+    }
+}
+
 pub fn supported(program: &mir::Program, ty: &hir::Type) -> bool {
     match ty {
         hir::Type::Unit
@@ -1066,6 +1308,9 @@ pub fn supported(program: &mir::Program, ty: &hir::Type) -> bool {
         | hir::Type::CString
         | hir::Type::CStr
         | hir::Type::Memory
+        | hir::Type::SecretBytes
+        | hir::Type::AeadEnvelope
+        | hir::Type::Ed25519SigningKey
         | hir::Type::Path
         | hir::Type::Url
         | hir::Type::Json
@@ -1085,12 +1330,15 @@ pub fn supported(program: &mir::Program, ty: &hir::Type) -> bool {
         | hir::Type::ProcessOutput
         | hir::Type::Database
         | hir::Type::DataStore
+        | hir::Type::CRegistration
         | hir::Type::Int { .. }
         | hir::Type::Float { .. } => true,
         hir::Type::AtomicInt => true,
         hir::Type::Thread(result) => supported(program, result),
         hir::Type::Future(result) | hir::Type::Task(result) => supported(program, result),
-        hir::Type::Mutex(value) | hir::Type::MutexGuard(value) => supported(program, value),
+        hir::Type::Mutex(value) | hir::Type::MutexGuard(value) | hir::Type::Channel(value) => {
+            supported(program, value)
+        }
         hir::Type::Struct(id, arguments) => {
             let declaration = &program.structs[id.0];
             let substitutions = declaration
@@ -1125,10 +1373,10 @@ pub fn supported(program: &mir::Program, ty: &hir::Type) -> bool {
         hir::Type::List(element) | hir::Type::Set(element) => supported(program, element),
         hir::Type::Map(key, value) => supported(program, key) && supported(program, value),
         hir::Type::Result(ok, error) => supported(program, ok) && supported(program, error),
-        hir::Type::Reference { inner, .. } | hir::Type::RawPointer { inner, .. } => {
-            supported(program, inner)
-        }
-        hir::Type::Function(arguments, result) => {
+        hir::Type::Reference { inner, .. }
+        | hir::Type::RawPointer { inner, .. }
+        | hir::Type::MemoryPointer { inner, .. } => supported(program, inner),
+        hir::Type::Function(arguments, result) | hir::Type::CFunction(arguments, result) => {
             arguments
                 .iter()
                 .all(|argument| supported(program, argument))
@@ -1137,7 +1385,12 @@ pub fn supported(program: &mir::Program, ty: &hir::Type) -> bool {
         hir::Type::Generic(name) => {
             matches!(
                 name.as_str(),
-                "ConversionError" | "IoError" | "NetworkError" | "HttpError" | "DataError"
+                "ConversionError"
+                    | "IoError"
+                    | "NetworkError"
+                    | "HttpError"
+                    | "DataError"
+                    | "CryptoError"
             )
         }
         _ => false,
@@ -1221,7 +1474,7 @@ fn function(
         )
         .unwrap();
     }
-    output.push_str("){\n");
+    output.push_str("){\ndisp_runtime_enter_call();\n");
     for local in &function.locals {
         writeln!(
             output,
@@ -1238,6 +1491,7 @@ fn function(
     output.push_str("goto bb0;\n");
     for (index, block) in function.blocks.iter().enumerate() {
         writeln!(output, "bb{index}:;").unwrap();
+        output.push_str("disp_runtime_charge_steps(1);\n");
         for statement in &block.statements {
             emit_statement(
                 program,
@@ -1297,6 +1551,7 @@ fn async_function(
     output.push_str("default:dv_panic(\"invalid async resume state\",0,0);return false;}\n");
     for (index, block) in function.blocks.iter().enumerate() {
         writeln!(output, "bb{index}:;").unwrap();
+        output.push_str("disp_runtime_charge_steps(1);\n");
         for statement in &block.statements {
             emit_statement(
                 program,
@@ -1578,6 +1833,52 @@ fn terminator(
                     format!("disp_future_sleep({duration})")
                 }
                 hir::CallTarget::Intrinsic(name)
+                    if matches!(
+                        name.as_str(),
+                        "MemoryPointer.offset" | "MemoryPointer.read" | "MemoryPointer.write"
+                    ) =>
+                {
+                    let pointer_ty = operand_ty(program, function, &arguments[0], substitutions);
+                    let pointer =
+                        operand(program, function, &arguments[0], &pointer_ty, substitutions);
+                    let hir::Type::MemoryPointer { inner, .. } = pointer_ty else {
+                        unreachable!()
+                    };
+                    let element_c = native_types::c_type(&inner);
+                    match name.as_str() {
+                        "MemoryPointer.offset" => {
+                            let offset_ty =
+                                operand_ty(program, function, &arguments[1], substitutions);
+                            let offset = operand(
+                                program,
+                                function,
+                                &arguments[1],
+                                &offset_ty,
+                                substitutions,
+                            );
+                            format!(
+                                "disp_memory_pointer_offset({pointer},(int64_t)({offset}),{},{})",
+                                span.start.line, span.start.column
+                            )
+                        }
+                        "MemoryPointer.read" => format!(
+                            "(*({element_c}*)disp_memory_pointer_access({pointer},sizeof({element_c}),_Alignof({element_c}),{},{}))",
+                            span.start.line, span.start.column
+                        ),
+                        "MemoryPointer.write" => {
+                            let value_ty =
+                                operand_ty(program, function, &arguments[1], substitutions);
+                            let value =
+                                operand(program, function, &arguments[1], &value_ty, substitutions);
+                            format!(
+                                "((*({element_c}*)disp_memory_pointer_access({pointer},sizeof({element_c}),_Alignof({element_c}),{},{})={value}),(disp_native_unit){{0}})",
+                                span.start.line, span.start.column
+                            )
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                hir::CallTarget::Intrinsic(name)
                     if matches!(name.as_str(), "Async.connect" | "Async.connect_timeout") =>
                 {
                     let hir::Type::Future(result) = &destination_ty else {
@@ -1817,6 +2118,39 @@ fn terminator(
                     };
                     format!("((({signature})(({callable}).code))(({callable}).env{suffix}))")
                 }
+                hir::CallTarget::ForeignCallable => {
+                    let callback_ty = operand_ty(program, function, &arguments[0], substitutions);
+                    let hir::Type::CFunction(parameters, result) = &callback_ty else {
+                        unreachable!("validated foreign callback must have CFunction type")
+                    };
+                    let callback = operand(
+                        program,
+                        function,
+                        &arguments[0],
+                        &callback_ty,
+                        substitutions,
+                    );
+                    let values = arguments[1..]
+                        .iter()
+                        .zip(parameters)
+                        .map(|(argument, expected)| {
+                            operand(program, function, argument, expected, substitutions)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    if matches!(**result, hir::Type::Unit) {
+                        format!(
+                            "({{if(!({callback}))dv_panic(\"null C callback\",{},{}) ;({callback})({values});(disp_native_unit){{0}};}})",
+                            span.start.line, span.start.column
+                        )
+                    } else {
+                        let result_c = native_types::c_type(result);
+                        format!(
+                            "({{if(!({callback}))dv_panic(\"null C callback\",{},{}) ;{result_c} _callback_result=({callback})({values});_callback_result;}})",
+                            span.start.line, span.start.column
+                        )
+                    }
+                }
                 hir::CallTarget::Intrinsic(name) if name == "print" => {
                     let argument_ty = operand_ty(program, function, &arguments[0], substitutions);
                     format!(
@@ -1880,6 +2214,22 @@ fn terminator(
                         "({{disp_native_thread _thread={value};disp_thread_wait(&_thread);{result_c} _result=*({result_c}*)_thread.result;disp_dealloc(_thread.result);_result;}})"
                     )
                 }
+                hir::CallTarget::Intrinsic(name)
+                    if matches!(name.as_str(), "Task.cancel" | "Task.is_finished") =>
+                {
+                    let task_ty = operand_ty(program, function, &arguments[0], substitutions);
+                    let task = operand(program, function, &arguments[0], &task_ty, substitutions);
+                    if name == "Task.cancel" {
+                        format!(
+                            "({{disp_native_task _task={task};disp_task_cancel(&_task);(disp_native_unit){{0}};}})"
+                        )
+                    } else {
+                        format!(
+                            "disp_task_is_finished({task},{},{})",
+                            span.start.line, span.start.column
+                        )
+                    }
+                }
                 hir::CallTarget::Intrinsic(name) if name == "Mutex.new" => {
                     let hir::Type::Mutex(value_ty) = &destination_ty else {
                         unreachable!()
@@ -1912,6 +2262,82 @@ fn terminator(
                         )
                     }
                 }
+                hir::CallTarget::Intrinsic(name) if name == "Channel.bounded" => {
+                    let hir::Type::Result(ok_ty, _) = &destination_ty else {
+                        unreachable!()
+                    };
+                    let hir::Type::Channel(value_ty) = ok_ty.as_ref() else {
+                        unreachable!()
+                    };
+                    let capacity_ty = operand_ty(program, function, &arguments[0], substitutions);
+                    let capacity = operand(
+                        program,
+                        function,
+                        &arguments[0],
+                        &capacity_ty,
+                        substitutions,
+                    );
+                    let value_c = native_types::c_type(value_ty);
+                    let result_c = native_types::c_type(&destination_ty);
+                    format!(
+                        "({{size_t _capacity=(size_t)({capacity});{result_c} _result={{0}};if(!_capacity){{_result.tag=1;_result.payload.v1.f0=disp_owned_bytes(\"Channel capacity must be greater than zero\",42);}}else if(_capacity>SIZE_MAX/sizeof({value_c})){{_result.tag=1;_result.payload.v1.f0=disp_owned_bytes(\"Channel capacity overflow\",25);}}else{{_result.tag=0;_result.payload.v0.f0=(disp_native_channel){{.state=disp_channel_create(_capacity,sizeof({value_c}),_Alignof({value_c}))}};}}_result;}})"
+                    )
+                }
+                hir::CallTarget::Intrinsic(name) if name.starts_with("Channel.") => {
+                    let receiver_ty = operand_ty(program, function, &arguments[0], substitutions);
+                    let value_ty = match &receiver_ty {
+                        hir::Type::Channel(value_ty) => value_ty.as_ref(),
+                        hir::Type::Reference { inner, .. } => {
+                            let hir::Type::Channel(value_ty) = inner.as_ref() else {
+                                unreachable!()
+                            };
+                            value_ty.as_ref()
+                        }
+                        _ => unreachable!(),
+                    };
+                    let receiver = operand(
+                        program,
+                        function,
+                        &arguments[0],
+                        &receiver_ty,
+                        substitutions,
+                    );
+                    match name.as_str() {
+                        "Channel.share" => format!(
+                            "({{disp_channel_retain(({receiver})->state);(disp_native_channel){{.state=({receiver})->state}};}})"
+                        ),
+                        "Channel.send" => {
+                            let value =
+                                operand(program, function, &arguments[1], value_ty, substitutions);
+                            let value_c = native_types::c_type(value_ty);
+                            let value_drop = drop_value(program, "_message", value_ty);
+                            format!(
+                                "({{{value_c} _message={value};bool _sent=disp_channel_send(({receiver})->state,&_message,{},{});if(!_sent){{{value_drop}}}_sent;}})",
+                                span.start.line, span.start.column
+                            )
+                        }
+                        "Channel.receive" => {
+                            let result_c = native_types::c_type(&destination_ty);
+                            format!(
+                                "({{{result_c} _result={{0}};if(disp_channel_receive(({receiver})->state,&_result.payload.v1.f0,{},{}))_result.tag=1;_result;}})",
+                                span.start.line, span.start.column
+                            )
+                        }
+                        "Channel.close" => format!(
+                            "(disp_channel_close(({receiver})->state),(disp_native_unit){{0}})"
+                        ),
+                        "Channel.len" => {
+                            format!("(uint64_t)disp_channel_len(({receiver})->state)")
+                        }
+                        "Channel.capacity" => {
+                            format!("(uint64_t)disp_channel_capacity(({receiver})->state)")
+                        }
+                        "Channel.is_closed" => {
+                            format!("disp_channel_is_closed(({receiver})->state)")
+                        }
+                        _ => unreachable!(),
+                    }
+                }
                 hir::CallTarget::Intrinsic(name) if name == "AtomicInt.new" => {
                     let value = operand(
                         program,
@@ -1936,12 +2362,15 @@ fn terminator(
                         &receiver_ty,
                         substitutions,
                     );
-                    match name.as_str() {
-                        "AtomicInt.share" => format!(
+                    let method = name.strip_prefix("AtomicInt.").unwrap();
+                    let operation = atomic_operation(method).unwrap_or(method);
+                    let order = atomic_c_order(method);
+                    match operation {
+                        "share" => format!(
                             "({{disp_atomic_int_retain(({receiver})->state);(disp_native_atomic_int){{.state=({receiver})->state}};}})"
                         ),
-                        "AtomicInt.load" => format!("disp_atomic_int_load(({receiver})->state)"),
-                        "AtomicInt.store" => {
+                        "load" => format!("disp_atomic_int_load(({receiver})->state,{order})"),
+                        "store" => {
                             let value = operand(
                                 program,
                                 function,
@@ -1953,10 +2382,10 @@ fn terminator(
                                 substitutions,
                             );
                             format!(
-                                "(disp_atomic_int_store(({receiver})->state,(int64_t)({value})),(disp_native_unit){{0}})"
+                                "(disp_atomic_int_store(({receiver})->state,(int64_t)({value}),{order}),(disp_native_unit){{0}})"
                             )
                         }
-                        "AtomicInt.fetch_add" | "AtomicInt.add" => {
+                        "fetch_add" | "add" => {
                             let value = operand(
                                 program,
                                 function,
@@ -1968,10 +2397,10 @@ fn terminator(
                                 substitutions,
                             );
                             let fetch = format!(
-                                "disp_atomic_int_fetch_add(({receiver})->state,(int64_t)({value}),{},{})",
+                                "disp_atomic_int_fetch_add(({receiver})->state,(int64_t)({value}),{order},{},{})",
                                 span.start.line, span.start.column
                             );
-                            if name == "AtomicInt.add" {
+                            if operation == "add" {
                                 format!("({fetch}+(int64_t)({value}))")
                             } else {
                                 fetch
@@ -2008,6 +2437,122 @@ fn terminator(
                         "({{const char *_data={data};size_t _len={len};{result_c} _result={{0}};if(_len&&memchr(_data,0,_len)){{_result.tag=1;_result.payload.v1.f0=disp_owned_bytes(\"{message}\",{});}}else{{_result.tag=0;_result.payload.v0.f0=disp_cstring_from_bytes(_data,_len);}}_result;}})",
                         message.len()
                     )
+                }
+                hir::CallTarget::Intrinsic(name) if name.starts_with("CExport.callback:") => {
+                    let symbol = name
+                        .strip_prefix("CExport.callback:")
+                        .expect("checked callback intrinsic has an export symbol");
+                    format!("(({}){symbol})", native_types::c_type(&destination_ty))
+                }
+                hir::CallTarget::Intrinsic(name) if name == "CRegistration.adopt" => {
+                    let context_ty = operand_ty(program, function, &arguments[0], substitutions);
+                    let release_ty = operand_ty(program, function, &arguments[1], substitutions);
+                    let context =
+                        operand(program, function, &arguments[0], &context_ty, substitutions);
+                    let release =
+                        operand(program, function, &arguments[1], &release_ty, substitutions);
+                    format!(
+                        "disp_c_registration_open((void*)({context}),NULL,(void (*)(void*))({release}),NULL,{},{})",
+                        span.start.line, span.start.column
+                    )
+                }
+                hir::CallTarget::Intrinsic(name) if name == "CRegistration.adopt_async" => {
+                    let context_ty = operand_ty(program, function, &arguments[0], substitutions);
+                    let quiesce_ty = operand_ty(program, function, &arguments[1], substitutions);
+                    let release_ty = operand_ty(program, function, &arguments[2], substitutions);
+                    let context =
+                        operand(program, function, &arguments[0], &context_ty, substitutions);
+                    let quiesce =
+                        operand(program, function, &arguments[1], &quiesce_ty, substitutions);
+                    let release =
+                        operand(program, function, &arguments[2], &release_ty, substitutions);
+                    format!(
+                        "({{if(!({quiesce}))dv_panic(\"C registration quiesce callback is null\",{},{});disp_c_registration_open((void*)({context}),(void (*)(void*))({quiesce}),(void (*)(void*))({release}),NULL,{},{});}})",
+                        span.start.line, span.start.column, span.start.line, span.start.column
+                    )
+                }
+                hir::CallTarget::Intrinsic(name)
+                    if name.starts_with("CRegistration.register_async:") =>
+                {
+                    let handler_ty = operand_ty(program, function, &arguments[0], substitutions);
+                    let register_ty = operand_ty(program, function, &arguments[1], substitutions);
+                    let quiesce_ty = operand_ty(program, function, &arguments[2], substitutions);
+                    let release_ty = operand_ty(program, function, &arguments[3], substitutions);
+                    let handler =
+                        operand(program, function, &arguments[0], &handler_ty, substitutions);
+                    let register = operand(
+                        program,
+                        function,
+                        &arguments[1],
+                        &register_ty,
+                        substitutions,
+                    );
+                    let quiesce =
+                        operand(program, function, &arguments[2], &quiesce_ty, substitutions);
+                    let release =
+                        operand(program, function, &arguments[3], &release_ty, substitutions);
+                    let hir::Type::Function(parameters, result) = &handler_ty else {
+                        unreachable!("validated captured callback handler has function type")
+                    };
+                    let mut trampoline_parameters = vec![hir::Type::RawPointer {
+                        mutable: true,
+                        inner: Box::new(hir::Type::Unit),
+                    }];
+                    trampoline_parameters.extend(parameters.clone());
+                    if !matches!(**result, hir::Type::Unit) {
+                        trampoline_parameters.push(hir::Type::RawPointer {
+                            mutable: true,
+                            inner: result.clone(),
+                        });
+                    }
+                    let trampoline_ty = hir::Type::CFunction(
+                        trampoline_parameters,
+                        Box::new(hir::Type::Int {
+                            signed: true,
+                            width: Some(32),
+                        }),
+                    );
+                    let trampoline = c_context_callback_name(&handler_ty);
+                    format!(
+                        "({{if(!({register}))dv_panic(\"C callback register function is null\",{},{});if(!({quiesce}))dv_panic(\"C registration quiesce callback is null\",{},{});if(!({release}))dv_panic(\"C registration release callback is null\",{},{});disp_native_callable *_callback=(disp_native_callable*)disp_alloc(sizeof(disp_native_callable),_Alignof(disp_native_callable));*_callback={handler};void *_context=({register})(({}){trampoline},(void*)_callback);if(!_context){{if(_callback->drop)_callback->drop(_callback->env);disp_dealloc(_callback);dv_panic(\"C callback provider returned a null registration context\",{},{});}}disp_c_registration_open(_context,(void (*)(void*))({quiesce}),(void (*)(void*))({release}),_callback,{},{});}})",
+                        span.start.line,
+                        span.start.column,
+                        span.start.line,
+                        span.start.column,
+                        span.start.line,
+                        span.start.column,
+                        native_types::c_type(&trampoline_ty),
+                        span.start.line,
+                        span.start.column,
+                        span.start.line,
+                        span.start.column
+                    )
+                }
+                hir::CallTarget::Intrinsic(name) if name == "CRegistration.close" => {
+                    let registration_ty =
+                        operand_ty(program, function, &arguments[0], substitutions);
+                    let registration = operand(
+                        program,
+                        function,
+                        &arguments[0],
+                        &registration_ty,
+                        substitutions,
+                    );
+                    format!(
+                        "({{disp_native_c_registration _registration={registration};disp_c_registration_close(&_registration);(disp_native_unit){{0}};}})"
+                    )
+                }
+                hir::CallTarget::Intrinsic(name) if name == "CRegistration.is_active" => {
+                    let registration_ty =
+                        operand_ty(program, function, &arguments[0], substitutions);
+                    let registration = operand(
+                        program,
+                        function,
+                        &arguments[0],
+                        &registration_ty,
+                        substitutions,
+                    );
+                    format!("(({registration})->active)")
                 }
                 hir::CallTarget::Intrinsic(name) if name == "Memory.allocate" => {
                     let size_ty = operand_ty(program, function, &arguments[0], substitutions);
@@ -2995,6 +3540,309 @@ fn terminator(
                         _ => unreachable!(),
                     }
                 }
+                hir::CallTarget::Intrinsic(name) if name == "Crypto.random_bytes" => {
+                    let actual = operand_ty(program, function, &arguments[0], substitutions);
+                    let length = operand(program, function, &arguments[0], &actual, substitutions);
+                    let result_c = native_types::c_type(&destination_ty);
+                    let hir::Type::Result(ok, _) = &destination_ty else {
+                        unreachable!()
+                    };
+                    let list_c = native_types::c_type(ok);
+                    let nonnegative = if matches!(actual, hir::Type::Int { signed: true, .. }) {
+                        format!("({length})>=0&&")
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "({{{result_c} _r={{0}};disp_native_string _bytes={{0}},_error={{0}};bool _valid={nonnegative}(unsigned __int128)({length})<=(unsigned __int128)SIZE_MAX;if(!_valid){{const char *_message=\"secure-random byte length must be a non-negative platform-sized integer\";_error=disp_owned_bytes(_message,strlen(_message));}}if(_valid&&disp_crypto_random_bytes((size_t)({length}),&_bytes,&_error)){{_r.tag=0;_r.payload.v0.f0=({list_c}){{.data=(uint8_t*)_bytes.data,.len=_bytes.len,.cap=_bytes.cap}};}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                    )
+                }
+                hir::CallTarget::Intrinsic(name) if name == "Crypto.random_secret" => {
+                    let actual = operand_ty(program, function, &arguments[0], substitutions);
+                    let length = operand(program, function, &arguments[0], &actual, substitutions);
+                    let result_c = native_types::c_type(&destination_ty);
+                    let nonnegative = if matches!(actual, hir::Type::Int { signed: true, .. }) {
+                        format!("({length})>=0&&")
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "({{{result_c} _r={{0}};disp_native_secret _secret={{0}};disp_native_string _error={{0}};bool _valid={nonnegative}(unsigned __int128)({length})<=(unsigned __int128)SIZE_MAX;if(!_valid){{const char *_message=\"secure-random byte length must be a non-negative platform-sized integer\";_error=disp_owned_bytes(_message,strlen(_message));}}if(_valid&&disp_crypto_random_secret((size_t)({length}),&_secret,&_error)){{_r.tag=0;_r.payload.v0.f0=_secret;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                    )
+                }
+                hir::CallTarget::Intrinsic(name) if name == "Crypto.import_secret" => {
+                    let bytes_ty = operand_ty(program, function, &arguments[0], substitutions);
+                    let bytes = operand(program, function, &arguments[0], &bytes_ty, substitutions);
+                    let bytes_c = native_types::c_type(&bytes_ty);
+                    let result_c = native_types::c_type(&destination_ty);
+                    format!(
+                        "({{{result_c} _r={{0}};{bytes_c} _bytes={bytes};disp_native_secret _secret={{0}};disp_native_string _error={{0}};if(disp_crypto_import_secret(_bytes.data,_bytes.len,_bytes.cap,&_secret,&_error)){{_r.tag=0;_r.payload.v0.f0=_secret;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                    )
+                }
+                hir::CallTarget::Intrinsic(name)
+                    if matches!(
+                        name.as_str(),
+                        "Crypto.sha256" | "Crypto.hmac_sha256" | "Crypto.hmac_sha256_verify"
+                    ) =>
+                {
+                    let result_c = native_types::c_type(&destination_ty);
+                    let message_index = usize::from(name != "Crypto.sha256");
+                    let (message, _) = system_argument(
+                        program,
+                        function,
+                        &arguments[message_index],
+                        substitutions,
+                    );
+                    if name == "Crypto.hmac_sha256_verify" {
+                        let (key, _) =
+                            system_argument(program, function, &arguments[0], substitutions);
+                        let (expected, _) =
+                            system_argument(program, function, &arguments[2], substitutions);
+                        format!(
+                            "({{{result_c} _r={{0}};disp_native_string _error={{0}};bool _valid=false;if(disp_crypto_hmac_sha256_verify({key},({message})->data,({message})->len,({expected})->data,({expected})->len,&_valid,&_error)){{_r.tag=0;_r.payload.v0.f0=_valid;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                        )
+                    } else {
+                        let hir::Type::Result(ok, _) = &destination_ty else {
+                            unreachable!()
+                        };
+                        let list_c = native_types::c_type(ok);
+                        let call = if name == "Crypto.sha256" {
+                            format!(
+                                "disp_crypto_sha256(({message})->data,({message})->len,&_digest,&_error)"
+                            )
+                        } else {
+                            let (key, _) =
+                                system_argument(program, function, &arguments[0], substitutions);
+                            format!(
+                                "disp_crypto_hmac_sha256({key},({message})->data,({message})->len,&_digest,&_error)"
+                            )
+                        };
+                        format!(
+                            "({{{result_c} _r={{0}};disp_native_string _digest={{0}},_error={{0}};if({call}){{_r.tag=0;_r.payload.v0.f0=({list_c}){{.data=(uint8_t*)_digest.data,.len=_digest.len,.cap=_digest.cap}};}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                        )
+                    }
+                }
+                hir::CallTarget::Intrinsic(name) if name == "Crypto.hkdf_sha256" => {
+                    let (salt, _) =
+                        system_argument(program, function, &arguments[0], substitutions);
+                    let (input, _) =
+                        system_argument(program, function, &arguments[1], substitutions);
+                    let (info, _) =
+                        system_argument(program, function, &arguments[2], substitutions);
+                    let length_ty = operand_ty(program, function, &arguments[3], substitutions);
+                    let length =
+                        operand(program, function, &arguments[3], &length_ty, substitutions);
+                    let result_c = native_types::c_type(&destination_ty);
+                    let nonnegative = if matches!(length_ty, hir::Type::Int { signed: true, .. }) {
+                        format!("({length})>=0&&")
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "({{{result_c} _r={{0}};disp_native_secret _output={{0}};disp_native_string _error={{0}};bool _valid={nonnegative}(unsigned __int128)({length})<=(unsigned __int128)SIZE_MAX;if(!_valid){{const char *_message=\"HKDF-SHA-256 output length must be a non-negative platform-sized integer\";_error=disp_owned_bytes(_message,strlen(_message));}}if(_valid&&disp_crypto_hkdf_sha256(({salt})->data,({salt})->len,{input},({info})->data,({info})->len,(size_t)({length}),&_output,&_error)){{_r.tag=0;_r.payload.v0.f0=_output;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                    )
+                }
+                hir::CallTarget::Intrinsic(name)
+                    if matches!(
+                        name.as_str(),
+                        "Crypto.aes256_gcm_siv_seal" | "Crypto.aes256_gcm_siv_open"
+                    ) =>
+                {
+                    let (key, _) = system_argument(program, function, &arguments[0], substitutions);
+                    let (input, _) =
+                        system_argument(program, function, &arguments[1], substitutions);
+                    let (associated_data, _) =
+                        system_argument(program, function, &arguments[2], substitutions);
+                    let result_c = native_types::c_type(&destination_ty);
+                    if name == "Crypto.aes256_gcm_siv_seal" {
+                        format!(
+                            "({{{result_c} _r={{0}};disp_native_string _envelope={{0}},_error={{0}};if(disp_crypto_aead_seal({key},{input},({associated_data})->data,({associated_data})->len,&_envelope,&_error)){{_r.tag=0;_r.payload.v0.f0=_envelope;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                        )
+                    } else {
+                        format!(
+                            "({{{result_c} _r={{0}};disp_native_secret _plaintext={{0}};disp_native_string _error={{0}};if(disp_crypto_aead_open({key},{input},({associated_data})->data,({associated_data})->len,&_plaintext,&_error)){{_r.tag=0;_r.payload.v0.f0=_plaintext;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                        )
+                    }
+                }
+                hir::CallTarget::Intrinsic(name)
+                    if matches!(
+                        name.as_str(),
+                        "Crypto.encode_aead_envelope" | "Crypto.decode_aead_envelope"
+                    ) =>
+                {
+                    let (input, _) =
+                        system_argument(program, function, &arguments[0], substitutions);
+                    let result_c = native_types::c_type(&destination_ty);
+                    let hir::Type::Result(ok, _) = &destination_ty else {
+                        unreachable!()
+                    };
+                    if name == "Crypto.encode_aead_envelope" {
+                        let list_c = native_types::c_type(ok);
+                        format!(
+                            "({{{result_c} _r={{0}};disp_native_string _encoded={{0}},_error={{0}};if(disp_crypto_aead_encode({input},&_encoded,&_error)){{_r.tag=0;_r.payload.v0.f0=({list_c}){{.data=(uint8_t*)_encoded.data,.len=_encoded.len,.cap=_encoded.cap}};}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                        )
+                    } else {
+                        format!(
+                            "({{{result_c} _r={{0}};disp_native_string _envelope={{0}},_error={{0}};if(disp_crypto_aead_decode(({input})->data,({input})->len,&_envelope,&_error)){{_r.tag=0;_r.payload.v0.f0=_envelope;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                        )
+                    }
+                }
+                hir::CallTarget::Intrinsic(name) if name == "Crypto.ed25519_generate" => {
+                    let result_c = native_types::c_type(&destination_ty);
+                    format!(
+                        "({{{result_c} _r={{0}};disp_native_secret _key={{0}};disp_native_string _error={{0}};if(disp_crypto_ed25519_generate(&_key,&_error)){{_r.tag=0;_r.payload.v0.f0=_key;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                    )
+                }
+                hir::CallTarget::Intrinsic(name)
+                    if matches!(
+                        name.as_str(),
+                        "Crypto.ed25519_public_key" | "Crypto.ed25519_sign"
+                    ) =>
+                {
+                    let (key, _) = system_argument(program, function, &arguments[0], substitutions);
+                    let result_c = native_types::c_type(&destination_ty);
+                    let hir::Type::Result(ok, _) = &destination_ty else {
+                        unreachable!()
+                    };
+                    let list_c = native_types::c_type(ok);
+                    let call = if name == "Crypto.ed25519_public_key" {
+                        format!("disp_crypto_ed25519_public_key({key},&_bytes,&_error)")
+                    } else {
+                        let (message, _) =
+                            system_argument(program, function, &arguments[1], substitutions);
+                        format!(
+                            "disp_crypto_ed25519_sign({key},({message})->data,({message})->len,&_bytes,&_error)"
+                        )
+                    };
+                    format!(
+                        "({{{result_c} _r={{0}};disp_native_string _bytes={{0}},_error={{0}};if({call}){{_r.tag=0;_r.payload.v0.f0=({list_c}){{.data=(uint8_t*)_bytes.data,.len=_bytes.len,.cap=_bytes.cap}};}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                    )
+                }
+                hir::CallTarget::Intrinsic(name) if name == "Crypto.ed25519_verify" => {
+                    let (public_key, _) =
+                        system_argument(program, function, &arguments[0], substitutions);
+                    let (message, _) =
+                        system_argument(program, function, &arguments[1], substitutions);
+                    let (signature, _) =
+                        system_argument(program, function, &arguments[2], substitutions);
+                    let result_c = native_types::c_type(&destination_ty);
+                    format!(
+                        "({{{result_c} _r={{0}};disp_native_string _error={{0}};bool _valid=false;if(disp_crypto_ed25519_verify(({public_key})->data,({public_key})->len,({message})->data,({message})->len,({signature})->data,({signature})->len,&_valid,&_error)){{_r.tag=0;_r.payload.v0.f0=_valid;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                    )
+                }
+                hir::CallTarget::Intrinsic(name) if name == "Crypto.ed25519_key_id" => {
+                    let (public_key, _) =
+                        system_argument(program, function, &arguments[0], substitutions);
+                    let result_c = native_types::c_type(&destination_ty);
+                    let hir::Type::Result(ok, _) = &destination_ty else {
+                        unreachable!()
+                    };
+                    let list_c = native_types::c_type(ok);
+                    format!(
+                        "({{{result_c} _r={{0}};disp_native_string _key_id={{0}},_error={{0}};if(disp_crypto_ed25519_key_id(({public_key})->data,({public_key})->len,&_key_id,&_error)){{_r.tag=0;_r.payload.v0.f0=({list_c}){{.data=(uint8_t*)_key_id.data,.len=_key_id.len,.cap=_key_id.cap}};}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                    )
+                }
+                hir::CallTarget::Intrinsic(name) if name == "Crypto.ed25519_verify_keyed" => {
+                    let (expected_key_id, _) =
+                        system_argument(program, function, &arguments[0], substitutions);
+                    let (public_key, _) =
+                        system_argument(program, function, &arguments[1], substitutions);
+                    let (message, _) =
+                        system_argument(program, function, &arguments[2], substitutions);
+                    let (signature, _) =
+                        system_argument(program, function, &arguments[3], substitutions);
+                    let result_c = native_types::c_type(&destination_ty);
+                    format!(
+                        "({{{result_c} _r={{0}};disp_native_string _error={{0}};bool _valid=false;if(disp_crypto_ed25519_verify_keyed(({expected_key_id})->data,({expected_key_id})->len,({public_key})->data,({public_key})->len,({message})->data,({message})->len,({signature})->data,({signature})->len,&_valid,&_error)){{_r.tag=0;_r.payload.v0.f0=_valid;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                    )
+                }
+                hir::CallTarget::Intrinsic(name) if name == "Crypto.ed25519_verify_lifecycle" => {
+                    let (expected_key_id, _) =
+                        system_argument(program, function, &arguments[0], substitutions);
+                    let (public_key, _) =
+                        system_argument(program, function, &arguments[1], substitutions);
+                    let (message, _) =
+                        system_argument(program, function, &arguments[2], substitutions);
+                    let (signature, _) =
+                        system_argument(program, function, &arguments[3], substitutions);
+                    let policy = (4..8)
+                        .map(|index| {
+                            let ty =
+                                operand_ty(program, function, &arguments[index], substitutions);
+                            operand(program, function, &arguments[index], &ty, substitutions)
+                        })
+                        .collect::<Vec<_>>();
+                    let valid_from = &policy[0];
+                    let valid_until = &policy[1];
+                    let revoked = &policy[2];
+                    let evaluation_time = &policy[3];
+                    let result_c = native_types::c_type(&destination_ty);
+                    format!(
+                        "({{{result_c} _r={{0}};disp_native_string _error={{0}};bool _valid=false;if(disp_crypto_ed25519_verify_lifecycle(({expected_key_id})->data,({expected_key_id})->len,({public_key})->data,({public_key})->len,({message})->data,({message})->len,({signature})->data,({signature})->len,(uint64_t)({valid_from}),(uint64_t)({valid_until}),({revoked}),(uint64_t)({evaluation_time}),&_valid,&_error)){{_r.tag=0;_r.payload.v0.f0=_valid;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                    )
+                }
+                hir::CallTarget::Intrinsic(name)
+                    if matches!(
+                        name.as_str(),
+                        "Crypto.encode_ed25519_public_key"
+                            | "Crypto.decode_ed25519_public_key"
+                            | "Crypto.encode_ed25519_signature"
+                            | "Crypto.decode_ed25519_signature"
+                    ) =>
+                {
+                    let (input, _) =
+                        system_argument(program, function, &arguments[0], substitutions);
+                    let result_c = native_types::c_type(&destination_ty);
+                    let hir::Type::Result(ok, _) = &destination_ty else {
+                        unreachable!()
+                    };
+                    let list_c = native_types::c_type(ok);
+                    let public_key = name.ends_with("public_key");
+                    let decode = name.contains("decode_");
+                    let kind = if public_key { 2 } else { 3 };
+                    let payload_length = if public_key { 32 } else { 64 };
+                    format!(
+                        "({{{result_c} _r={{0}};disp_native_string _output={{0}},_error={{0}};if(disp_crypto_ed25519_record(({input})->data,({input})->len,{kind},{payload_length},{decode},&_output,&_error)){{_r.tag=0;_r.payload.v0.f0=({list_c}){{.data=(uint8_t*)_output.data,.len=_output.len,.cap=_output.cap}};}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                    )
+                }
+                hir::CallTarget::Intrinsic(name) if name == "Crypto.argon2id_hash_password" => {
+                    let (password, _) =
+                        system_argument(program, function, &arguments[0], substitutions);
+                    let result_c = native_types::c_type(&destination_ty);
+                    format!(
+                        "({{{result_c} _r={{0}};disp_native_string _encoded={{0}},_error={{0}};if(disp_crypto_argon2id_hash({password},&_encoded,&_error)){{_r.tag=0;_r.payload.v0.f0=_encoded;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                    )
+                }
+                hir::CallTarget::Intrinsic(name) if name == "Crypto.argon2id_verify_password" => {
+                    let (password, _) =
+                        system_argument(program, function, &arguments[0], substitutions);
+                    let (encoded, _) =
+                        system_argument(program, function, &arguments[1], substitutions);
+                    let result_c = native_types::c_type(&destination_ty);
+                    format!(
+                        "({{{result_c} _r={{0}};disp_native_string _error={{0}};bool _valid=false;if(disp_crypto_argon2id_verify({password},({encoded})->data,({encoded})->len,&_valid,&_error)){{_r.tag=0;_r.payload.v0.f0=_valid;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                    )
+                }
+                hir::CallTarget::Intrinsic(name) if name.starts_with("SecretBytes.") => {
+                    let receiver_ty = operand_ty(program, function, &arguments[0], substitutions);
+                    let receiver = operand(
+                        program,
+                        function,
+                        &arguments[0],
+                        &receiver_ty,
+                        substitutions,
+                    );
+                    match name.as_str() {
+                        "SecretBytes.len" => format!("({receiver})->len"),
+                        "SecretBytes.is_empty" => format!("(({receiver})->len==0)"),
+                        "SecretBytes.constant_time_equals" => {
+                            let (other, _) =
+                                system_argument(program, function, &arguments[1], substitutions);
+                            format!("disp_secret_constant_time_equals({receiver},{other})")
+                        }
+                        _ => unreachable!(),
+                    }
+                }
                 hir::CallTarget::Intrinsic(name)
                     if matches!(
                         name.as_str(),
@@ -3086,7 +3934,7 @@ fn terminator(
                         system_argument(program, function, &arguments[1], substitutions);
                     let result_c = native_types::c_type(&destination_ty);
                     format!(
-                        "({{disp_native_process_command _c={{.program=*{path},.args=({args})->data,.args_len=({args})->len,.args_cap=({args})->len}};{result_c} _r={{0}};disp_native_process_output _output={{0}};disp_native_string _error={{0}};if(disp_process_run_command(&_c,&_output,&_error)){{_r.tag=0;_r.payload.v0.f0=_output;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
+                        "({{disp_native_process_command _c={{.program=*{path},.args=({args})->data,.args_len=({args})->len,.args_cap=({args})->len}};{result_c} _r={{0}};disp_native_process_output _output={{0}};disp_native_string _error={{0}};disp_runtime_charge_process_start();disp_runtime_acquire_handle();bool _ok=disp_process_run_command(&_c,&_output,&_error);disp_runtime_release_handle();if(_ok){{_r.tag=0;_r.payload.v0.f0=_output;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})"
                     )
                 }
                 hir::CallTarget::Intrinsic(name) if name.starts_with("ProcessCommand.") => {
@@ -3098,11 +3946,11 @@ fn terminator(
                         let command_c = native_types::c_type(&hir::Type::ProcessCommand);
                         if name == "ProcessCommand.run" {
                             format!(
-                                "({{{command_c} _c={command};{result_c} _r={{0}};disp_native_process_output _output={{0}};disp_native_string _error={{0}};if(disp_process_run_command(&_c,&_output,&_error)){{_r.tag=0;_r.payload.v0.f0=_output;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}disp_process_command_drop(&_c);_r;}})"
+                                "({{{command_c} _c={command};{result_c} _r={{0}};disp_native_process_output _output={{0}};disp_native_string _error={{0}};disp_runtime_charge_process_start();disp_runtime_acquire_handle();bool _ok=disp_process_run_command(&_c,&_output,&_error);disp_runtime_release_handle();if(_ok){{_r.tag=0;_r.payload.v0.f0=_output;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}disp_process_command_drop(&_c);_r;}})"
                             )
                         } else {
                             format!(
-                                "({{{command_c} _c={command};{result_c} _r={{0}};disp_native_child_process _child={{0}};disp_native_string _error={{0}};if(disp_process_start_command(&_c,&_child,&_error)){{_r.tag=0;_r.payload.v0.f0=_child;}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}disp_process_command_drop(&_c);_r;}})"
+                                "({{{command_c} _c={command};{result_c} _r={{0}};disp_native_child_process _child={{0}};disp_native_string _error={{0}};disp_runtime_charge_process_start();disp_runtime_acquire_handle();if(disp_process_start_command(&_c,&_child,&_error)){{_child.state->handle_charged=true;_r.tag=0;_r.payload.v0.f0=_child;}}else{{disp_runtime_release_handle();_r.tag=1;_r.payload.v1.f0=_error;}}disp_process_command_drop(&_c);_r;}})"
                             )
                         }
                     } else {
@@ -3397,6 +4245,7 @@ fn terminator(
                     match name.as_str() {
                         "Time.now" => "(disp_native_instant){.nanos=disp_time_now_nanos()}".into(),
                         "Time.unix_seconds" => "disp_time_unix_seconds()".into(),
+                        "Time.ticks" => "((uint32_t)(disp_time_now_nanos()/10000000ULL))".into(),
                         "Time.sleep" => {
                             let actual =
                                 operand_ty(program, function, &arguments[0], substitutions);
@@ -3659,9 +4508,9 @@ fn terminator(
                         "Memory.len" => format!("({receiver})->len"),
                         "Memory.alignment" => format!("({receiver})->align"),
                         "Memory.is_empty" => format!("(({receiver})->len==0)"),
-                        "Memory.as_ptr" | "Memory.as_mut_ptr" => {
-                            format!("({receiver})->data")
-                        }
+                        "Memory.as_ptr" | "Memory.as_mut_ptr" => format!(
+                            "(disp_native_memory_pointer){{.address=({receiver})->data,.base=({receiver})->data,.byte_len=({receiver})->len,.element_size=sizeof(uint8_t),.element_align=_Alignof(uint8_t)}}"
+                        ),
                         "Memory.read" => {
                             let index_ty =
                                 operand_ty(program, function, &arguments[1], substitutions);
@@ -4001,7 +4850,7 @@ fn terminator(
             c_local_type(function, function.return_local, substitutions)
         )
         .unwrap(),
-        mir::Terminator::Return => output.push_str("return l0;\n"),
+        mir::Terminator::Return => output.push_str("disp_runtime_leave_call();return l0;\n"),
         mir::Terminator::Unreachable => {
             output.push_str("dv_panic(\"entered unreachable MIR block\",0,0);\n")
         }
@@ -4025,6 +4874,13 @@ fn rvalue(
                 function: *target,
                 substitutions: vec![],
             };
+            if matches!(expected, hir::Type::CFunction(_, _)) {
+                return format!(
+                    "({}){}",
+                    native_types::c_type(expected),
+                    mono::mangle(program, &target)
+                );
+            }
             format!(
                 "(disp_native_callable){{.code=(void (*)(void)){},.env=NULL,.drop=NULL}}",
                 callable_wrapper_name(program, &target)
@@ -5262,6 +6118,9 @@ fn to_dv(value: &str, ty: &hir::Type) -> String {
         hir::Type::CString => format!("dv_string(({value}).data,({value}).len)"),
         hir::Type::CStr => format!("dv_string(({value}),strlen({value}))"),
         hir::Type::Memory => "dv_string(\"<Memory>\",8)".into(),
+        hir::Type::SecretBytes => "dv_string(\"<SecretBytes:redacted>\",22)".into(),
+        hir::Type::AeadEnvelope => "dv_string(\"<AeadEnvelope>\",14)".into(),
+        hir::Type::Ed25519SigningKey => "dv_string(\"<Ed25519SigningKey:redacted>\",28)".into(),
         hir::Type::Path => format!("dv_string(({value}).data,({value}).len)"),
         hir::Type::Url => format!("dv_string(({value}).data,({value}).len)"),
         hir::Type::Json => format!("dv_string(({value}).data,({value}).len)"),
@@ -5511,6 +6370,9 @@ fn drop_value_depth(program: &mir::Program, value: &str, ty: &hir::Type, depth: 
         hir::Type::String => format!("disp_string_drop(&({value}));"),
         hir::Type::CString => format!("disp_cstring_drop(&({value}));"),
         hir::Type::Memory => format!("disp_memory_drop(&({value}));"),
+        hir::Type::SecretBytes => format!("disp_secret_drop(&({value}));"),
+        hir::Type::AeadEnvelope => format!("disp_string_drop(&({value}));"),
+        hir::Type::Ed25519SigningKey => format!("disp_secret_drop(&({value}));"),
         hir::Type::Path => format!("disp_path_drop(&({value}));"),
         hir::Type::Url => format!("disp_url_drop(&({value}));"),
         hir::Type::Json => format!("disp_json_drop(&({value}));"),
@@ -5565,6 +6427,17 @@ fn drop_value_depth(program: &mir::Program, value: &str, ty: &hir::Type, depth: 
             );
             format!(
                 "{{if(({value}).state){{disp_mutex_unlock(({value}).state);if(disp_mutex_release(({value}).state)){{{value_drop}disp_dealloc(({value}).state->data);disp_dealloc(({value}).state);}}({value}).state=NULL;}}}}"
+            )
+        }
+        hir::Type::Channel(value_ty) => {
+            let value_c = native_types::c_type(value_ty);
+            let index = format!("_drop_i{depth}");
+            let queued = format!(
+                "(({value_c}*)({value}).state->data)[(({value}).state->head+{index})%({value}).state->capacity]"
+            );
+            let queued_drop = drop_value_depth(program, &queued, value_ty, depth + 1);
+            format!(
+                "{{if(({value}).state&&disp_channel_release(({value}).state)){{for(size_t {index}=0;{index}<({value}).state->len;{index}++){{{queued_drop}}}disp_dealloc(({value}).state->data);disp_dealloc(({value}).state);}}({value}).state=NULL;}}"
             )
         }
         hir::Type::AtomicInt => format!(
@@ -5694,6 +6567,9 @@ fn drop_value_depth(program: &mir::Program, value: &str, ty: &hir::Type, depth: 
         hir::Type::Function(_, _) => format!(
             "{{if(({value}).drop)({value}).drop(({value}).env);({value})=(disp_native_callable){{0}};}}"
         ),
+        hir::Type::CRegistration => {
+            format!("disp_c_registration_close(&({value}));")
+        }
         hir::Type::Future(_) => format!(
             "{{if(({value}).drop)({value}).drop(({value}).context);({value})=(disp_native_future){{0}};}}"
         ),

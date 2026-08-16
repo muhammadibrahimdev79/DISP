@@ -1,0 +1,7 @@
+fn recurse(value: u8) -> u8 {
+    return recurse(value)
+}
+
+fn main() {
+    print(recurse(1))
+}

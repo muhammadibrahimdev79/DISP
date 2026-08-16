@@ -1,0 +1,6 @@
+enum Slot { Left(int), Right(int) }
+
+fn main() {
+    let slot = Slot.Right(7)
+    print(match slot { Slot.Left(value) => value Slot.Right(value) => value })
+}

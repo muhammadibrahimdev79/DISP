@@ -13,9 +13,10 @@ pub fn generate(
     mono_program: &MonoProgram,
     abi: &AbiProgram,
     native_types: &str,
+    library: bool,
 ) -> Result<GeneratedC, Diagnostic> {
-    let source =
-        typed_codegen::generate(program, mono_program, abi, native_types)?.ok_or_else(|| {
+    let source = typed_codegen::generate(program, mono_program, abi, native_types, library)?
+        .ok_or_else(|| {
             Diagnostic::new(
                 DiagnosticKind::Backend,
                 "MIR contains a type that has no concrete native representation",

@@ -1,0 +1,5 @@
+fn read(pointer: ptr<u8>) -> u8 {
+    return *pointer
+}
+
+fn main() {}

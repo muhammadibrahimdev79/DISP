@@ -40,6 +40,283 @@ fn version_and_help_identify_the_developer_preview() {
     let help = String::from_utf8(help.stdout).unwrap();
     assert!(help.contains("disp <file.disp|project-directory>"));
     assert!(help.contains("program arguments follow `--`"));
+    assert!(help.contains("disp fmt [--check]"));
+    assert!(help.contains("disp migrate [--check]"));
+    assert!(help.contains("--diagnostic-format=<human|json>"));
+    assert!(help.contains("--sanitize"));
+    assert!(help.contains("--freestanding"));
+    assert!(help.contains("--freestanding32"));
+    assert!(help.contains("--freestanding64"));
+    assert!(help.contains("--freestanding-aarch64"));
+    assert!(help.contains("header"));
+}
+
+#[test]
+fn header_command_writes_the_versioned_c_contract_deterministically() {
+    let path = source_file(
+        "header-cli.disp",
+        "extern C(\"fixture\") { fn fixture_add(left: CInt, right: CInt) -> CInt } fn main() {}",
+    );
+    let Some(first) = disp(&["header", path.to_str().unwrap()]) else {
+        return;
+    };
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let header = path.with_extension("h");
+    assert_eq!(
+        String::from_utf8(first.stdout).unwrap().trim(),
+        header.display().to_string()
+    );
+    let first_bytes = fs::read(&header).unwrap();
+    let Some(second) = disp(&["header", path.to_str().unwrap()]) else {
+        return;
+    };
+    assert!(second.status.success());
+    assert_eq!(fs::read(&header).unwrap(), first_bytes);
+    let text = String::from_utf8(first_bytes).unwrap();
+    assert!(text.contains("#define DISP_C_ABI_VERSION 1u"));
+    assert!(text.contains("int32_t fixture_add(int32_t arg1, int32_t arg2);"));
+}
+
+#[test]
+fn library_command_writes_a_shared_artifact_and_consumer_header() {
+    let path = source_file(
+        "library-cli.disp",
+        "export C fn library_value() -> CInt uses Pure { return 42 } fn main() {}",
+    );
+    let Some(output) = disp(&["build", "--library", path.to_str().unwrap()]) else {
+        return;
+    };
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2);
+    assert!(std::path::Path::new(&lines[0]).is_file());
+    assert_eq!(std::path::Path::new(&lines[1]), path.with_extension("h"));
+    let header = fs::read_to_string(&lines[1]).unwrap();
+    assert!(header.contains("DISP_C_API int32_t library_value(int32_t *out_result);"));
+}
+
+#[test]
+fn sanitized_builds_are_instrumented_or_fail_closed() {
+    let path = source_file(
+        "sanitized-cli.disp",
+        "fn main() { let value = 7 print(value) }",
+    );
+    let Some(output) = disp(&["build", "--sanitize", path.to_str().unwrap()]) else {
+        return;
+    };
+    if output.status.success() {
+        let executable = path.parent().unwrap().join("build/sanitized-cli.exe");
+        assert!(executable.is_file());
+        if cfg!(windows) {
+            assert!(
+                executable
+                    .parent()
+                    .unwrap()
+                    .read_dir()
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .any(|entry| entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with("clang_rt.asan_dynamic-")
+                            && name.ends_with(".dll"))),
+                "successful sanitized Windows builds must include the ASan runtime"
+            );
+        }
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("native linking failed")
+                || stderr.contains("sanitizer runtime")
+                || stderr.contains("libasan")
+                || stderr.contains("libubsan"),
+            "sanitizer failure must identify the unavailable instrumented toolchain: {stderr}"
+        );
+        assert!(!stderr.contains("usage:"));
+    }
+}
+
+#[test]
+fn migrate_is_explicit_idempotent_and_checkable() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("disp-migrate-{}-{unique}", std::process::id()));
+    fs::create_dir_all(root.join("src")).unwrap();
+    let manifest = root.join("DISP.toml");
+    let legacy = "[package]\nname = \"legacy\"\nversion = \"0.1.0\"\nentry = \"src/main.disp\"\n";
+    fs::write(&manifest, legacy).unwrap();
+    fs::write(root.join("src/main.disp"), "fn main() {}\n").unwrap();
+
+    let Some(before) = disp(&["migrate", "--check", root.to_str().unwrap()]) else {
+        return;
+    };
+    assert!(!before.status.success());
+    assert!(String::from_utf8_lossy(&before.stderr).contains("run `disp migrate"));
+    assert_eq!(fs::read_to_string(&manifest).unwrap(), legacy);
+
+    let Some(migrated) = disp(&["migrate", root.to_str().unwrap()]) else {
+        return;
+    };
+    assert!(migrated.status.success());
+    let expected = "[package]\nname = \"legacy\"\nversion = \"0.1.0\"\nedition = \"1\"\nfeatures = []\nentry = \"src/main.disp\"\n";
+    assert_eq!(fs::read_to_string(&manifest).unwrap(), expected);
+
+    let Some(again) = disp(&["migrate", root.to_str().unwrap()]) else {
+        return;
+    };
+    assert!(again.status.success());
+    assert!(String::from_utf8_lossy(&again.stdout).contains("already declares"));
+    assert_eq!(fs::read_to_string(&manifest).unwrap(), expected);
+
+    let Some(checked) = disp(&["migrate", "--check", root.to_str().unwrap()]) else {
+        return;
+    };
+    assert!(checked.status.success());
+    assert_eq!(fs::read_to_string(&manifest).unwrap(), expected);
+}
+
+#[test]
+fn json_diagnostics_are_structured_stable_and_global() {
+    let source = source_file("json-invalid.disp", "fn main() { print(missing) }");
+    let path = source.to_str().unwrap();
+    let Some(leading) = disp(&["--diagnostic-format=json", "check", path]) else {
+        return;
+    };
+    let Some(infix) = disp(&["check", "--diagnostic-format=json", path]) else {
+        return;
+    };
+    assert!(!leading.status.success() && !infix.status.success());
+    assert!(leading.stdout.is_empty() && infix.stdout.is_empty());
+    assert_eq!(leading.stderr, infix.stderr);
+    let json = String::from_utf8(leading.stderr).unwrap();
+    assert_eq!(json.lines().count(), 1);
+    assert!(json.starts_with("{\"schema\":\"disp.diagnostic.v1\""));
+    assert!(json.contains("\"code\":\"DISP-RESOLVE-0001\""));
+    assert!(json.contains("\"stage\":\"resolver\""));
+    assert!(json.contains("\"message\":\"unknown name `missing`\""));
+    assert!(json.contains("\"span\":{\"start\":"));
+    assert!(json.trim_end().ends_with('}'));
+}
+
+#[test]
+fn json_driver_errors_have_null_source_locations() {
+    let Some(output) = disp(&["--diagnostic-format=json", "unknown", "extra"]) else {
+        return;
+    };
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let json = String::from_utf8(output.stderr).unwrap();
+    assert!(json.contains("\"code\":\"DISP-DRIVER-0001\""));
+    assert!(json.contains("\"stage\":\"driver\""));
+    assert!(json.contains("\"file\":null,\"span\":null"));
+}
+
+#[test]
+fn diagnostic_option_after_separator_remains_a_program_argument() {
+    let source = source_file(
+        "diagnostic-argument.disp",
+        "fn main(args: List<String>) { print(args.len()) print(match args.get(0) { Some(value) => (*value).contains(\"--diagnostic-format=json\"), None => false }) }",
+    );
+    let Some(output) = disp(&[
+        "interpret",
+        source.to_str().unwrap(),
+        "--",
+        "--diagnostic-format=json",
+    ]) else {
+        return;
+    };
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .replace("\r\n", "\n"),
+        "1\ntrue\n"
+    );
+}
+
+#[test]
+fn formatter_is_idempotent_and_check_mode_is_non_mutating() {
+    let source = source_file(
+        "format.disp",
+        "fn main() {  \r\n\tif true {\r\n\t\tprint(\"DISP\")   \r\n\t}\r\n}\r\n",
+    );
+    let path = source.to_str().unwrap();
+    let original = fs::read(&source).unwrap();
+    let Some(check_before) = disp(&["fmt", "--check", path]) else {
+        return;
+    };
+    assert!(!check_before.status.success());
+    assert_eq!(fs::read(&source).unwrap(), original);
+
+    let Some(format) = disp(&["fmt", path]) else {
+        return;
+    };
+    assert!(format.status.success());
+    assert_eq!(
+        fs::read_to_string(&source).unwrap(),
+        "fn main() {\n    if true {\n        print(\"DISP\")\n    }\n}\n"
+    );
+
+    let Some(check_after) = disp(&["fmt", "--check", path]) else {
+        return;
+    };
+    assert!(check_after.status.success());
+}
+
+#[test]
+fn formatter_walks_project_sources_including_nested_modules() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let project = std::env::temp_dir().join(format!(
+        "disp-format-project-{}-{unique}",
+        std::process::id()
+    ));
+    let nested = project.join("src/nested");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(
+        project.join("src/main.disp"),
+        "fn main() {  \n\tprint(1) \n}\n",
+    )
+    .unwrap();
+    fs::write(
+        nested.join("values.disp"),
+        "module values  \npub fn answer() -> int = 42  \n",
+    )
+    .unwrap();
+
+    let Some(format) = disp(&["fmt", project.to_str().unwrap()]) else {
+        return;
+    };
+    assert!(format.status.success());
+    assert_eq!(
+        fs::read_to_string(project.join("src/main.disp")).unwrap(),
+        "fn main() {\n    print(1)\n}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(nested.join("values.disp")).unwrap(),
+        "module values\npub fn answer() -> int = 42\n"
+    );
+
+    let Some(check) = disp(&["fmt", "--check", project.to_str().unwrap()]) else {
+        return;
+    };
+    assert!(check.status.success());
 }
 
 #[test]
@@ -126,7 +403,11 @@ fn native_run_cache_reuses_unchanged_builds_and_tracks_imports() {
     let Some(rebuilt) = disp(&[path]) else {
         return;
     };
-    assert!(rebuilt.status.success());
+    assert!(
+        rebuilt.status.success(),
+        "rebuilt native program failed: {}",
+        String::from_utf8_lossy(&rebuilt.stderr)
+    );
     assert_eq!(String::from_utf8(rebuilt.stdout).unwrap().trim(), "43");
     assert_ne!(
         fs::metadata(&executable).unwrap().modified().unwrap(),
@@ -232,6 +513,71 @@ fn developer_hir_and_mir_dumps_are_available() {
 }
 
 #[test]
+fn effect_dump_is_deterministic_and_distinguishes_contracts_from_inference() {
+    let source = source_file(
+        "effects.disp",
+        "fn load(path: Path) -> Result<String, IoError> uses FileSystem = File.read_text(path)\nfn inferred(path: Path) -> Result<String, IoError> = load(path)\nfn main() uses Pure {}\n",
+    );
+    let Some(output) = disp(&["check", "--dump-effects", source.to_str().unwrap()]) else {
+        return;
+    };
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .replace("\r\n", "\n"),
+        "load uses FileSystem\ninferred uses FileSystem [inferred]\nmain uses Pure\n"
+    );
+}
+
+#[test]
+fn constant_dump_is_deterministic_and_reports_evaluated_values() {
+    let source = source_file(
+        "constants.disp",
+        "fn main() { const base = 7 const answer = base * 6 const label = \"DISP\" print(answer) }",
+    );
+    let Some(output) = disp(&["check", "--dump-constants", source.to_str().unwrap()]) else {
+        return;
+    };
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .replace("\r\n", "\n"),
+        "main::base = 7\nmain::answer = 42\nmain::label = \"DISP\"\n"
+    );
+}
+
+#[test]
+fn expansion_dump_records_bounded_structured_generation() {
+    let source = source_file(
+        "expansions.disp",
+        "fn main() { let values = Meta.map(3, |index: int| index + 1) print(values) }",
+    );
+    let Some(output) = disp(&["check", "--dump-expansions", source.to_str().unwrap()]) else {
+        return;
+    };
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = String::from_utf8(output.stdout)
+        .unwrap()
+        .replace("\r\n", "\n");
+    assert!(output.starts_with("Meta.map generated "), "{output}");
+    assert!(output.ends_with(" nodes at 1:26\n"), "{output}");
+}
+
+#[test]
 fn new_creates_a_runnable_directory_project() {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -244,6 +590,9 @@ fn new_creates_a_runnable_directory_project() {
     assert!(created.status.success());
     assert!(root.join("DISP.toml").is_file());
     assert!(root.join("src/main.disp").is_file());
+    let manifest = fs::read_to_string(root.join("DISP.toml")).unwrap();
+    assert!(manifest.contains("edition = \"1\""));
+    assert!(manifest.contains("features = []"));
 
     let Some(checked) = disp(&["check", root.to_str().unwrap()]) else {
         return;

@@ -49,6 +49,8 @@ pub struct StructDeclaration {
     pub name: String,
     pub name_span: Span,
     pub data: bool,
+    /// Opts this non-generic value record into DISP's stable C ABI v1 layout contract.
+    pub c_abi: bool,
     pub generics: Vec<GenericParameter>,
     pub fields: Vec<FieldDeclaration>,
     pub span: Span,
@@ -86,8 +88,11 @@ pub struct Function {
     pub generics: Vec<GenericParameter>,
     pub parameters: Vec<Parameter>,
     pub return_type: Option<TypeName>,
+    /// `None` requests inference; `Some` is an explicit maximum effect contract.
+    pub capabilities: Option<Vec<CapabilityUse>>,
     pub body: Block,
     pub external: Option<ExternalFunction>,
+    pub exported: bool,
     pub span: Span,
 }
 
@@ -121,6 +126,63 @@ pub struct FunctionSignature {
     pub generics: Vec<GenericParameter>,
     pub parameters: Vec<Parameter>,
     pub return_type: Option<TypeName>,
+    pub capabilities: Option<Vec<CapabilityUse>>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Capability {
+    FileSystem,
+    Network,
+    Process,
+    Foreign,
+    RawMemory,
+    DeviceIo,
+    Timer,
+    Random,
+    Gpu,
+    Ui,
+}
+
+impl Capability {
+    pub const ALL: [Self; 10] = [
+        Self::FileSystem,
+        Self::Network,
+        Self::Process,
+        Self::Foreign,
+        Self::RawMemory,
+        Self::DeviceIo,
+        Self::Timer,
+        Self::Random,
+        Self::Gpu,
+        Self::Ui,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::FileSystem => "FileSystem",
+            Self::Network => "Network",
+            Self::Process => "Process",
+            Self::Foreign => "Foreign",
+            Self::RawMemory => "RawMemory",
+            Self::DeviceIo => "DeviceIo",
+            Self::Timer => "Timer",
+            Self::Random => "Random",
+            Self::Gpu => "Gpu",
+            Self::Ui => "Ui",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|capability| capability.name() == name)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapabilityUse {
+    pub capability: Capability,
     pub span: Span,
 }
 
@@ -176,6 +238,9 @@ pub type Stmt = Spanned<Statement>;
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchArm {
     pub pattern: Spanned<Pattern>,
+    /// Alternatives produced from one source `|` pattern share this identifier.
+    pub alternative_group: Option<u32>,
+    pub guard: Option<Expr>,
     pub value: Expr,
     pub span: Span,
 }
@@ -185,14 +250,28 @@ pub enum Pattern {
     Wildcard,
     Binding(String),
     Integer(u128),
+    NegativeInteger(u128),
     String(String),
     Character(char),
     Bool(bool),
+    Or(Vec<Spanned<Pattern>>),
+    Struct {
+        type_name: String,
+        fields: Vec<StructPatternField>,
+        rest: bool,
+    },
     Variant {
         type_name: Option<String>,
         variant: String,
         arguments: Vec<Spanned<Pattern>>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructPatternField {
+    pub name: String,
+    pub name_span: Span,
+    pub pattern: Spanned<Pattern>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,7 +327,10 @@ pub enum Statement {
         body: Block,
     },
     Loop(Block),
-    Unsafe(Block),
+    Unsafe {
+        capabilities: Option<Vec<CapabilityUse>>,
+        body: Block,
+    },
     Break,
     Continue,
 }
@@ -514,7 +596,7 @@ fn collect_capture_block(
                 loop_locals.insert(name.clone());
                 collect_capture_block(body, &mut loop_locals, captures);
             }
-            Statement::Loop(body) | Statement::Unsafe(body) => {
+            Statement::Loop(body) | Statement::Unsafe { body, .. } => {
                 collect_capture_block(body, &mut locals, captures)
             }
             Statement::Break | Statement::Continue => {}
@@ -641,6 +723,9 @@ fn collect_capture_expr(
             for arm in arms {
                 let mut arm_locals = locals.clone();
                 collect_pattern_bindings(&arm.pattern.node, &mut arm_locals);
+                if let Some(guard) = &arm.guard {
+                    collect_capture_expr(guard, CaptureMode::Read, &mut arm_locals, captures);
+                }
                 collect_capture_expr(&arm.value, mode, &mut arm_locals, captures);
             }
         }
@@ -682,6 +767,16 @@ fn collect_pattern_bindings(pattern: &Pattern, locals: &mut HashSet<String>) {
     match pattern {
         Pattern::Binding(name) => {
             locals.insert(name.clone());
+        }
+        Pattern::Or(alternatives) => {
+            for alternative in alternatives {
+                collect_pattern_bindings(&alternative.node, locals);
+            }
+        }
+        Pattern::Struct { fields, .. } => {
+            for field in fields {
+                collect_pattern_bindings(&field.pattern.node, locals);
+            }
         }
         Pattern::Variant { arguments, .. } => {
             for argument in arguments {

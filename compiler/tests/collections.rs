@@ -54,6 +54,26 @@ fn map_and_set_have_concrete_target_aware_layouts() {
 }
 
 #[test]
+fn contextual_with_capacity_infers_non_numeric_collection_storage_natively() {
+    let source = r#"
+struct Item { value: int }
+fn main() {
+    var list: List<Item> = List.with_capacity(2)
+    list.push(Item { value: 40 })
+    var map: Map<String, Item> = Map.with_capacity(2)
+    map.set("answer", Item { value: 41 })
+    var set: Set<String> = Set.with_capacity(2)
+    set.add("DISP")
+    print(match list.get(0) { Some(item) => (*item).value, None => 0 })
+    print(match map.get("answer") { Some(item) => (*item).value, None => 0 })
+    print(set.has("DISP"))
+}
+"#;
+    assert_eq!(run_source(source).unwrap(), ["40", "41", "true"]);
+    differential("contextual-capacity", source);
+}
+
+#[test]
 fn map_construction_updates_queries_removal_and_clear_are_differential() {
     let source = r#"
 fn main() {

@@ -1,0 +1,6 @@
+fn main() {
+    var values = List.of(1, 2)
+    let first = &values[0]
+    values.add(3)
+    print(*first)
+}

@@ -146,6 +146,20 @@ fn main() {{
 }
 
 #[test]
+fn capability_timer_ticks_advance_in_fixed_ten_millisecond_units() {
+    let source = r#"
+fn main() uses Timer {
+    first = Time.ticks()
+    Time.sleep(Duration.from_millis(30))
+    second = Time.ticks()
+    print(second != first)
+}
+"#;
+    assert_eq!(run_source(source).unwrap(), ["true"]);
+    differential("capability-timer", source);
+}
+
+#[test]
 fn io_errors_propagate_without_panics_and_invalid_types_have_spans() {
     let missing = unique_root("missing");
     let source = format!(

@@ -57,8 +57,30 @@ impl Resolver {
             data_fields: HashMap::new(),
         };
         for builtin in [
-            "print", "Some", "None", "Ok", "Err", "i8", "i16", "i32", "i64", "i128", "u8", "u16",
-            "u32", "u64", "u128", "int", "uint", "f32", "f64", "CString", "Memory",
+            "print",
+            "Some",
+            "None",
+            "Ok",
+            "Err",
+            "i8",
+            "i16",
+            "i32",
+            "i64",
+            "i128",
+            "u8",
+            "u16",
+            "u32",
+            "u64",
+            "u128",
+            "int",
+            "uint",
+            "f32",
+            "f64",
+            "CString",
+            "Memory",
+            "CRegistration",
+            "CExport",
+            "Meta",
         ] {
             let id = resolver.add_symbol(builtin, SymbolKind::Builtin, Span::point(1, 1));
             resolver.globals.insert(builtin.into(), id);
@@ -68,18 +90,24 @@ impl Resolver {
 
     pub fn resolve(mut self, program: &Program) -> Result<Resolution, Diagnostic> {
         for declaration in &program.traits {
-            if self
-                .traits
-                .insert(
-                    declaration.name.clone(),
-                    (declaration.name_span, declaration.generics.len()),
-                )
-                .is_some()
+            if declaration.name == "Meta"
+                || self
+                    .traits
+                    .insert(
+                        declaration.name.clone(),
+                        (declaration.name_span, declaration.generics.len()),
+                    )
+                    .is_some()
                 || self.types.contains_key(&declaration.name)
             {
                 return Err(Diagnostic::new(
                     DiagnosticKind::Resolve,
-                    format!("duplicate trait `{}`", declaration.name),
+                    if declaration.name == "Meta" {
+                        "`Meta` is reserved for bounded structured compile-time generation"
+                            .to_owned()
+                    } else {
+                        format!("duplicate trait `{}`", declaration.name)
+                    },
                     declaration.name_span,
                 ));
             }
@@ -198,12 +226,14 @@ impl Resolver {
                 .unwrap()
                 .insert("Self".into(), declaration.name_span);
             for method in &declaration.methods {
+                self.begin_generics(&method.generics)?;
                 for parameter in &method.parameters {
                     self.resolve_type_name(&parameter.ty)?;
                 }
                 if let Some(result) = &method.return_type {
                     self.resolve_type_name(result)?;
                 }
+                self.generic_types.pop();
             }
             self.generic_types.pop();
         }
@@ -213,14 +243,15 @@ impl Resolver {
                 self.resolve_trait_name(trait_name)?;
             }
             self.resolve_type_name(&implementation.target)?;
+            self.generic_types
+                .last_mut()
+                .unwrap()
+                .insert("Self".into(), implementation.span);
             for (_, ty, _) in &implementation.associated_types {
                 self.resolve_type_name(ty)?;
             }
             for method in &implementation.methods {
-                self.generic_types
-                    .last_mut()
-                    .unwrap()
-                    .insert("Self".into(), method.name_span);
+                self.begin_generics(&method.generics)?;
                 for parameter in &method.parameters {
                     self.resolve_type_name(&parameter.ty)?;
                 }
@@ -237,6 +268,7 @@ impl Resolver {
                 }
                 self.resolve_block_contents(&method.body)?;
                 self.end_scope();
+                self.generic_types.pop();
             }
             self.generic_types.pop();
         }
@@ -389,7 +421,7 @@ impl Resolver {
                 })
             }
             Statement::Loop(body) => self.with_loop(|resolver| resolver.resolve_block(body)),
-            Statement::Unsafe(body) => self.resolve_block(body),
+            Statement::Unsafe { body, .. } => self.resolve_block(body),
             Statement::Break | Statement::Continue if self.loop_depth == 0 => Err(Diagnostic::new(
                 DiagnosticKind::Resolve,
                 "`break` and `continue` are only valid inside loops",
@@ -531,6 +563,9 @@ impl Resolver {
                         | "Database"
                         | "DataStore"
                         | "Async"
+                        | "Crypto"
+                        | "Port"
+                        | "Mmio"
                 ) {
                     return Ok(());
                 }
@@ -574,7 +609,7 @@ impl Resolver {
                 field,
                 field_span,
             } => {
-                if matches!(&object.node, Expression::Identifier(name) if matches!(name.as_str(), "String" | "List" | "Map" | "Set" | "Mutex" | "AtomicInt" | "Path" | "Url" | "Json" | "IpAddress" | "Dns" | "SocketAddress" | "Tls" | "Http" | "TcpListener" | "UdpSocket" | "File" | "Directory" | "Time" | "Duration" | "Environment" | "Process" | "Database" | "DataStore" | "Async"))
+                if matches!(&object.node, Expression::Identifier(name) if matches!(name.as_str(), "String" | "List" | "Map" | "Set" | "Mutex" | "AtomicInt" | "Channel" | "Path" | "Url" | "Json" | "IpAddress" | "Dns" | "SocketAddress" | "Tls" | "Http" | "TcpListener" | "UdpSocket" | "File" | "Directory" | "Time" | "Duration" | "Environment" | "Process" | "Database" | "DataStore" | "Async" | "Crypto" | "Port" | "Mmio"))
                 {
                     return Ok(());
                 }
@@ -612,7 +647,12 @@ impl Resolver {
                     self.begin_scope();
                     let result = self
                         .resolve_pattern(&arm.pattern.node, arm.pattern.span)
-                        .and_then(|()| self.resolve_expression(&arm.value));
+                        .and_then(|()| {
+                            if let Some(guard) = &arm.guard {
+                                self.resolve_expression(guard)?;
+                            }
+                            self.resolve_expression(&arm.value)
+                        });
                     self.end_scope();
                     result?;
                 }
@@ -675,6 +715,11 @@ impl Resolver {
 
     fn resolve_pattern(&mut self, pattern: &Pattern, span: Span) -> Result<(), Diagnostic> {
         match pattern {
+            Pattern::Or(_) => Err(Diagnostic::new(
+                DiagnosticKind::Internal,
+                "unexpanded `|` pattern reached name resolution",
+                span,
+            )),
             Pattern::Binding(name) => self.declare_local(
                 name,
                 span,
@@ -683,6 +728,12 @@ impl Resolver {
                     constant: false,
                 },
             ),
+            Pattern::Struct { fields, .. } => {
+                for field in fields {
+                    self.resolve_pattern(&field.pattern.node, field.pattern.span)?;
+                }
+                Ok(())
+            }
             Pattern::Variant {
                 type_name,
                 variant,
@@ -718,6 +769,7 @@ impl Resolver {
             }
             Pattern::Wildcard
             | Pattern::Integer(_)
+            | Pattern::NegativeInteger(_)
             | Pattern::String(_)
             | Pattern::Character(_)
             | Pattern::Bool(_) => Ok(()),
@@ -730,6 +782,13 @@ impl Resolver {
         span: Span,
         kind: SymbolKind,
     ) -> Result<(), Diagnostic> {
+        if name == "Meta" {
+            return Err(Diagnostic::new(
+                DiagnosticKind::Resolve,
+                "`Meta` is reserved for bounded structured compile-time generation",
+                span,
+            ));
+        }
         if self
             .scopes
             .last()
@@ -856,23 +915,38 @@ impl Resolver {
             "Map" => Some(2),
             "Set" => Some(1),
             "Thread" | "Future" | "Task" => Some(1),
-            "Mutex" | "MutexGuard" => Some(1),
+            "Mutex" | "MutexGuard" | "Channel" => Some(1),
             "AtomicInt" => Some(0),
-            "CString" | "CStr" | "Memory" | "CInt" | "CUInt" | "CSize" | "CSSize" | "CChar"
-            | "CUChar" | "CShort" | "CUShort" | "CLongLong" | "CULongLong" | "CFloat"
-            | "CDouble" => Some(0),
+            "MemoryPtr" | "MemoryMutPtr" => Some(1),
+            "CFunction" => Some(1),
+            "CRegistration" => Some(0),
+            "CString" | "CStr" | "Memory" | "SecretBytes" | "AeadEnvelope"
+            | "Ed25519SigningKey" | "CInt" | "CUInt" | "CSize" | "CSSize" | "CChar" | "CUChar"
+            | "CShort" | "CUShort" | "CLongLong" | "CULongLong" | "CFloat" | "CDouble" => Some(0),
             "[]" => Some(1),
             name if name.starts_with("[;") && name.ends_with(']') => Some(1),
             "int" | "f64" | "str" | "String" | "Path" | "IpAddress" | "SocketAddress"
             | "TcpStream" | "TlsStream" | "TcpListener" | "UdpSocket" | "UdpDatagram"
             | "Instant" | "Duration" | "IoError" | "NetworkError" | "HttpError" | "DataError"
-            | "HttpRequest" | "Url" | "Json" | "HttpResponse" | "ProcessCommand"
-            | "ChildProcess" | "Database" | "DataStore" | "ProcessOutput" | "char" | "bool"
-            | "Unit" | "ConversionError" => Some(0),
+            | "CryptoError" | "HttpRequest" | "Url" | "Json" | "HttpResponse"
+            | "ProcessCommand" | "ChildProcess" | "Database" | "DataStore" | "ProcessOutput"
+            | "char" | "bool" | "Unit" | "ConversionError" => Some(0),
+            name if name
+                .strip_prefix("Self.")
+                .is_some_and(|associated| !associated.is_empty())
+                && self
+                    .generic_types
+                    .iter()
+                    .rev()
+                    .any(|scope| scope.contains_key("Self")) =>
+            {
+                Some(0)
+            }
             name if self
                 .generic_types
-                .last()
-                .is_some_and(|scope| scope.contains_key(name)) =>
+                .iter()
+                .rev()
+                .any(|scope| scope.contains_key(name)) =>
             {
                 Some(0)
             }

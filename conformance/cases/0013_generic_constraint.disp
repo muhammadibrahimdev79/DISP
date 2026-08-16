@@ -1,0 +1,9 @@
+trait Value {
+    fn value(&self) -> int
+}
+
+fn read<T: Value>(item: T) -> int = item.value()
+
+fn main() {
+    print(read(42))
+}

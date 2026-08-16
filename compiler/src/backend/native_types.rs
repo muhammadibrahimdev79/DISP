@@ -1,6 +1,9 @@
 use super::{layout, mono, target::Target};
 use crate::{diagnostics::Diagnostic, hir};
-use std::{collections::HashSet, fmt::Write};
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    fmt::Write,
+};
 
 pub fn generate(
     program: &hir::Program,
@@ -14,6 +17,8 @@ pub fn generate(
          typedef struct { const char *data; size_t len; } disp_native_str;\n\
          typedef struct { char *data; size_t len; size_t cap; } disp_native_cstring;\n\
          typedef struct { uint8_t *data; size_t len; size_t align; } disp_native_memory;\n\
+         typedef struct { uint8_t *data; size_t len; size_t cap; } disp_native_secret;\n\
+         typedef struct { uint8_t *address; uint8_t *base; size_t byte_len; size_t element_size; size_t element_align; } disp_native_memory_pointer;\n\
          typedef struct { char *data; size_t len; size_t cap; } disp_native_path;\n\
          typedef struct { char *data; size_t len; size_t cap; } disp_native_url;\n\
          typedef struct { char *data; size_t len; size_t cap; } disp_native_json;\n\
@@ -50,8 +55,80 @@ pub fn generate(
          typedef struct { disp_mutex_state *state; } disp_native_mutex_guard;\n\
          typedef struct disp_atomic_int_state disp_atomic_int_state;\n\
          typedef struct { disp_atomic_int_state *state; } disp_native_atomic_int;\n\
-         typedef struct { void (*code)(void); void *env; void (*drop)(void *); } disp_native_callable;\n",
+         typedef struct disp_channel_state disp_channel_state;\n\
+         typedef struct { disp_channel_state *state; } disp_native_channel;\n\
+         typedef struct { void (*code)(void); void *env; void (*drop)(void *); } disp_native_callable;\n\
+         typedef struct { void *context; void (*quiesce)(void *); void (*release)(void *); disp_native_callable *callback; DispRollbackHook *rollback; bool active; } disp_native_c_registration;\n",
     );
+    let mut callbacks = BTreeSet::new();
+    // CRegistration stores this release callback even when the CFunction value
+    // exists only as a compiler-generated temporary rather than a HIR local.
+    callbacks.insert(hir::Type::CFunction(
+        vec![hir::Type::RawPointer {
+            mutable: true,
+            inner: Box::new(hir::Type::Unit),
+        }],
+        Box::new(hir::Type::Unit),
+    ));
+    for function in program
+        .functions
+        .iter()
+        .filter(|function| function.external.is_some() && function.generic_parameters.is_empty())
+    {
+        let signature = hir::Type::CFunction(
+            function
+                .parameters
+                .iter()
+                .map(|parameter| function.locals[parameter.0].ty.clone())
+                .collect(),
+            Box::new(function.return_type.clone()),
+        );
+        collect_c_functions(&signature, &mut callbacks);
+    }
+    for instance in &mono_program.instances {
+        let function = &program.functions[instance.function.0];
+        let substitutions = function
+            .generic_parameters
+            .iter()
+            .cloned()
+            .zip(instance.substitutions.iter().cloned())
+            .collect::<HashMap<_, _>>();
+        for local in &function.locals {
+            collect_c_functions(
+                &layout::substitute(&local.ty, &substitutions),
+                &mut callbacks,
+            );
+        }
+    }
+    let mut callbacks = callbacks.into_iter().collect::<Vec<_>>();
+    callbacks.sort_by_key(|ty| (c_function_depth(ty), mono::type_code(ty)));
+    for callback in callbacks {
+        let hir::Type::CFunction(parameters, result) = &callback else {
+            unreachable!()
+        };
+        write!(
+            output,
+            "typedef {} (*{})(",
+            if matches!(**result, hir::Type::Unit) {
+                "void".into()
+            } else {
+                c_type(result)
+            },
+            c_function_name(&callback)
+        )
+        .unwrap();
+        if parameters.is_empty() {
+            output.push_str("void");
+        } else {
+            for (index, parameter) in parameters.iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                output.push_str(&c_type(parameter));
+            }
+        }
+        output.push_str(");\n");
+    }
     for instance in &mono_program.types {
         writeln!(
             output,
@@ -159,7 +236,18 @@ impl Emitter<'_> {
                 }
                 for field in &declaration.fields {
                     let field_ty = layout::substitute(&field.ty, &substitutions);
-                    writeln!(self.output, "{} f{};", c_type(&field_ty), field.index).unwrap();
+                    let field_type = c_type(&field_ty);
+                    let internal_name = format!("f{}", field.index);
+                    if declaration.c_abi && field.name != internal_name {
+                        writeln!(
+                            self.output,
+                            "union {{ {field_type} {internal_name}; {field_type} {}; }};",
+                            field.name
+                        )
+                        .unwrap();
+                    } else {
+                        writeln!(self.output, "{field_type} {internal_name};").unwrap();
+                    }
                 }
                 writeln!(self.output, "}};").unwrap();
                 for (index, offset) in concrete_layout.fields.iter().enumerate() {
@@ -333,6 +421,10 @@ pub fn name(ty: &hir::Type) -> String {
     format!("disp_t_{}", mono::type_code(ty))
 }
 
+fn c_function_name(ty: &hir::Type) -> String {
+    format!("disp_c_fn_{}", mono::type_code(ty))
+}
+
 pub fn c_type(ty: &hir::Type) -> String {
     match ty {
         hir::Type::Unit => "disp_native_unit".into(),
@@ -342,6 +434,9 @@ pub fn c_type(ty: &hir::Type) -> String {
         hir::Type::CString => "disp_native_cstring".into(),
         hir::Type::CStr => "const char *".into(),
         hir::Type::Memory => "disp_native_memory".into(),
+        hir::Type::SecretBytes => "disp_native_secret".into(),
+        hir::Type::AeadEnvelope => "disp_native_string".into(),
+        hir::Type::Ed25519SigningKey => "disp_native_secret".into(),
         hir::Type::Path => "disp_native_path".into(),
         hir::Type::Url => "disp_native_url".into(),
         hir::Type::Json => "disp_native_json".into(),
@@ -366,6 +461,7 @@ pub fn c_type(ty: &hir::Type) -> String {
         hir::Type::Mutex(_) => "disp_native_mutex".into(),
         hir::Type::MutexGuard(_) => "disp_native_mutex_guard".into(),
         hir::Type::AtomicInt => "disp_native_atomic_int".into(),
+        hir::Type::Channel(_) => "disp_native_channel".into(),
         hir::Type::Str => "disp_native_str".into(),
         hir::Type::Array(_, _) => name(ty),
         hir::Type::Slice(_) => name(ty),
@@ -386,15 +482,71 @@ pub fn c_type(ty: &hir::Type) -> String {
         }
         hir::Type::Float { width: 32 } => "float".into(),
         hir::Type::Float { .. } => "double".into(),
+        hir::Type::RawPointer { mutable, inner } if matches!(**inner, hir::Type::Unit) => {
+            format!("{}void *", if *mutable { "" } else { "const " })
+        }
         hir::Type::Reference { mutable, inner } | hir::Type::RawPointer { mutable, inner } => {
             format!("{}{}*", if *mutable { "" } else { "const " }, c_type(inner))
         }
+        hir::Type::MemoryPointer { .. } => "disp_native_memory_pointer".into(),
         hir::Type::Struct(_, _)
         | hir::Type::Enum(_, _)
         | hir::Type::Option(_)
         | hir::Type::Result(_, _) => name(ty),
         hir::Type::Generic(_) => "disp_native_string".into(),
         hir::Type::Function(_, _) => "disp_native_callable".into(),
+        hir::Type::CFunction(_, _) => c_function_name(ty),
+        hir::Type::CRegistration => "disp_native_c_registration".into(),
         hir::Type::Unknown => "void".into(),
+    }
+}
+
+fn collect_c_functions(ty: &hir::Type, output: &mut BTreeSet<hir::Type>) {
+    match ty {
+        hir::Type::CFunction(parameters, result) => {
+            for parameter in parameters {
+                collect_c_functions(parameter, output);
+            }
+            collect_c_functions(result, output);
+            output.insert(ty.clone());
+        }
+        hir::Type::Array(inner, _)
+        | hir::Type::Slice(inner)
+        | hir::Type::List(inner)
+        | hir::Type::Set(inner)
+        | hir::Type::Thread(inner)
+        | hir::Type::Future(inner)
+        | hir::Type::Task(inner)
+        | hir::Type::Mutex(inner)
+        | hir::Type::MutexGuard(inner)
+        | hir::Type::Channel(inner)
+        | hir::Type::Reference { inner, .. }
+        | hir::Type::RawPointer { inner, .. }
+        | hir::Type::MemoryPointer { inner, .. }
+        | hir::Type::Option(inner) => collect_c_functions(inner, output),
+        hir::Type::Map(key, value) | hir::Type::Result(key, value) => {
+            collect_c_functions(key, output);
+            collect_c_functions(value, output);
+        }
+        hir::Type::Struct(_, arguments) | hir::Type::Enum(_, arguments) => {
+            for argument in arguments {
+                collect_c_functions(argument, output);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn c_function_depth(ty: &hir::Type) -> usize {
+    match ty {
+        hir::Type::CFunction(parameters, result) => {
+            1 + parameters
+                .iter()
+                .chain(std::iter::once(&**result))
+                .map(c_function_depth)
+                .max()
+                .unwrap_or(0)
+        }
+        _ => 0,
     }
 }

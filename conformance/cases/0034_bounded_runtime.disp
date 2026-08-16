@@ -1,0 +1,7 @@
+fn main() {
+    var total = 0
+    for value in 0..5 {
+        total += value
+    }
+    print(total)
+}

@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-disp = { path = ".." }
+disp = { path = "..", features = ["fuzzing"] }
 
 [[bin]]
 name = "lexer"
@@ -21,6 +21,13 @@ bench = false
 [[bin]]
 name = "frontend"
 path = "fuzz_targets/frontend.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "security_frames"
+path = "fuzz_targets/security_frames.rs"
 test = false
 doc = false
 bench = false

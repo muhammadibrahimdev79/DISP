@@ -1,17 +1,22 @@
-use crate::diagnostics::{Diagnostic, DiagnosticKind, Span};
+use crate::{
+    diagnostics::{Diagnostic, DiagnosticKind, Span},
+    process_sandbox::{SandboxProfile, SandboxedCommand},
+};
 use std::{
     env,
     ffi::OsString,
+    fs,
     path::{Path, PathBuf},
-    process::Command,
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct RuntimeFeatures {
     pub networking: bool,
     pub http: bool,
     pub database: bool,
     pub data: bool,
+    pub native_crypto_library: Option<PathBuf>,
+    pub shared: bool,
 }
 
 pub fn compile_and_link(
@@ -19,9 +24,11 @@ pub fn compile_and_link(
     object: &Path,
     executable: &Path,
     optimized: bool,
+    sanitizers: bool,
     features: RuntimeFeatures,
     libraries: &[String],
 ) -> Result<(), Diagnostic> {
+    let msvc_driver = cfg!(windows) && native_cc_targets_msvc();
     let mut compile = vec![
         "-std=c11".to_string(),
         if optimized { "-O2" } else { "-O0" }.to_string(),
@@ -31,6 +38,13 @@ pub fn compile_and_link(
     ];
     if !cfg!(windows) {
         compile.push("-pthread".into());
+        if features.shared {
+            compile.push("-fPIC".into());
+        }
+    }
+    if sanitizers {
+        compile.push("-fsanitize=address,undefined".into());
+        compile.push("-fno-omit-frame-pointer".into());
     }
     if features.networking {
         compile.push("-DDISP_NETWORKING".into());
@@ -44,6 +58,9 @@ pub fn compile_and_link(
     if features.data {
         compile.push("-DDISP_DATA".into());
     }
+    if features.native_crypto_library.is_some() {
+        compile.push("-DDISP_CRYPTO_NATIVE".into());
+    }
     compile.extend([
         "-c".into(),
         path(c_source)?.into(),
@@ -51,17 +68,23 @@ pub fn compile_and_link(
         path(object)?.into(),
     ]);
     run_native_cc(&compile, "C compilation")?;
-    let mut link = vec![
-        path(object)?.into(),
-        "-o".into(),
-        path(executable)?.into(),
-        "-Wl,--gc-sections".into(),
-        "-lm".into(),
-    ];
+    let mut link = vec![path(object)?.into(), "-o".into(), path(executable)?.into()];
+    if features.shared {
+        link.push(if cfg!(target_os = "macos") {
+            "-dynamiclib".into()
+        } else {
+            "-shared".into()
+        });
+    }
+    if !msvc_driver {
+        link.push("-Wl,--gc-sections".into());
+        link.push("-lm".into());
+    }
     if !cfg!(windows) {
         link.push("-pthread".into());
     } else {
         link.push("-lshell32".into());
+        link.push("-lbcrypt".into());
         if features.networking {
             link.push("-lws2_32".into());
             link.push("-lsecur32".into());
@@ -74,13 +97,91 @@ pub fn compile_and_link(
             link.push(windows_sqlite_library()?);
         }
     }
+    if sanitizers {
+        link.push("-fsanitize=address,undefined".into());
+    }
     if features.database && !cfg!(windows) {
         link.push("-lsqlite3".into());
+    }
+    if let Some(runtime) = features.native_crypto_library.as_deref() {
+        if cfg!(windows) {
+            let import_library = runtime.with_extension("dll.lib");
+            if !import_library.is_file() {
+                return Err(error(&format!(
+                    "native cryptography import library `{}` is missing",
+                    import_library.display()
+                )));
+            }
+            link.push(path(&import_library)?.into());
+        } else {
+            link.push(path(runtime)?.into());
+            if cfg!(target_os = "linux") {
+                link.push("-Wl,-rpath,$ORIGIN".into());
+            } else if cfg!(target_os = "macos") {
+                link.push("-Wl,-rpath,@loader_path".into());
+            }
+        }
     }
     for library in libraries {
         link.push(format!("-l{library}"));
     }
-    run_native_cc(&link, "native linking")
+    run_native_cc(&link, "native linking")?;
+    if sanitizers && msvc_driver {
+        stage_msvc_sanitizer_runtime(executable)?;
+    }
+    Ok(())
+}
+
+fn stage_msvc_sanitizer_runtime(executable: &Path) -> Result<(), Diagnostic> {
+    let (program, prefix, description) = native_cc();
+    let mut command = SandboxedCommand::new(&program);
+    command.args(prefix).arg("--print-runtime-dir");
+    let output = command.output(SandboxProfile::Toolchain).map_err(|cause| {
+        error(&format!(
+            "{description} could not locate its sanitizer runtime: {cause}"
+        ))
+    })?;
+    if !output.status.success() {
+        return Err(error(&format!(
+            "{description} could not locate its sanitizer runtime:\n{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let runtime_directory = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let runtime = fs::read_dir(&runtime_directory)
+        .map_err(|cause| {
+            error(&format!(
+                "could not inspect sanitizer runtime directory `{}`: {cause}",
+                runtime_directory.display()
+            ))
+        })?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("clang_rt.asan_dynamic-") && name.ends_with(".dll")
+                })
+        })
+        .ok_or_else(|| {
+            error(&format!(
+                "{description} has no dynamic ASan runtime in `{}`",
+                runtime_directory.display()
+            ))
+        })?;
+    let destination = executable
+        .parent()
+        .ok_or_else(|| error("native executable has no output directory"))?
+        .join(runtime.file_name().unwrap());
+    fs::copy(&runtime, &destination).map_err(|cause| {
+        error(&format!(
+            "could not stage sanitizer runtime `{}` beside `{}`: {cause}",
+            runtime.display(),
+            executable.display()
+        ))
+    })?;
+    Ok(())
 }
 
 fn windows_sqlite_library() -> Result<String, Diagnostic> {
@@ -124,17 +225,30 @@ fn native_cc() -> (OsString, Vec<OsString>, &'static str) {
     ("gcc".into(), Vec::new(), "GCC")
 }
 
+fn native_cc_targets_msvc() -> bool {
+    let (program, prefix, _) = native_cc();
+    let mut command = SandboxedCommand::new(program);
+    command.args(prefix).arg("-dumpmachine");
+    command
+        .output(SandboxProfile::Toolchain)
+        .ok()
+        .filter(|output| output.status.success())
+        .is_some_and(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .ends_with("windows-msvc")
+        })
+}
+
 fn run_native_cc(arguments: &[String], phase: &str) -> Result<(), Diagnostic> {
     let (program, prefix, description) = native_cc();
-    let output = Command::new(&program)
-        .args(prefix)
-        .args(arguments)
-        .output()
-        .map_err(|cause| {
-            error(&format!(
-                "{description} is unavailable for {phase}: {cause}"
-            ))
-        })?;
+    let mut command = SandboxedCommand::new(&program);
+    command.args(prefix).args(arguments);
+    let output = command.output(SandboxProfile::Toolchain).map_err(|cause| {
+        error(&format!(
+            "{description} is unavailable for {phase}: {cause}"
+        ))
+    })?;
     if output.status.success() {
         return Ok(());
     }

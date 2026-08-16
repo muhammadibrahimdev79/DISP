@@ -1,0 +1,5 @@
+fn main() {
+    var value: i32 = 2147483647
+    value += 1
+    print("unreachable")
+}

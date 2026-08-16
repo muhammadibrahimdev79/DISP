@@ -1,0 +1,15 @@
+fn array_pick(seed: u8, depth: u8) -> u8 {
+    var bytes: [u8; 4] = [seed, u8(2), u8(3), u8(4)]
+    bytes[1] += 5
+    if depth == 0 { return bytes[1] }
+    return array_pick(bytes[0], depth - 1)
+}
+
+fn main() {
+    print("DISP x86-64 checked fixed arrays")
+    var values: [u32; 4] = [u32(10), u32(20), u32(30), u32(40)]
+    var index: u32 = 2
+    values[index] += 5
+    print(values[index])
+    print(array_pick(9, 2))
+}

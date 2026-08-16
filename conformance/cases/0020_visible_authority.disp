@@ -1,0 +1,5 @@
+fn load(path: Path) -> Result<String, IoError> uses Pure {
+    return File.read_text(path)
+}
+
+fn main() uses Pure {}

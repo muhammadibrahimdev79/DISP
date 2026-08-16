@@ -1,0 +1,7 @@
+fn apply(operation: fn(int) -> int, value: int) -> int = operation(value)
+
+fn main() {
+    let factor = 3
+    let scale = |value: int| value * factor
+    print(apply(scale, 14))
+}

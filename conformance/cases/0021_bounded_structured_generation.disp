@@ -1,0 +1,4 @@
+fn main() {
+    let squares = Meta.map(3, |index: int| index * index)
+    print(squares[2])
+}

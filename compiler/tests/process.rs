@@ -569,7 +569,7 @@ fn launch() -> Result<Unit, IoError> {{
     c1=c0.arg("-NoProfile")
     c2=c1.arg("-NonInteractive")
     c3=c2.arg("-Command")
-    c4=c3.arg("Start-Sleep -Milliseconds 500; [IO.File]::WriteAllText('{marker}','bad')")
+    c4=c3.arg("Start-Process -WindowStyle Hidden powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep -Milliseconds 500; [IO.File]::WriteAllText(''{marker}'',''bad'')'; Start-Sleep -Seconds 5")
     var child=c4.start()?
     return child.close_input()
 }}
@@ -607,7 +607,7 @@ fn timed() -> bool {{
 fn launch() -> Result<Unit, IoError> {{
     c0=Process.command(Path("/bin/sh"))
     c1=c0.arg("-c")
-    c2=c1.arg("sleep 1; printf bad > '{marker}'")
+    c2=c1.arg("(sleep 1; printf bad > '{marker}') & sleep 5")
     var child=c2.start()?
     return child.close_input()
 }}

@@ -1,0 +1,5 @@
+fn main() {
+    var bytes: [u8; 2] = [u8(10), u8(20)]
+    var index: u32 = 2
+    print(bytes[index])
+}

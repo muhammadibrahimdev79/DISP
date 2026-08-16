@@ -1,0 +1,19 @@
+fn identity(pointer: MemoryMutPtr<u8>) -> MemoryMutPtr<u8> = pointer
+
+fn exercise() -> Result<int, String> uses RawMemory {
+    memory = Memory.allocate(2, 8)?
+    unsafe uses RawMemory {
+        pointer = identity(memory.as_mut_ptr())
+        pointer.write(u8(7))
+        print(pointer.read())
+        print(pointer.offset(1).read())
+    }
+    return Ok(0)
+}
+
+fn main() {
+    match exercise() {
+        Ok(_) => 0
+        Err(_) => 0
+    }
+}

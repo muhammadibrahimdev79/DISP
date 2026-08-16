@@ -4,113 +4,68 @@ use crate::ast::{
 };
 use crate::data_store;
 use crate::diagnostics::{Diagnostic, DiagnosticKind, Span};
+use crate::limits;
+use crate::process_sandbox::{SandboxProfile, SandboxedCommand, SandboxedProcess};
+use crate::sqlite_compat::*;
 use native_tls::{Protocol, TlsConnector, TlsStream as NativeTlsStream};
 use std::{
     any::Any,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     io::{self, Read, Write},
     net::{
         IpAddr, Shutdown, TcpListener as StdTcpListener, TcpStream as StdTcpStream, ToSocketAddrs,
         UdpSocket as StdUdpSocket,
     },
-    path::PathBuf,
-    process::{Child as StdChild, ChildStdin, Command as StdCommand, Stdio},
+    path::{Path, PathBuf},
     sync::{
-        Arc, Mutex as StdMutex, Weak,
-        atomic::{AtomicBool, AtomicI64, Ordering},
+        Arc, Condvar, Mutex as StdMutex, OnceLock, Weak,
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     },
     thread,
     time::{Duration as StdDuration, Instant as StdInstant, SystemTime, UNIX_EPOCH},
 };
 use url::{Host, Position, Url};
 
-#[repr(C)]
-struct Sqlite3 {
-    _private: [u8; 0],
+static TIMER_ORIGIN: OnceLock<StdInstant> = OnceLock::new();
+
+#[derive(Clone)]
+struct RuntimeSecret(Arc<crate::crypto::SecretBytes>);
+
+impl std::fmt::Debug for RuntimeSecret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SecretBytes(<redacted>)")
+    }
 }
 
-#[repr(C)]
-struct SqliteStatement {
-    _private: [u8; 0],
+impl PartialEq for RuntimeSecret {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.constant_time_eq(&other.0)
+    }
 }
 
-type SqliteCallback = unsafe extern "C" fn(
-    context: *mut std::ffi::c_void,
-    columns: std::ffi::c_int,
-    values: *mut *mut std::ffi::c_char,
-    names: *mut *mut std::ffi::c_char,
-) -> std::ffi::c_int;
+#[derive(Clone, PartialEq)]
+struct RuntimeAeadEnvelope(Arc<crate::crypto::AeadEnvelope>);
 
-#[cfg_attr(windows, link(name = "winsqlite3"))]
-#[cfg_attr(not(windows), link(name = "sqlite3"))]
-unsafe extern "C" {
-    fn sqlite3_open_v2(
-        filename: *const std::ffi::c_char,
-        database: *mut *mut Sqlite3,
-        flags: std::ffi::c_int,
-        vfs: *const std::ffi::c_char,
-    ) -> std::ffi::c_int;
-    fn sqlite3_close_v2(database: *mut Sqlite3) -> std::ffi::c_int;
-    fn sqlite3_errmsg(database: *mut Sqlite3) -> *const std::ffi::c_char;
-    fn sqlite3_busy_timeout(database: *mut Sqlite3, millis: std::ffi::c_int) -> std::ffi::c_int;
-    fn sqlite3_prepare_v2(
-        database: *mut Sqlite3,
-        sql: *const std::ffi::c_char,
-        bytes: std::ffi::c_int,
-        statement: *mut *mut SqliteStatement,
-        tail: *mut *const std::ffi::c_char,
-    ) -> std::ffi::c_int;
-    fn sqlite3_finalize(statement: *mut SqliteStatement) -> std::ffi::c_int;
-    fn sqlite3_step(statement: *mut SqliteStatement) -> std::ffi::c_int;
-    fn sqlite3_bind_parameter_count(statement: *mut SqliteStatement) -> std::ffi::c_int;
-    fn sqlite3_bind_null(
-        statement: *mut SqliteStatement,
-        index: std::ffi::c_int,
-    ) -> std::ffi::c_int;
-    fn sqlite3_bind_int64(
-        statement: *mut SqliteStatement,
-        index: std::ffi::c_int,
-        value: i64,
-    ) -> std::ffi::c_int;
-    fn sqlite3_bind_double(
-        statement: *mut SqliteStatement,
-        index: std::ffi::c_int,
-        value: f64,
-    ) -> std::ffi::c_int;
-    fn sqlite3_bind_text(
-        statement: *mut SqliteStatement,
-        index: std::ffi::c_int,
-        value: *const std::ffi::c_char,
-        bytes: std::ffi::c_int,
-        destructor: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
-    ) -> std::ffi::c_int;
-    fn sqlite3_column_count(statement: *mut SqliteStatement) -> std::ffi::c_int;
-    fn sqlite3_column_name(
-        statement: *mut SqliteStatement,
-        column: std::ffi::c_int,
-    ) -> *const std::ffi::c_char;
-    fn sqlite3_column_type(
-        statement: *mut SqliteStatement,
-        column: std::ffi::c_int,
-    ) -> std::ffi::c_int;
-    fn sqlite3_column_int64(statement: *mut SqliteStatement, column: std::ffi::c_int) -> i64;
-    fn sqlite3_column_double(statement: *mut SqliteStatement, column: std::ffi::c_int) -> f64;
-    fn sqlite3_column_text(statement: *mut SqliteStatement, column: std::ffi::c_int) -> *const u8;
-    fn sqlite3_column_bytes(
-        statement: *mut SqliteStatement,
-        column: std::ffi::c_int,
-    ) -> std::ffi::c_int;
-    fn sqlite3_changes(database: *mut Sqlite3) -> std::ffi::c_int;
-    fn sqlite3_last_insert_rowid(database: *mut Sqlite3) -> i64;
-    fn sqlite3_get_autocommit(database: *mut Sqlite3) -> std::ffi::c_int;
-    fn sqlite3_exec(
-        database: *mut Sqlite3,
-        sql: *const std::ffi::c_char,
-        callback: Option<SqliteCallback>,
-        context: *mut std::ffi::c_void,
-        error: *mut *mut std::ffi::c_char,
-    ) -> std::ffi::c_int;
+impl std::fmt::Debug for RuntimeAeadEnvelope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AeadEnvelope(<opaque>)")
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeEd25519SigningKey(Arc<crate::crypto::Ed25519SigningKey>);
+
+impl std::fmt::Debug for RuntimeEd25519SigningKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Ed25519SigningKey(<redacted>)")
+    }
+}
+
+impl PartialEq for RuntimeEd25519SigningKey {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 #[derive(Clone)]
@@ -226,7 +181,7 @@ struct RuntimeIpAddress(IpAddr);
 struct RuntimeTcpStream(Arc<StdMutex<RuntimeTcpStreamState>>);
 
 #[derive(Clone)]
-struct RuntimeTlsStream(Arc<StdMutex<Option<NativeTlsStream<StdTcpStream>>>>);
+struct RuntimeTlsStream(Arc<StdMutex<RuntimeTlsStreamState>>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeHttpResponse(Arc<RuntimeHttpResponseData>);
@@ -258,7 +213,7 @@ struct RuntimeUrl {
     text: String,
 }
 
-const HTTP_URL_LIMIT: usize = 8192;
+const HTTP_URL_LIMIT: usize = limits::URL_BYTES;
 
 impl RuntimeUrl {
     fn scheme(&self) -> &str {
@@ -569,7 +524,7 @@ impl JsonParser<'_> {
                 Ok("bool")
             }
             Some(open @ (b'[' | b'{')) => {
-                if self.depth >= 128 {
+                if self.depth >= limits::JSON_DEPTH {
                     return Err("JSON nesting exceeds 128 levels");
                 }
                 self.at += 1;
@@ -594,7 +549,7 @@ impl JsonParser<'_> {
                         if object_keys.contains(&key) {
                             return Err("JSON object contains a duplicate key");
                         }
-                        if object_keys.len() >= 4096 {
+                        if object_keys.len() >= limits::JSON_OBJECT_KEYS {
                             return Err("JSON object exceeds 4096 keys");
                         }
                         object_keys.push(key);
@@ -1414,23 +1369,40 @@ struct RuntimeTcpStreamState {
     socket: Option<StdTcpStream>,
     read_shutdown: bool,
     write_shutdown: bool,
+    permit: Option<RuntimeHandlePermit>,
 }
 
 impl RuntimeTcpStream {
-    fn new(socket: StdTcpStream) -> Self {
+    fn new(socket: StdTcpStream, permit: RuntimeHandlePermit) -> Self {
         Self(Arc::new(StdMutex::new(RuntimeTcpStreamState {
             socket: Some(socket),
             read_shutdown: false,
             write_shutdown: false,
+            permit: Some(permit),
         })))
     }
 }
 
-#[derive(Clone)]
-struct RuntimeTcpListener(Arc<StdMutex<Option<StdTcpListener>>>);
+struct RuntimeTlsStreamState {
+    socket: Option<NativeTlsStream<StdTcpStream>>,
+    permit: Option<RuntimeHandlePermit>,
+}
 
 #[derive(Clone)]
-struct RuntimeUdpSocket(Arc<StdMutex<Option<StdUdpSocket>>>);
+struct RuntimeTcpListener(Arc<StdMutex<RuntimeTcpListenerState>>);
+
+struct RuntimeTcpListenerState {
+    socket: Option<StdTcpListener>,
+    permit: Option<RuntimeHandlePermit>,
+}
+
+#[derive(Clone)]
+struct RuntimeUdpSocket(Arc<StdMutex<RuntimeUdpSocketState>>);
+
+struct RuntimeUdpSocketState {
+    socket: Option<StdUdpSocket>,
+    permit: Option<RuntimeHandlePermit>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeUdpDatagram {
@@ -1531,7 +1503,7 @@ impl PartialEq for RuntimeFuture {
 }
 
 #[derive(Clone)]
-struct RuntimeTask(Arc<StdMutex<RuntimeTaskWork>>);
+struct RuntimeTask(Arc<RuntimeTaskState>);
 
 enum RuntimeTaskWork {
     Future(RuntimeFuture),
@@ -1540,9 +1512,23 @@ enum RuntimeTaskWork {
     Consumed,
 }
 
+struct RuntimeTaskState {
+    work: StdMutex<RuntimeTaskWork>,
+    budget: Arc<RuntimeBudget>,
+}
+
+impl Drop for RuntimeTaskState {
+    fn drop(&mut self) {
+        self.budget.live_tasks.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 impl RuntimeTask {
-    fn new(future: RuntimeFuture) -> Self {
-        Self(Arc::new(StdMutex::new(RuntimeTaskWork::Future(future))))
+    fn new(future: RuntimeFuture, budget: Arc<RuntimeBudget>) -> Self {
+        Self(Arc::new(RuntimeTaskState {
+            work: StdMutex::new(RuntimeTaskWork::Future(future)),
+            budget,
+        }))
     }
 }
 
@@ -1565,30 +1551,54 @@ impl PartialEq for RuntimeTask {
 struct RuntimeMutex(Arc<RuntimeMutexState>);
 
 struct RuntimeMutexState {
-    locked: AtomicBool,
+    gate: StdMutex<RuntimeMutexGate>,
+    available: Condvar,
     value: StdMutex<Box<dyn Any + Send>>,
+}
+
+struct RuntimeMutexGate {
+    owner: Option<thread::ThreadId>,
+    depth: usize,
 }
 
 impl RuntimeMutex {
     fn new(value: Value) -> Self {
         Self(Arc::new(RuntimeMutexState {
-            locked: AtomicBool::new(false),
+            gate: StdMutex::new(RuntimeMutexGate {
+                owner: None,
+                depth: 0,
+            }),
+            available: Condvar::new(),
             value: StdMutex::new(Box::new(value)),
         }))
     }
 
-    fn lock(&self) -> RuntimeMutexGuard {
-        while self
+    fn lock(&self, span: Span) -> Result<RuntimeMutexGuard, Diagnostic> {
+        let current = thread::current().id();
+        let mut gate = self
             .0
-            .locked
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            thread::yield_now();
+            .gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while gate.owner.is_some_and(|owner| owner != current) {
+            gate = self
+                .0
+                .available
+                .wait(gate)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
-        RuntimeMutexGuard(Arc::new(RuntimeMutexGuardState {
+        gate.owner = Some(current);
+        gate.depth = gate.depth.checked_add(1).ok_or_else(|| {
+            Diagnostic::new(
+                DiagnosticKind::Runtime,
+                "Mutex recursion depth overflow",
+                span,
+            )
+        })?;
+        drop(gate);
+        Ok(RuntimeMutexGuard(Arc::new(RuntimeMutexGuardState {
             mutex: Arc::clone(&self.0),
-        }))
+        })))
     }
 }
 
@@ -1633,7 +1643,19 @@ impl RuntimeMutexGuard {
 
 impl Drop for RuntimeMutexGuardState {
     fn drop(&mut self) {
-        self.mutex.locked.store(false, Ordering::Release);
+        let current = thread::current().id();
+        let mut gate = self
+            .mutex
+            .gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert_eq!(gate.owner, Some(current));
+        debug_assert!(gate.depth > 0);
+        gate.depth -= 1;
+        if gate.depth == 0 {
+            gate.owner = None;
+            self.mutex.available.notify_one();
+        }
     }
 }
 
@@ -1656,20 +1678,57 @@ impl PartialEq for RuntimeMutexGuard {
 struct RuntimeAtomicInt(Arc<AtomicI64>);
 
 impl RuntimeAtomicInt {
-    fn add(&self, delta: i64, span: Span) -> Result<(i64, i64), Diagnostic> {
-        let mut current = self.0.load(Ordering::SeqCst);
+    fn add(&self, delta: i64, order: Ordering, span: Span) -> Result<(i64, i64), Diagnostic> {
+        let mut current = self.0.load(Ordering::Relaxed);
         loop {
             let next = current.checked_add(delta).ok_or_else(|| {
                 Diagnostic::new(DiagnosticKind::Runtime, "AtomicInt overflow", span)
             })?;
             match self
                 .0
-                .compare_exchange_weak(current, next, Ordering::SeqCst, Ordering::SeqCst)
+                .compare_exchange_weak(current, next, order, atomic_failure_order(order))
             {
                 Ok(previous) => return Ok((previous, next)),
                 Err(observed) => current = observed,
             }
         }
+    }
+}
+
+fn atomic_operation(name: &str) -> Option<&'static str> {
+    if name == "load" || name.starts_with("load_") {
+        Some("load")
+    } else if name == "store" || name.starts_with("store_") {
+        Some("store")
+    } else if name == "add" || name.starts_with("add_") {
+        Some("add")
+    } else if name == "fetch_add" || name.starts_with("fetch_add_") {
+        Some("fetch_add")
+    } else {
+        None
+    }
+}
+
+fn atomic_order(name: &str) -> Ordering {
+    if name.ends_with("_relaxed") {
+        Ordering::Relaxed
+    } else if name.ends_with("_acquire") {
+        Ordering::Acquire
+    } else if name.ends_with("_release") {
+        Ordering::Release
+    } else if name.ends_with("_acq_rel") {
+        Ordering::AcqRel
+    } else {
+        Ordering::SeqCst
+    }
+}
+
+fn atomic_failure_order(order: Ordering) -> Ordering {
+    match order {
+        Ordering::Relaxed | Ordering::Release => Ordering::Relaxed,
+        Ordering::Acquire | Ordering::AcqRel => Ordering::Acquire,
+        Ordering::SeqCst => Ordering::SeqCst,
+        _ => unreachable!("unsupported AtomicInt memory order"),
     }
 }
 
@@ -1683,6 +1742,116 @@ impl std::fmt::Debug for RuntimeAtomicInt {
 }
 
 impl PartialEq for RuntimeAtomicInt {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeChannel(Arc<RuntimeChannelState>);
+
+struct RuntimeChannelState {
+    queue: StdMutex<RuntimeChannelQueue>,
+    not_empty: Condvar,
+    not_full: Condvar,
+}
+
+struct RuntimeChannelQueue {
+    values: VecDeque<Value>,
+    capacity: usize,
+    closed: bool,
+    permit: Option<RuntimeHandlePermit>,
+}
+
+impl RuntimeChannel {
+    fn bounded(capacity: usize, permit: RuntimeHandlePermit) -> Result<Self, &'static str> {
+        if capacity == 0 {
+            return Err("Channel capacity must be greater than zero");
+        }
+        let mut values = VecDeque::new();
+        values
+            .try_reserve_exact(capacity)
+            .map_err(|_| "Channel allocation failed")?;
+        Ok(Self(Arc::new(RuntimeChannelState {
+            queue: StdMutex::new(RuntimeChannelQueue {
+                values,
+                capacity,
+                closed: false,
+                permit: Some(permit),
+            }),
+            not_empty: Condvar::new(),
+            not_full: Condvar::new(),
+        })))
+    }
+
+    fn send(&self, value: Value, span: Span) -> Result<bool, Diagnostic> {
+        let mut queue = self.0.queue.lock().map_err(|_| channel_poisoned(span))?;
+        while queue.values.len() == queue.capacity && !queue.closed {
+            queue = self
+                .0
+                .not_full
+                .wait(queue)
+                .map_err(|_| channel_poisoned(span))?;
+        }
+        if queue.closed {
+            return Ok(false);
+        }
+        queue.values.push_back(value);
+        self.0.not_empty.notify_one();
+        Ok(true)
+    }
+
+    fn receive(&self, span: Span) -> Result<Option<Value>, Diagnostic> {
+        let mut queue = self.0.queue.lock().map_err(|_| channel_poisoned(span))?;
+        while queue.values.is_empty() && !queue.closed {
+            queue = self
+                .0
+                .not_empty
+                .wait(queue)
+                .map_err(|_| channel_poisoned(span))?;
+        }
+        let value = queue.values.pop_front();
+        if value.is_some() {
+            self.0.not_full.notify_one();
+        }
+        Ok(value)
+    }
+
+    fn close(&self, span: Span) -> Result<(), Diagnostic> {
+        let mut queue = self.0.queue.lock().map_err(|_| channel_poisoned(span))?;
+        if !queue.closed {
+            queue.closed = true;
+            queue.permit.take();
+        }
+        self.0.not_empty.notify_all();
+        self.0.not_full.notify_all();
+        Ok(())
+    }
+
+    fn inspect(&self, span: Span) -> Result<(usize, usize, bool), Diagnostic> {
+        let queue = self.0.queue.lock().map_err(|_| channel_poisoned(span))?;
+        Ok((queue.values.len(), queue.capacity, queue.closed))
+    }
+}
+
+fn channel_poisoned(span: Span) -> Diagnostic {
+    Diagnostic::new(
+        DiagnosticKind::Runtime,
+        "Channel state lock is poisoned",
+        span,
+    )
+}
+
+impl std::fmt::Debug for RuntimeChannel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("Channel")
+            .field(&Arc::as_ptr(&self.0))
+            .finish()
+    }
+}
+
+impl PartialEq for RuntimeChannel {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
@@ -1755,6 +1924,14 @@ impl RuntimeCString {
 struct RuntimeMemoryState {
     bytes: Vec<u8>,
     alignment: usize,
+    budget: Arc<RuntimeBudget>,
+    reserved_bytes: u64,
+}
+
+impl Drop for RuntimeMemoryState {
+    fn drop(&mut self) {
+        self.budget.release_explicit_memory(self.reserved_bytes);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1767,7 +1944,7 @@ impl PartialEq for RuntimeMemory {
 }
 
 impl RuntimeMemory {
-    fn new(size: usize, alignment: usize) -> Result<Self, &'static str> {
+    fn validate(size: usize, alignment: usize) -> Result<(), &'static str> {
         if alignment == 0 || !alignment.is_power_of_two() {
             return Err("Memory alignment must be a non-zero power of two");
         }
@@ -1781,14 +1958,26 @@ impl RuntimeMemory {
         {
             return Err("Memory size overflow");
         }
+        Ok(())
+    }
+
+    fn new(
+        size: usize,
+        alignment: usize,
+        budget: Arc<RuntimeBudget>,
+    ) -> Result<Self, &'static str> {
+        Self::validate(size, alignment)?;
         let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(size)
-            .map_err(|_| "Memory allocation failed")?;
+        if bytes.try_reserve_exact(size).is_err() {
+            budget.release_explicit_memory(size as u64);
+            return Err("Memory allocation failed");
+        }
         bytes.resize(size, 0);
         Ok(Self(Arc::new(StdMutex::new(RuntimeMemoryState {
             bytes,
             alignment,
+            budget,
+            reserved_bytes: size as u64,
         }))))
     }
 
@@ -1888,6 +2077,112 @@ fn runtime_result(value: Result<Value, std::io::Error>) -> Value {
     }
 }
 
+static FILE_TRANSACTION_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+const FILE_WRITE_LIMIT_ERROR: &str = "file write exceeds the configured byte limit";
+
+fn transactional_replace<F>(
+    destination: &Path,
+    permissions: Option<fs::Permissions>,
+    write: F,
+) -> io::Result<()>
+where
+    F: FnOnce(&mut fs::File) -> io::Result<()>,
+{
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    let name = destination
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file path has no name"))?;
+    let mut created = None;
+    for _ in 0..128 {
+        let id = FILE_TRANSACTION_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut temporary_name = name.to_os_string();
+        temporary_name.push(format!(".disp-tmp-{}-{id}", std::process::id()));
+        let temporary_path = parent.join(temporary_name);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+        {
+            Ok(file) => {
+                created = Some((temporary_path, file));
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let Some((temporary_path, mut file)) = created else {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not create a unique transactional file",
+        ));
+    };
+
+    let prepared = write(&mut file)
+        .and_then(|()| file.flush())
+        .and_then(|()| file.sync_all())
+        .and_then(|()| {
+            if let Some(permissions) = permissions {
+                file.set_permissions(permissions)?;
+            }
+            Ok(())
+        });
+    drop(file);
+    if let Err(error) = prepared {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&temporary_path, destination) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn transactional_file_write(
+    destination: &Path,
+    data: &[u8],
+    append: bool,
+    max_bytes: u64,
+) -> io::Result<()> {
+    let data_len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+    if data_len > max_bytes {
+        return Err(io::Error::other(FILE_WRITE_LIMIT_ERROR));
+    }
+    let permissions = fs::metadata(destination)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    transactional_replace(destination, permissions, |temporary| {
+        if append {
+            match fs::File::open(destination) {
+                Ok(source) => {
+                    let remaining = max_bytes - data_len;
+                    let mut bounded = source.take(remaining.saturating_add(1));
+                    if io::copy(&mut bounded, temporary)? > remaining {
+                        return Err(io::Error::other(FILE_WRITE_LIMIT_ERROR));
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        temporary.write_all(data)
+    })
+}
+
+fn transactional_file_copy(source: &Path, destination: &Path, max_bytes: u64) -> io::Result<()> {
+    let permissions = fs::metadata(source)?.permissions();
+    transactional_replace(destination, Some(permissions), |temporary| {
+        let source = fs::File::open(source)?;
+        let mut bounded = source.take(max_bytes.saturating_add(1));
+        if io::copy(&mut bounded, temporary)? > max_bytes {
+            return Err(io::Error::other(FILE_WRITE_LIMIT_ERROR));
+        }
+        Ok(())
+    })
+}
+
 fn runtime_bytes(bytes: Vec<u8>) -> Value {
     Value::List {
         capacity: bytes.len(),
@@ -1895,6 +2190,39 @@ fn runtime_bytes(bytes: Vec<u8>) -> Value {
             .into_iter()
             .map(|byte| Value::Unsigned(byte as u128, 8))
             .collect(),
+    }
+}
+
+fn runtime_list_bytes(value: Value) -> Option<Vec<u8>> {
+    let Value::List { values, .. } = value else {
+        return None;
+    };
+    values
+        .into_iter()
+        .map(|value| match value {
+            Value::Unsigned(byte, 8) => Some(byte as u8),
+            _ => None,
+        })
+        .collect()
+}
+
+fn runtime_nonnegative_usize(value: Value) -> Option<usize> {
+    match value {
+        Value::Int(value) if value >= 0 => usize::try_from(value).ok(),
+        Value::UInt(value) => usize::try_from(value).ok(),
+        Value::Signed(value, _) if value >= 0 => usize::try_from(value).ok(),
+        Value::Unsigned(value, _) => usize::try_from(value).ok(),
+        _ => None,
+    }
+}
+
+fn runtime_u64(value: Value) -> Option<u64> {
+    match value {
+        Value::UInt(value) => Some(value),
+        Value::Unsigned(value, _) => u64::try_from(value).ok(),
+        Value::Int(value) if value >= 0 => Some(value as u64),
+        Value::Signed(value, _) if value >= 0 => u64::try_from(value).ok(),
+        _ => None,
     }
 }
 
@@ -1913,10 +2241,10 @@ fn runtime_http_body(value: Value) -> Option<Vec<u8>> {
     }
 }
 
-const HTTP_HEADER_LIMIT: usize = 64 * 1024;
-const HTTP_BODY_LIMIT: usize = 16 * 1024 * 1024;
+const HTTP_HEADER_LIMIT: usize = limits::HTTP_HEADER_BYTES;
+const HTTP_BODY_LIMIT: usize = limits::HTTP_BODY_BYTES;
 const HTTP_CHUNKED_WIRE_LIMIT: usize = HTTP_BODY_LIMIT + 1024 * 1024;
-const HTTP_REDIRECT_LIMIT: usize = 10;
+const HTTP_REDIRECT_LIMIT: usize = limits::HTTP_REDIRECTS;
 
 enum InterpreterHttpStream {
     Plain(StdTcpStream),
@@ -2185,7 +2513,7 @@ fn decode_chunked_body(bytes: &[u8]) -> io::Result<Option<(Vec<u8>, usize)>> {
 }
 
 fn parse_http_headers(bytes: &[u8]) -> io::Result<ParsedHttpHeaders> {
-    let mut storage = [httparse::EMPTY_HEADER; 100];
+    let mut storage = [httparse::EMPTY_HEADER; limits::HTTP_HEADERS];
     let mut response = httparse::Response::new(&mut storage);
     let consumed = match response.parse(bytes).map_err(|error| {
         http_error(
@@ -2481,7 +2809,7 @@ fn http_header(name: &str, value: &str) -> io::Result<()> {
 }
 
 fn http_request_size(request: &RuntimeHttpRequest) -> io::Result<()> {
-    if request.headers.len() > 100 {
+    if request.headers.len() > limits::HTTP_HEADERS {
         return Err(http_error(
             io::ErrorKind::InvalidInput,
             "HTTP request contains more than 100 headers",
@@ -2657,6 +2985,9 @@ enum Value {
     CString(RuntimeCString),
     CStr(RuntimeCString),
     Memory(RuntimeMemory),
+    SecretBytes(RuntimeSecret),
+    AeadEnvelope(RuntimeAeadEnvelope),
+    Ed25519SigningKey(RuntimeEd25519SigningKey),
     Path(PathBuf),
     Url(RuntimeUrl),
     Json(RuntimeJson),
@@ -2680,6 +3011,7 @@ enum Value {
     Task(RuntimeTask),
     Mutex(RuntimeMutex),
     MutexGuard(RuntimeMutexGuard),
+    Channel(RuntimeChannel),
     AtomicInt(RuntimeAtomicInt),
     Array(Vec<Value>),
     Slice(Vec<Value>),
@@ -2717,6 +3049,571 @@ enum Value {
     Uninitialized,
 }
 
+fn heap_product(items: usize, item_size: usize) -> u64 {
+    u64::try_from(items)
+        .ok()
+        .and_then(|items| {
+            u64::try_from(item_size)
+                .ok()
+                .and_then(|size| items.checked_mul(size))
+        })
+        .unwrap_or(u64::MAX)
+}
+
+fn heap_sum(total: &mut u64, amount: u64) {
+    *total = total.saturating_add(amount);
+}
+
+fn string_heap(value: &String) -> u64 {
+    u64::try_from(value.capacity()).unwrap_or(u64::MAX)
+}
+
+fn path_heap(value: &Path) -> u64 {
+    u64::try_from(value.as_os_str().as_encoded_bytes().len()).unwrap_or(u64::MAX)
+}
+
+fn place_heap(place: &Place) -> u64 {
+    let mut total = string_heap(&place.name);
+    heap_sum(
+        &mut total,
+        heap_product(place.fields.capacity(), std::mem::size_of::<PlaceSegment>()),
+    );
+    for field in &place.fields {
+        if let PlaceSegment::Field(name) = field {
+            heap_sum(&mut total, string_heap(name));
+        }
+    }
+    total
+}
+
+fn map_storage<K, V>(map: &HashMap<K, V>) -> u64 {
+    heap_product(
+        map.capacity(),
+        std::mem::size_of::<K>()
+            .saturating_add(std::mem::size_of::<V>())
+            .saturating_add(16),
+    )
+}
+
+fn future_work_heap(work: &FutureWork, seen: &mut HashSet<usize>) -> u64 {
+    let mut total = 0u64;
+    match work {
+        FutureWork::Function(_, arguments) => {
+            heap_sum(
+                &mut total,
+                u64::try_from(std::mem::size_of::<Function>()).unwrap_or(u64::MAX),
+            );
+            heap_sum(
+                &mut total,
+                heap_product(arguments.capacity(), std::mem::size_of::<Value>()),
+            );
+            for value in arguments {
+                heap_sum(&mut total, value.heap_bytes(seen));
+            }
+        }
+        FutureWork::ReadText(path) | FutureWork::ReadBytes(path) => {
+            heap_sum(&mut total, path_heap(path));
+        }
+        FutureWork::WriteText(path, text) => {
+            heap_sum(&mut total, path_heap(path));
+            heap_sum(
+                &mut total,
+                u64::try_from(text.capacity()).unwrap_or(u64::MAX),
+            );
+        }
+        FutureWork::WriteBytes(path, bytes) => {
+            heap_sum(&mut total, path_heap(path));
+            heap_sum(
+                &mut total,
+                u64::try_from(bytes.capacity()).unwrap_or(u64::MAX),
+            );
+        }
+        FutureWork::SocketWrite(_, bytes, _)
+        | FutureWork::UdpSend(_, bytes, _, _)
+        | FutureWork::TlsWrite(_, bytes, _) => {
+            heap_sum(
+                &mut total,
+                u64::try_from(bytes.capacity()).unwrap_or(u64::MAX),
+            );
+        }
+        FutureWork::Resolve(host, _) | FutureWork::TlsConnect(_, host, _) => {
+            heap_sum(&mut total, string_heap(host));
+        }
+        FutureWork::HttpRequest(request, _) => {
+            heap_sum(&mut total, request.heap_bytes());
+        }
+        FutureWork::Yield
+        | FutureWork::Sleep(_)
+        | FutureWork::Connect(_, _)
+        | FutureWork::Accept(_, _)
+        | FutureWork::SocketRead(_, _, _)
+        | FutureWork::UdpReceive(_, _, _)
+        | FutureWork::TlsRead(_, _, _) => {}
+    }
+    total
+}
+
+impl RuntimeHttpRequest {
+    fn heap_bytes(&self) -> u64 {
+        let mut total = string_heap(&self.method).saturating_add(string_heap(&self.url));
+        heap_sum(
+            &mut total,
+            heap_product(
+                self.headers.capacity(),
+                std::mem::size_of::<(String, String)>(),
+            ),
+        );
+        for (name, value) in &self.headers {
+            heap_sum(&mut total, string_heap(name));
+            heap_sum(&mut total, string_heap(value));
+        }
+        heap_sum(
+            &mut total,
+            u64::try_from(self.body.capacity()).unwrap_or(u64::MAX),
+        );
+        total
+    }
+}
+
+impl Value {
+    fn heap_bytes(&self, seen: &mut HashSet<usize>) -> u64 {
+        let mut total = 0u64;
+        match self {
+            Value::String(value) => {
+                heap_sum(
+                    &mut total,
+                    u64::try_from(value.capacity()).unwrap_or(u64::MAX),
+                );
+            }
+            Value::CString(value) | Value::CStr(value) => {
+                let pointer = Arc::as_ptr(&value.0) as usize;
+                if seen.insert(pointer) {
+                    heap_sum(&mut total, std::mem::size_of::<Vec<u8>>() as u64);
+                    heap_sum(
+                        &mut total,
+                        u64::try_from(value.0.capacity()).unwrap_or(u64::MAX),
+                    );
+                }
+            }
+            Value::Memory(value) => {
+                let pointer = Arc::as_ptr(&value.0) as usize;
+                if seen.insert(pointer) {
+                    heap_sum(&mut total, std::mem::size_of::<RuntimeMemoryState>() as u64);
+                }
+            }
+            Value::SecretBytes(value) => {
+                let pointer = Arc::as_ptr(&value.0) as usize;
+                if seen.insert(pointer) {
+                    heap_sum(&mut total, value.0.len() as u64);
+                }
+            }
+            Value::AeadEnvelope(value) => {
+                let pointer = Arc::as_ptr(&value.0) as usize;
+                if seen.insert(pointer) {
+                    heap_sum(
+                        &mut total,
+                        (value.0.nonce().len() + value.0.ciphertext().len()) as u64,
+                    );
+                }
+            }
+            Value::Ed25519SigningKey(value) => {
+                let pointer = Arc::as_ptr(&value.0) as usize;
+                if seen.insert(pointer) {
+                    heap_sum(&mut total, 32);
+                }
+            }
+            Value::Path(value) => heap_sum(&mut total, path_heap(value)),
+            Value::Url(value) => heap_sum(&mut total, string_heap(&value.text)),
+            Value::Json(value) => heap_sum(&mut total, string_heap(&value.text)),
+            Value::SocketAddress(value) => heap_sum(&mut total, string_heap(&value.host)),
+            Value::HttpRequest(value) => heap_sum(&mut total, value.heap_bytes()),
+            Value::HttpResponse(value) => {
+                let pointer = Arc::as_ptr(&value.0) as usize;
+                if seen.insert(pointer) {
+                    heap_sum(
+                        &mut total,
+                        std::mem::size_of::<RuntimeHttpResponseData>() as u64,
+                    );
+                    heap_sum(&mut total, string_heap(&value.0.url));
+                    heap_sum(
+                        &mut total,
+                        heap_product(
+                            value.0.headers.capacity(),
+                            std::mem::size_of::<(String, String)>(),
+                        ),
+                    );
+                    for (name, value) in &value.0.headers {
+                        heap_sum(&mut total, string_heap(name));
+                        heap_sum(&mut total, string_heap(value));
+                    }
+                    heap_sum(
+                        &mut total,
+                        u64::try_from(value.0.body.capacity()).unwrap_or(u64::MAX),
+                    );
+                }
+            }
+            Value::UdpDatagram(value) => {
+                heap_sum(&mut total, string_heap(&value.source.host));
+                heap_sum(
+                    &mut total,
+                    u64::try_from(value.bytes.capacity()).unwrap_or(u64::MAX),
+                );
+            }
+            Value::ProcessCommand(value) => {
+                heap_sum(
+                    &mut total,
+                    std::mem::size_of::<RuntimeProcessCommand>() as u64,
+                );
+                heap_sum(&mut total, path_heap(&value.program));
+                heap_sum(
+                    &mut total,
+                    heap_product(value.arguments.capacity(), std::mem::size_of::<String>()),
+                );
+                for argument in &value.arguments {
+                    heap_sum(&mut total, string_heap(argument));
+                }
+                if let Some(directory) = &value.directory {
+                    heap_sum(&mut total, path_heap(directory));
+                }
+                heap_sum(
+                    &mut total,
+                    heap_product(
+                        value.environment.capacity(),
+                        std::mem::size_of::<(String, String)>(),
+                    ),
+                );
+                for (name, value) in &value.environment {
+                    heap_sum(&mut total, string_heap(name));
+                    heap_sum(&mut total, string_heap(value));
+                }
+                heap_sum(
+                    &mut total,
+                    u64::try_from(value.input.capacity()).unwrap_or(u64::MAX),
+                );
+            }
+            Value::ProcessOutput(value) => {
+                heap_sum(
+                    &mut total,
+                    u64::try_from(value.stdout.capacity()).unwrap_or(u64::MAX),
+                );
+                heap_sum(
+                    &mut total,
+                    u64::try_from(value.stderr.capacity()).unwrap_or(u64::MAX),
+                );
+            }
+            Value::Future(value) => {
+                let pointer = Arc::as_ptr(&value.0) as usize;
+                if seen.insert(pointer) {
+                    heap_sum(
+                        &mut total,
+                        std::mem::size_of::<StdMutex<Option<FutureWork>>>() as u64,
+                    );
+                    if let Ok(work) = value.0.lock()
+                        && let Some(work) = work.as_ref()
+                    {
+                        heap_sum(&mut total, future_work_heap(work, seen));
+                    }
+                }
+            }
+            Value::Task(value) => {
+                let pointer = Arc::as_ptr(&value.0) as usize;
+                if seen.insert(pointer) {
+                    heap_sum(&mut total, std::mem::size_of::<RuntimeTaskState>() as u64);
+                    if let Ok(work) = value.0.work.lock() {
+                        match &*work {
+                            RuntimeTaskWork::Future(future) => {
+                                heap_sum(
+                                    &mut total,
+                                    Value::Future(future.clone()).heap_bytes(seen),
+                                );
+                            }
+                            RuntimeTaskWork::Ready(value) => {
+                                heap_sum(&mut total, value.heap_bytes(seen));
+                            }
+                            RuntimeTaskWork::Running | RuntimeTaskWork::Consumed => {}
+                        }
+                    }
+                }
+            }
+            Value::Thread(value) => {
+                let pointer = Arc::as_ptr(&value.0) as usize;
+                if seen.insert(pointer) {
+                    heap_sum(&mut total, std::mem::size_of::<ThreadState>() as u64);
+                }
+            }
+            Value::Mutex(value) => {
+                let pointer = Arc::as_ptr(&value.0) as usize;
+                if seen.insert(pointer) {
+                    heap_sum(&mut total, std::mem::size_of::<RuntimeMutexState>() as u64);
+                    if let Ok(value) = value.0.value.lock()
+                        && let Some(value) = value.downcast_ref::<Value>()
+                    {
+                        heap_sum(&mut total, value.heap_bytes(seen));
+                    }
+                }
+            }
+            Value::MutexGuard(value) => {
+                let pointer = Arc::as_ptr(&value.0.mutex) as usize;
+                if seen.insert(pointer) {
+                    heap_sum(&mut total, std::mem::size_of::<RuntimeMutexState>() as u64);
+                    if let Ok(value) = value.0.mutex.value.lock()
+                        && let Some(value) = value.downcast_ref::<Value>()
+                    {
+                        heap_sum(&mut total, value.heap_bytes(seen));
+                    }
+                }
+            }
+            Value::Channel(value) => {
+                let pointer = Arc::as_ptr(&value.0) as usize;
+                if seen.insert(pointer) {
+                    heap_sum(
+                        &mut total,
+                        std::mem::size_of::<RuntimeChannelState>() as u64,
+                    );
+                    if let Ok(queue) = value.0.queue.lock() {
+                        heap_sum(
+                            &mut total,
+                            heap_product(queue.capacity, std::mem::size_of::<Value>()),
+                        );
+                        for value in &queue.values {
+                            heap_sum(&mut total, value.heap_bytes(seen));
+                        }
+                    }
+                }
+            }
+            Value::AtomicInt(value) => {
+                let pointer = Arc::as_ptr(&value.0) as usize;
+                if seen.insert(pointer) {
+                    heap_sum(&mut total, std::mem::size_of::<AtomicI64>() as u64);
+                }
+            }
+            Value::TcpStream(value) => {
+                let pointer = Arc::as_ptr(&value.0) as usize;
+                if seen.insert(pointer) {
+                    heap_sum(
+                        &mut total,
+                        std::mem::size_of::<RuntimeTcpStreamState>() as u64,
+                    );
+                }
+            }
+            Value::TlsStream(value) => {
+                let pointer = Arc::as_ptr(&value.0) as usize;
+                if seen.insert(pointer) {
+                    heap_sum(
+                        &mut total,
+                        std::mem::size_of::<RuntimeTlsStreamState>() as u64,
+                    );
+                }
+            }
+            Value::TcpListener(value) => {
+                let pointer = Arc::as_ptr(&value.0) as usize;
+                if seen.insert(pointer) {
+                    heap_sum(
+                        &mut total,
+                        std::mem::size_of::<RuntimeTcpListenerState>() as u64,
+                    );
+                }
+            }
+            Value::UdpSocket(value) => {
+                let pointer = Arc::as_ptr(&value.0) as usize;
+                if seen.insert(pointer) {
+                    heap_sum(
+                        &mut total,
+                        std::mem::size_of::<RuntimeUdpSocketState>() as u64,
+                    );
+                }
+            }
+            Value::Array(values) | Value::Slice(values) => {
+                heap_sum(
+                    &mut total,
+                    heap_product(values.capacity(), std::mem::size_of::<Value>()),
+                );
+                for value in values {
+                    heap_sum(&mut total, value.heap_bytes(seen));
+                }
+            }
+            Value::List { values, capacity } => {
+                heap_sum(
+                    &mut total,
+                    heap_product(*capacity, std::mem::size_of::<Value>()),
+                );
+                for value in values {
+                    heap_sum(&mut total, value.heap_bytes(seen));
+                }
+            }
+            Value::Map { entries, capacity } => {
+                heap_sum(
+                    &mut total,
+                    heap_product(*capacity, std::mem::size_of::<(Value, Value)>()),
+                );
+                for (key, value) in entries {
+                    heap_sum(&mut total, key.heap_bytes(seen));
+                    heap_sum(&mut total, value.heap_bytes(seen));
+                }
+            }
+            Value::Set { values, capacity } => {
+                heap_sum(
+                    &mut total,
+                    heap_product(*capacity, std::mem::size_of::<Value>()),
+                );
+                for value in values {
+                    heap_sum(&mut total, value.heap_bytes(seen));
+                }
+            }
+            Value::Function(value) => heap_sum(&mut total, string_heap(value)),
+            Value::Closure(value) => {
+                heap_sum(&mut total, std::mem::size_of::<RuntimeClosure>() as u64);
+                let pointer = Arc::as_ptr(&value.captures) as usize;
+                if seen.insert(pointer)
+                    && let Ok(captures) = value.captures.lock()
+                {
+                    heap_sum(&mut total, map_storage(&captures));
+                    for (name, value) in captures.iter() {
+                        heap_sum(&mut total, string_heap(name));
+                        heap_sum(&mut total, value.heap_bytes(seen));
+                    }
+                }
+            }
+            Value::Reference(place, _) | Value::CaptureReference(place, _) => {
+                heap_sum(&mut total, place_heap(place));
+            }
+            Value::Constructor { type_name, variant } => {
+                heap_sum(&mut total, string_heap(type_name));
+                heap_sum(&mut total, string_heap(variant));
+            }
+            Value::Struct { type_name, fields } => {
+                heap_sum(&mut total, string_heap(type_name));
+                heap_sum(&mut total, map_storage(fields));
+                for (name, value) in fields {
+                    heap_sum(&mut total, string_heap(name));
+                    heap_sum(&mut total, value.heap_bytes(seen));
+                }
+            }
+            Value::Enum {
+                type_name,
+                variant,
+                payload,
+            } => {
+                heap_sum(&mut total, string_heap(type_name));
+                heap_sum(&mut total, string_heap(variant));
+                heap_sum(
+                    &mut total,
+                    heap_product(payload.capacity(), std::mem::size_of::<Value>()),
+                );
+                for value in payload {
+                    heap_sum(&mut total, value.heap_bytes(seen));
+                }
+            }
+            Value::Database(value) => {
+                let pointer = Arc::as_ptr(&value.0) as usize;
+                if seen.insert(pointer) {
+                    heap_sum(
+                        &mut total,
+                        std::mem::size_of::<RuntimeDatabaseState>() as u64,
+                    );
+                    if let Ok(state) = value.0.lock()
+                        && let Some(store) = &state.native
+                    {
+                        heap_sum(&mut total, map_storage(&store.tables));
+                        for (name, table) in &store.tables {
+                            heap_sum(&mut total, string_heap(name));
+                            heap_sum(
+                                &mut total,
+                                heap_product(
+                                    table.fields.capacity(),
+                                    std::mem::size_of::<NativeDataField>(),
+                                ),
+                            );
+                            for field in &table.fields {
+                                heap_sum(&mut total, string_heap(&field.name));
+                                heap_sum(&mut total, string_heap(&field.storage));
+                            }
+                            heap_sum(
+                                &mut total,
+                                heap_product(table.rows.capacity(), std::mem::size_of::<Value>()),
+                            );
+                            for row in &table.rows {
+                                heap_sum(&mut total, row.heap_bytes(seen));
+                            }
+                        }
+                        heap_sum(&mut total, map_storage(&store.pending));
+                        for (name, table) in &store.pending {
+                            heap_sum(&mut total, string_heap(name));
+                            heap_sum(&mut total, string_heap(&table.name));
+                            heap_sum(
+                                &mut total,
+                                heap_product(
+                                    table.fields.capacity(),
+                                    std::mem::size_of::<data_store::Field>(),
+                                ),
+                            );
+                            for field in &table.fields {
+                                heap_sum(&mut total, string_heap(&field.name));
+                                heap_sum(&mut total, string_heap(&field.storage));
+                            }
+                            heap_sum(
+                                &mut total,
+                                heap_product(table.rows.capacity(), std::mem::size_of::<Vec<u8>>()),
+                            );
+                            for row in &table.rows {
+                                heap_sum(
+                                    &mut total,
+                                    u64::try_from(row.capacity()).unwrap_or(u64::MAX),
+                                );
+                            }
+                        }
+                        if let Some(path) = &store.path {
+                            heap_sum(&mut total, path_heap(path));
+                        }
+                    }
+                }
+            }
+            Value::ChildProcess(value) => {
+                let pointer = Arc::as_ptr(&value.0) as usize;
+                if seen.insert(pointer) {
+                    heap_sum(&mut total, std::mem::size_of::<RuntimeChildInner>() as u64);
+                    if let Ok(state) = value.0.state.lock() {
+                        for pipe in [&state.stdout, &state.stderr] {
+                            let pointer = Arc::as_ptr(pipe) as usize;
+                            if seen.insert(pointer) {
+                                heap_sum(
+                                    &mut total,
+                                    std::mem::size_of::<RuntimeChildPipe>() as u64,
+                                );
+                                if let Ok(bytes) = pipe.bytes.lock() {
+                                    heap_sum(
+                                        &mut total,
+                                        u64::try_from(bytes.capacity()).unwrap_or(u64::MAX),
+                                    );
+                                }
+                                if let Ok(failed) = pipe.failed.lock()
+                                    && let Some(message) = failed.as_ref()
+                                {
+                                    heap_sum(&mut total, string_heap(message));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Value::Int(_)
+            | Value::UInt(_)
+            | Value::Signed(_, _)
+            | Value::Unsigned(_, _)
+            | Value::Float(_)
+            | Value::Float32(_)
+            | Value::IpAddress(_)
+            | Value::Instant(_)
+            | Value::Duration(_)
+            | Value::Char(_)
+            | Value::Bool(_)
+            | Value::Unit
+            | Value::Uninitialized => {}
+        }
+        total
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct RuntimeProcessOutput {
     status: i64,
@@ -2743,8 +3640,8 @@ const SQLITE_FLOAT: i32 = 2;
 const SQLITE_TEXT: i32 = 3;
 const SQLITE_BLOB: i32 = 4;
 const SQLITE_NULL: i32 = 5;
-const DATABASE_SQL_LIMIT: usize = 1024 * 1024;
-const DATABASE_ROW_LIMIT: usize = 100_000;
+const DATABASE_SQL_LIMIT: usize = limits::DATABASE_SQL_BYTES;
+const DATABASE_ROW_LIMIT: usize = limits::DATABASE_ROWS;
 
 #[derive(Clone, PartialEq, Eq)]
 struct NativeDataField {
@@ -2773,6 +3670,7 @@ struct RuntimeDatabaseState {
     handle: *mut Sqlite3,
     closed: bool,
     native: Option<NativeDataStore>,
+    permit: Option<RuntimeHandlePermit>,
 }
 
 // SQLite is opened in FULLMUTEX mode, and every access is additionally serialized
@@ -2823,7 +3721,8 @@ fn database_error(handle: *mut Sqlite3, fallback: &str) -> io::Error {
 }
 
 impl RuntimeDatabase {
-    fn open(path: &str) -> io::Result<Self> {
+    fn open(path: &str, permit: RuntimeHandlePermit) -> io::Result<Self> {
+        load_sqlite_api()?;
         if path.is_empty() || path.len() > 32_768 || path.contains('\0') {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2872,18 +3771,20 @@ impl RuntimeDatabase {
             handle,
             closed: false,
             native: None,
+            permit: Some(permit),
         }))))
     }
 
-    fn native_memory() -> io::Result<Self> {
+    fn native_memory(permit: RuntimeHandlePermit) -> io::Result<Self> {
         Ok(Self(Arc::new(StdMutex::new(RuntimeDatabaseState {
             handle: std::ptr::null_mut(),
             closed: false,
             native: Some(NativeDataStore::default()),
+            permit: Some(permit),
         }))))
     }
 
-    fn native_open(path: PathBuf) -> io::Result<Self> {
+    fn native_open(path: PathBuf, permit: RuntimeHandlePermit) -> io::Result<Self> {
         let lock = Arc::new(data_store::Lock::acquire(&path)?);
         let snapshot = data_store::load(&path, &lock)?;
         for table in &snapshot.tables {
@@ -2907,6 +3808,7 @@ impl RuntimeDatabase {
                 path: Some(path),
                 lock: Some(lock),
             }),
+            permit: Some(permit),
         }))))
     }
 
@@ -3102,7 +4004,7 @@ impl RuntimeDatabase {
             let _decoded = Self::bind(statement.0, parameters)?;
             // SAFETY: statement is live.
             let columns = unsafe { sqlite3_column_count(statement.0) };
-            if !(0..=4096).contains(&columns) {
+            if !(0..=limits::DATABASE_COLUMNS as i32).contains(&columns) {
                 return Err(io::Error::other("query column count exceeds 4096"));
             }
             let mut rows = Vec::new();
@@ -3255,10 +4157,12 @@ impl RuntimeDatabase {
         if let Some(native) = state.native.as_mut() {
             native.tables.clear();
             state.closed = true;
+            state.permit.take();
             return Ok(());
         }
         if state.handle.is_null() {
             state.closed = true;
+            state.permit.take();
             return Ok(());
         }
         // SAFETY: state owns a live connection. SQLite returns zero inside a transaction.
@@ -3281,6 +4185,7 @@ impl RuntimeDatabase {
         }
         state.handle = std::ptr::null_mut();
         state.closed = true;
+        state.permit.take();
         Ok(())
     }
 }
@@ -3710,7 +4615,7 @@ fn data_decode_rows(
         .collect()
 }
 
-const PROCESS_STREAM_LIMIT: usize = 16 * 1024 * 1024;
+const PROCESS_STREAM_LIMIT: usize = limits::PROCESS_STREAM_BYTES;
 
 #[derive(Default)]
 struct RuntimeChildPipe {
@@ -3721,8 +4626,8 @@ struct RuntimeChildPipe {
 }
 
 struct RuntimeChildState {
-    child: StdChild,
-    input: Option<ChildStdin>,
+    child: SandboxedProcess,
+    input: Option<Box<dyn Write + Send>>,
     stdout: Arc<RuntimeChildPipe>,
     stderr: Arc<RuntimeChildPipe>,
     stdout_thread: Option<thread::JoinHandle<()>>,
@@ -3733,6 +4638,7 @@ struct RuntimeChildState {
 
 struct RuntimeChildInner {
     state: StdMutex<RuntimeChildState>,
+    _permit: RuntimeHandlePermit,
 }
 
 #[derive(Clone)]
@@ -3804,8 +4710,7 @@ impl RuntimeChildProcess {
                 .deadline
                 .is_some_and(|deadline| StdInstant::now() >= deadline)
         {
-            let _ = state.child.kill();
-            let _ = state.child.wait();
+            let _ = state.child.kill_tree();
             state.status = Some(124);
             state.input.take();
             return Err(io::Error::new(
@@ -3928,8 +4833,7 @@ impl RuntimeChildProcess {
             .lock()
             .map_err(|_| io::Error::other("child-process state is poisoned"))?;
         if state.status.is_none() {
-            state.child.kill()?;
-            state.status = Some(process_status(state.child.wait()?));
+            state.status = Some(process_status(state.child.kill_tree()?));
         }
         state.input.take();
         Ok(())
@@ -4001,11 +4905,10 @@ impl Drop for RuntimeChildInner {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
-        if state.status.is_none() {
-            let _ = state.child.kill();
-            if let Ok(status) = state.child.wait() {
-                state.status = Some(process_status(status));
-            }
+        if state.status.is_none()
+            && let Ok(status) = state.child.kill_tree()
+        {
+            state.status = Some(process_status(status));
         }
         state.input.take();
         let threads = [state.stdout_thread.take(), state.stderr_thread.take()];
@@ -4016,7 +4919,22 @@ impl Drop for RuntimeChildInner {
     }
 }
 
-fn start_process(command: RuntimeProcessCommand) -> io::Result<Value> {
+fn runtime_process_command(command: &RuntimeProcessCommand) -> SandboxedCommand {
+    let mut configured = SandboxedCommand::new(&command.program);
+    configured.args(&command.arguments);
+    if let Some(directory) = &command.directory {
+        configured.current_dir(directory);
+    }
+    if command.clear_environment {
+        configured.env_clear();
+    }
+    for (name, value) in &command.environment {
+        configured.env(name, value);
+    }
+    configured
+}
+
+fn start_process(command: RuntimeProcessCommand, permit: RuntimeHandlePermit) -> io::Result<Value> {
     if command.program.as_os_str().is_empty()
         || command
             .program
@@ -4062,24 +4980,12 @@ fn start_process(command: RuntimeProcessCommand) -> io::Result<Value> {
             "process working directory cannot contain NUL",
         ));
     }
+    let configured = runtime_process_command(&command);
     let initial_input = command.input;
-    let mut configured = StdCommand::new(command.program);
-    configured
-        .args(command.arguments)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(directory) = command.directory {
-        configured.current_dir(directory);
-    }
-    if command.clear_environment {
-        configured.env_clear();
-    }
-    configured.envs(command.environment);
-    let mut child = configured.spawn()?;
-    let input = child.stdin.take().expect("piped child input");
-    let stdout_reader = child.stdout.take().expect("piped child stdout");
-    let stderr_reader = child.stderr.take().expect("piped child stderr");
+    let mut child = configured.spawn_streaming(SandboxProfile::Runtime)?;
+    let input = child.take_stdin().expect("piped child input");
+    let stdout_reader = child.take_stdout().expect("piped child stdout");
+    let stderr_reader = child.take_stderr().expect("piped child stderr");
     let stdout = Arc::new(RuntimeChildPipe::default());
     let stderr = Arc::new(RuntimeChildPipe::default());
     let stdout_thread = stdout.clone();
@@ -4100,6 +5006,7 @@ fn start_process(command: RuntimeProcessCommand) -> io::Result<Value> {
             status: None,
             deadline,
         }),
+        _permit: permit,
     }));
     if !initial_input.is_empty() {
         process.write(&initial_input)?;
@@ -4108,10 +5015,10 @@ fn start_process(command: RuntimeProcessCommand) -> io::Result<Value> {
 }
 
 fn execute_process(command: RuntimeProcessCommand) -> io::Result<Value> {
-    const MAX_ARGUMENTS: usize = 4096;
-    const MAX_ARGUMENT_BYTES: usize = 1024 * 1024;
-    const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
-    const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
+    const MAX_ARGUMENTS: usize = limits::PROCESS_ARGUMENTS;
+    const MAX_ARGUMENT_BYTES: usize = limits::PROCESS_ARGUMENT_BYTES;
+    const MAX_INPUT_BYTES: usize = limits::PROCESS_STREAM_BYTES;
+    const MAX_CAPTURE_BYTES: usize = limits::PROCESS_STREAM_BYTES;
     if command.program.as_os_str().is_empty()
         || command
             .program
@@ -4172,23 +5079,11 @@ fn execute_process(command: RuntimeProcessCommand) -> io::Result<Value> {
             "process working directory cannot contain NUL",
         ));
     }
-    let mut child = StdCommand::new(command.program);
-    child
-        .args(command.arguments)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(directory) = command.directory {
-        child.current_dir(directory);
-    }
-    if command.clear_environment {
-        child.env_clear();
-    }
-    child.envs(command.environment);
-    let mut child = child.spawn()?;
-    let mut stdin = child.stdin.take().expect("piped child stdin");
-    let mut stdout = child.stdout.take().expect("piped child stdout");
-    let mut stderr = child.stderr.take().expect("piped child stderr");
+    let configured = runtime_process_command(&command);
+    let mut child = configured.spawn_streaming(SandboxProfile::Runtime)?;
+    let mut stdin = child.take_stdin().expect("piped child stdin");
+    let mut stdout = child.take_stdout().expect("piped child stdout");
+    let mut stderr = child.take_stderr().expect("piped child stderr");
     let started = StdInstant::now();
     thread::scope(|scope| -> io::Result<Value> {
         let input = command.input;
@@ -4217,8 +5112,7 @@ fn execute_process(command: RuntimeProcessCommand) -> io::Result<Value> {
                 .timeout
                 .is_some_and(|timeout| started.elapsed() >= timeout)
             {
-                let _ = child.kill();
-                let _ = child.wait();
+                let _ = child.kill_tree();
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "process exceeded its configured timeout",
@@ -4286,7 +5180,220 @@ enum RuntimeFault {
 type RuntimeResult<T> = Result<T, RuntimeFault>;
 // The recursive semantic oracle retains rich source and ownership values in each
 // frame. Keep enough stack for the documented 32-call safety limit on Windows.
-const INTERPRETER_STACK_BYTES: usize = 32 * 1024 * 1024;
+const INTERPRETER_STACK_BYTES: usize = limits::INTERPRETER_STACK_BYTES;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeLimits {
+    pub max_steps: u64,
+    pub max_output_bytes: u64,
+    pub max_call_depth: usize,
+    pub max_tasks: u64,
+    pub max_threads: u64,
+    pub max_process_starts: u64,
+    pub max_handles: u64,
+    pub max_memory_bytes: u64,
+    pub max_file_write_bytes: u64,
+}
+
+impl Default for RuntimeLimits {
+    fn default() -> Self {
+        Self {
+            max_steps: limits::DEFAULT_RUNTIME_STEPS,
+            max_output_bytes: limits::DEFAULT_RUNTIME_OUTPUT_BYTES as u64,
+            max_call_depth: limits::DEFAULT_RUNTIME_CALL_DEPTH,
+            max_tasks: limits::DEFAULT_RUNTIME_TASKS as u64,
+            max_threads: limits::DEFAULT_RUNTIME_THREADS as u64,
+            max_process_starts: limits::DEFAULT_RUNTIME_PROCESS_STARTS as u64,
+            max_handles: limits::DEFAULT_RUNTIME_HANDLES as u64,
+            max_memory_bytes: limits::DEFAULT_RUNTIME_MEMORY_BYTES as u64,
+            max_file_write_bytes: limits::DEFAULT_RUNTIME_FILE_WRITE_BYTES as u64,
+        }
+    }
+}
+
+impl RuntimeLimits {
+    pub fn from_environment() -> Result<Self, Diagnostic> {
+        fn value(name: &str, fallback: u64) -> Result<u64, Diagnostic> {
+            let Some(text) = std::env::var_os(name) else {
+                return Ok(fallback);
+            };
+            let text = text.to_str().ok_or_else(|| {
+                Diagnostic::new(
+                    DiagnosticKind::Runtime,
+                    format!("{name} must be valid UTF-8"),
+                    Span::point(1, 1),
+                )
+            })?;
+            let parsed = text.parse::<u64>().map_err(|_| {
+                Diagnostic::new(
+                    DiagnosticKind::Runtime,
+                    format!("{name} must be a positive decimal integer"),
+                    Span::point(1, 1),
+                )
+            })?;
+            if parsed == 0 {
+                return Err(Diagnostic::new(
+                    DiagnosticKind::Runtime,
+                    format!("{name} must be greater than zero"),
+                    Span::point(1, 1),
+                ));
+            }
+            Ok(parsed)
+        }
+
+        let defaults = Self::default();
+        let depth = value("DISP_MAX_CALL_DEPTH", defaults.max_call_depth as u64)?;
+        Ok(Self {
+            max_steps: value("DISP_MAX_STEPS", defaults.max_steps)?,
+            max_output_bytes: value("DISP_MAX_OUTPUT_BYTES", defaults.max_output_bytes)?,
+            max_call_depth: usize::try_from(depth).map_err(|_| {
+                Diagnostic::new(
+                    DiagnosticKind::Runtime,
+                    "DISP_MAX_CALL_DEPTH does not fit this platform",
+                    Span::point(1, 1),
+                )
+            })?,
+            max_tasks: value("DISP_MAX_TASKS", defaults.max_tasks)?,
+            max_threads: value("DISP_MAX_THREADS", defaults.max_threads)?,
+            max_process_starts: value("DISP_MAX_PROCESS_STARTS", defaults.max_process_starts)?,
+            max_handles: value("DISP_MAX_HANDLES", defaults.max_handles)?,
+            max_memory_bytes: value("DISP_MAX_MEMORY_BYTES", defaults.max_memory_bytes)?,
+            max_file_write_bytes: value(
+                "DISP_MAX_FILE_WRITE_BYTES",
+                defaults.max_file_write_bytes,
+            )?,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct RuntimeBudget {
+    limits: RuntimeLimits,
+    steps: AtomicU64,
+    output_bytes: AtomicU64,
+    live_tasks: AtomicU64,
+    live_threads: AtomicU64,
+    process_starts: AtomicU64,
+    live_handles: AtomicU64,
+    live_memory_bytes: AtomicU64,
+    live_object_bytes: AtomicU64,
+    memory_gate: StdMutex<()>,
+}
+
+impl RuntimeBudget {
+    fn new(limits: RuntimeLimits) -> Self {
+        Self {
+            limits,
+            steps: AtomicU64::new(0),
+            output_bytes: AtomicU64::new(0),
+            live_tasks: AtomicU64::new(0),
+            live_threads: AtomicU64::new(0),
+            process_starts: AtomicU64::new(0),
+            live_handles: AtomicU64::new(0),
+            live_memory_bytes: AtomicU64::new(0),
+            live_object_bytes: AtomicU64::new(0),
+            memory_gate: StdMutex::new(()),
+        }
+    }
+
+    fn reset(&self) {
+        self.steps.store(0, Ordering::Relaxed);
+        self.output_bytes.store(0, Ordering::Relaxed);
+        self.live_tasks.store(0, Ordering::Relaxed);
+        self.live_threads.store(0, Ordering::Relaxed);
+        self.process_starts.store(0, Ordering::Relaxed);
+        self.live_handles.store(0, Ordering::Relaxed);
+        self.live_memory_bytes.store(0, Ordering::Relaxed);
+        self.live_object_bytes.store(0, Ordering::Relaxed);
+    }
+
+    fn charge(counter: &AtomicU64, amount: u64, limit: u64) -> bool {
+        counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(amount).filter(|next| *next <= limit)
+            })
+            .is_ok()
+    }
+
+    fn charge_explicit_memory(&self, amount: u64) -> bool {
+        let _gate = self
+            .memory_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let explicit = self.live_memory_bytes.load(Ordering::Relaxed);
+        let objects = self.live_object_bytes.load(Ordering::Relaxed);
+        explicit
+            .checked_add(objects)
+            .and_then(|total| total.checked_add(amount))
+            .is_some_and(|total| total <= self.limits.max_memory_bytes)
+            && self
+                .live_memory_bytes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    current.checked_add(amount)
+                })
+                .is_ok()
+    }
+
+    fn release_explicit_memory(&self, amount: u64) {
+        let _gate = self
+            .memory_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.live_memory_bytes.fetch_sub(amount, Ordering::Relaxed);
+    }
+
+    fn reconcile_object_memory(&self, previous: u64, next: u64) -> bool {
+        let _gate = self
+            .memory_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if next > previous {
+            let growth = next - previous;
+            let explicit = self.live_memory_bytes.load(Ordering::Relaxed);
+            let objects = self.live_object_bytes.load(Ordering::Relaxed);
+            if explicit
+                .checked_add(objects)
+                .and_then(|total| total.checked_add(growth))
+                .is_none_or(|total| total > self.limits.max_memory_bytes)
+            {
+                return false;
+            }
+            self.live_object_bytes.fetch_add(growth, Ordering::Relaxed);
+        } else if previous > next {
+            self.live_object_bytes
+                .fetch_sub(previous - next, Ordering::Relaxed);
+        }
+        true
+    }
+
+    fn can_fit_additional_memory(&self, amount: u64) -> bool {
+        let _gate = self
+            .memory_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.live_memory_bytes
+            .load(Ordering::Relaxed)
+            .checked_add(self.live_object_bytes.load(Ordering::Relaxed))
+            .and_then(|total| total.checked_add(amount))
+            .is_some_and(|total| total <= self.limits.max_memory_bytes)
+    }
+}
+
+struct RuntimeThreadPermit(Arc<RuntimeBudget>);
+
+impl Drop for RuntimeThreadPermit {
+    fn drop(&mut self) {
+        self.0.live_threads.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct RuntimeHandlePermit(Arc<RuntimeBudget>);
+
+impl Drop for RuntimeHandlePermit {
+    fn drop(&mut self) {
+        self.0.live_handles.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 enum Flow {
     Normal,
@@ -4300,13 +5407,23 @@ pub struct Interpreter {
     scope_orders: Vec<Vec<String>>,
     output: Arc<StdMutex<Vec<String>>>,
     call_depth: usize,
-    tasks: Vec<Weak<StdMutex<RuntimeTaskWork>>>,
+    tasks: Vec<Weak<RuntimeTaskState>>,
     http_pool: InterpreterHttpPool,
     program_arguments: Vec<String>,
+    budget: Arc<RuntimeBudget>,
+    accounted_object_bytes: u64,
 }
 
 impl Interpreter {
     pub fn new() -> Self {
+        Self::with_limits(RuntimeLimits::default())
+    }
+
+    pub fn from_environment() -> Result<Self, Diagnostic> {
+        Ok(Self::with_limits(RuntimeLimits::from_environment()?))
+    }
+
+    pub fn with_limits(limits: RuntimeLimits) -> Self {
         Self {
             scopes: Vec::new(),
             scope_orders: Vec::new(),
@@ -4315,6 +5432,8 @@ impl Interpreter {
             tasks: Vec::new(),
             http_pool: HashMap::new(),
             program_arguments: Vec::new(),
+            budget: Arc::new(RuntimeBudget::new(limits)),
+            accounted_object_bytes: 0,
         }
     }
 
@@ -4365,6 +5484,8 @@ impl Interpreter {
         self.call_depth = 0;
         self.tasks.clear();
         self.http_pool.clear();
+        self.budget.reset();
+        self.accounted_object_bytes = 0;
         let main = program
             .functions
             .iter()
@@ -4428,7 +5549,6 @@ impl Interpreter {
         }
         // Keep the semantic oracle below the smallest supported test-thread stack.
         // Native DISP programs use the platform stack and are not capped here.
-        const MAX_CALL_DEPTH: usize = 32;
         if function.parameters.len() != arguments.len() {
             return Err(self.error(
                 format!(
@@ -4440,9 +5560,12 @@ impl Interpreter {
                 call_span,
             ));
         }
-        if self.call_depth >= MAX_CALL_DEPTH {
+        if self.call_depth >= self.budget.limits.max_call_depth {
             return Err(self.error(
-                format!("call depth exceeds the runtime limit of {MAX_CALL_DEPTH}"),
+                format!(
+                    "call depth exceeds the runtime limit of {}",
+                    self.budget.limits.max_call_depth
+                ),
                 call_span,
             ));
         }
@@ -4460,9 +5583,16 @@ impl Interpreter {
                 .unwrap()
                 .push(parameter.name.clone());
         }
+        if let Err(error) = self.reconcile_object_memory(call_span) {
+            self.pop_scope();
+            self.call_depth -= 1;
+            return Err(error);
+        }
         let flow = self.execute_block_contents(program, &function.body);
         self.pop_scope();
+        let memory = self.reconcile_object_memory(call_span);
         self.call_depth -= 1;
+        memory?;
         match flow {
             Err(RuntimeFault::Propagate(value)) => Ok(value),
             Err(error) => Err(error),
@@ -4505,24 +5635,49 @@ impl Interpreter {
                 thread::sleep(duration);
                 Ok(Value::Unit)
             }
-            FutureWork::ReadText(path) => Ok(runtime_result(
-                fs::read_to_string(path).map(|text| Value::String(RuntimeString::literal(text))),
-            )),
-            FutureWork::ReadBytes(path) => Ok(runtime_result(fs::read(path).map(|bytes| {
-                let values = bytes
-                    .into_iter()
-                    .map(|value| Value::Unsigned(value as u128, 8))
-                    .collect::<Vec<_>>();
-                Value::List {
-                    capacity: values.len(),
-                    values,
-                }
-            }))),
-            FutureWork::WriteText(path, text) => Ok(runtime_result(
-                fs::write(path, text.text).map(|()| Value::Unit),
-            )),
+            FutureWork::ReadText(path) => {
+                let _permit = self.acquire_handle(span)?;
+                Ok(runtime_result(
+                    fs::read_to_string(path)
+                        .map(|text| Value::String(RuntimeString::literal(text))),
+                ))
+            }
+            FutureWork::ReadBytes(path) => {
+                let _permit = self.acquire_handle(span)?;
+                Ok(runtime_result(fs::read(path).map(|bytes| {
+                    let values = bytes
+                        .into_iter()
+                        .map(|value| Value::Unsigned(value as u128, 8))
+                        .collect::<Vec<_>>();
+                    Value::List {
+                        capacity: values.len(),
+                        values,
+                    }
+                })))
+            }
+            FutureWork::WriteText(path, text) => {
+                let _permit = self.acquire_handle(span)?;
+                Ok(runtime_result(
+                    transactional_file_write(
+                        &path,
+                        text.text.as_bytes(),
+                        false,
+                        self.budget.limits.max_file_write_bytes,
+                    )
+                    .map(|()| Value::Unit),
+                ))
+            }
             FutureWork::WriteBytes(path, bytes) => {
-                Ok(runtime_result(fs::write(path, bytes).map(|()| Value::Unit)))
+                let _permit = self.acquire_handle(span)?;
+                Ok(runtime_result(
+                    transactional_file_write(
+                        &path,
+                        &bytes,
+                        false,
+                        self.budget.limits.max_file_write_bytes,
+                    )
+                    .map(|()| Value::Unit),
+                ))
             }
             FutureWork::Connect(address, timeout) => {
                 let connected = if let Some(timeout) = timeout {
@@ -4553,9 +5708,15 @@ impl Interpreter {
                 } else {
                     StdTcpStream::connect((address.host.as_str(), address.port))
                 };
-                Ok(runtime_result(connected.map(|stream| {
-                    Value::TcpStream(RuntimeTcpStream::new(stream))
-                })))
+                match connected {
+                    Ok(stream) => {
+                        let permit = self.acquire_handle(span)?;
+                        Ok(runtime_result(Ok(Value::TcpStream(RuntimeTcpStream::new(
+                            stream, permit,
+                        )))))
+                    }
+                    Err(error) => Ok(runtime_result(Err(error))),
+                }
             }
             FutureWork::Accept(listener, timeout) => {
                 let deadline = timeout.and_then(|duration| StdInstant::now().checked_add(duration));
@@ -4565,7 +5726,7 @@ impl Interpreter {
                             .0
                             .lock()
                             .map_err(|_| self.error("TCP listener state is poisoned", span))?;
-                        match guard.as_ref() {
+                        match guard.socket.as_ref() {
                             Some(listener) => listener.accept(),
                             None => Err(std::io::Error::new(
                                 std::io::ErrorKind::NotConnected,
@@ -4575,8 +5736,9 @@ impl Interpreter {
                     };
                     match accepted {
                         Ok((stream, _)) => {
+                            let permit = self.acquire_handle(span)?;
                             break Ok(runtime_result(Ok(Value::TcpStream(RuntimeTcpStream::new(
-                                stream,
+                                stream, permit,
                             )))));
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -4657,7 +5819,7 @@ impl Interpreter {
                     .0
                     .lock()
                     .map_err(|_| self.error("UDP socket state is poisoned", span))?;
-                let result = if let Some(socket) = guard.as_mut() {
+                let result = if let Some(socket) = guard.socket.as_mut() {
                     socket.set_read_timeout(timeout).and_then(|()| {
                         let mut bytes = vec![0; limit.saturating_add(1)];
                         let result = socket.recv_from(&mut bytes).and_then(|(count, source)| {
@@ -4692,12 +5854,12 @@ impl Interpreter {
                     .0
                     .lock()
                     .map_err(|_| self.error("UDP socket state is poisoned", span))?;
-                let result = if bytes.len() > 65_507 {
+                let result = if bytes.len() > limits::UDP_PAYLOAD_BYTES {
                     Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         "UDP datagram exceeds the 65507-byte payload limit",
                     ))
-                } else if let Some(socket) = guard.as_mut() {
+                } else if let Some(socket) = guard.socket.as_mut() {
                     socket.set_write_timeout(timeout).and_then(|()| {
                         let result = socket
                             .send_to(&bytes, (address.host.as_str(), address.port))
@@ -4752,12 +5914,12 @@ impl Interpreter {
                         "TLS handshake timed out",
                     ))));
                 }
-                let socket = {
+                let (socket, permit) = {
                     let mut state = stream
                         .0
                         .lock()
                         .map_err(|_| self.error("TCP stream state is poisoned", span))?;
-                    state.socket.take()
+                    (state.socket.take(), state.permit.take())
                 };
                 let Some(socket) = socket else {
                     return Ok(runtime_result(Err(std::io::Error::new(
@@ -4765,6 +5927,7 @@ impl Interpreter {
                         "TCP stream is closed",
                     ))));
                 };
+                let permit = permit.expect("an open TCP stream owns a handle permit");
                 let result = (|| {
                     socket.set_nonblocking(false)?;
                     socket.set_read_timeout(timeout)?;
@@ -4776,7 +5939,10 @@ impl Interpreter {
                     secure.get_ref().set_read_timeout(None)?;
                     secure.get_ref().set_write_timeout(None)?;
                     Ok(Value::TlsStream(RuntimeTlsStream(Arc::new(StdMutex::new(
-                        Some(secure),
+                        RuntimeTlsStreamState {
+                            socket: Some(secure),
+                            permit: Some(permit),
+                        },
                     )))))
                 })();
                 Ok(runtime_result(result))
@@ -4786,7 +5952,7 @@ impl Interpreter {
                     .0
                     .lock()
                     .map_err(|_| self.error("TLS stream state is poisoned", span))?;
-                let result = if let Some(stream) = guard.as_mut() {
+                let result = if let Some(stream) = guard.socket.as_mut() {
                     stream.get_ref().set_read_timeout(timeout).and_then(|()| {
                         let mut bytes = vec![0; limit];
                         let result = stream.read(&mut bytes).map(|count| {
@@ -4809,7 +5975,7 @@ impl Interpreter {
                     .0
                     .lock()
                     .map_err(|_| self.error("TLS stream state is poisoned", span))?;
-                let result = if let Some(stream) = guard.as_mut() {
+                let result = if let Some(stream) = guard.socket.as_mut() {
                     stream.get_ref().set_write_timeout(timeout).and_then(|()| {
                         let result = stream
                             .write_all(&bytes)
@@ -4825,9 +5991,14 @@ impl Interpreter {
                 };
                 Ok(runtime_result(result))
             }
-            FutureWork::HttpRequest(request, timeout) => Ok(runtime_result(
-                interpreter_http_request(request, timeout, &mut self.http_pool),
-            )),
+            FutureWork::HttpRequest(request, timeout) => {
+                let _permit = self.acquire_handle(span)?;
+                Ok(runtime_result(interpreter_http_request(
+                    request,
+                    timeout,
+                    &mut self.http_pool,
+                )))
+            }
         }
     }
 
@@ -4840,6 +6011,7 @@ impl Interpreter {
             };
             let work = {
                 let mut work = state
+                    .work
                     .lock()
                     .map_err(|_| self.error("task state is poisoned", span))?;
                 match &*work {
@@ -4857,12 +6029,13 @@ impl Interpreter {
             match self.await_future(program, future, span) {
                 Ok(value) => {
                     *state
+                        .work
                         .lock()
                         .map_err(|_| self.error("task state is poisoned", span))? =
                         RuntimeTaskWork::Ready(value);
                 }
                 Err(error) => {
-                    if let Ok(mut work) = state.lock() {
+                    if let Ok(mut work) = state.work.lock() {
                         *work = RuntimeTaskWork::Consumed;
                     }
                     return Err(error);
@@ -4889,10 +6062,12 @@ impl Interpreter {
                 call_span,
             ));
         }
-        const MAX_CALL_DEPTH: usize = 32;
-        if self.call_depth >= MAX_CALL_DEPTH {
+        if self.call_depth >= self.budget.limits.max_call_depth {
             return Err(self.error(
-                format!("call depth exceeds the runtime limit of {MAX_CALL_DEPTH}"),
+                format!(
+                    "call depth exceeds the runtime limit of {}",
+                    self.budget.limits.max_call_depth
+                ),
                 call_span,
             ));
         }
@@ -4916,6 +6091,13 @@ impl Interpreter {
                 .unwrap()
                 .push(parameter.name.clone());
         }
+        if let Err(error) = self.reconcile_object_memory(call_span) {
+            self.pop_scope();
+            self.scopes.pop();
+            self.scope_orders.pop();
+            self.call_depth -= 1;
+            return Err(error);
+        }
         let flow = match &closure.body {
             crate::ast::ClosureBody::Expression(value) => {
                 self.evaluate(program, value).map(Flow::Return)
@@ -4929,7 +6111,9 @@ impl Interpreter {
             .captures
             .lock()
             .map_err(|_| self.error("closure capture state is poisoned", call_span))? = captures;
+        let memory = self.reconcile_object_memory(call_span);
         self.call_depth -= 1;
+        memory?;
         let value = match flow {
             Err(RuntimeFault::Propagate(value)) => value,
             Err(error) => return Err(error),
@@ -5006,12 +6190,120 @@ impl Interpreter {
         self.push_scope(HashMap::new());
         let result = self.execute_block_contents(program, block);
         self.pop_scope();
+        self.reconcile_object_memory(block.span)?;
         result
+    }
+
+    fn charge_steps(&self, amount: u64, span: Span) -> RuntimeResult<()> {
+        if RuntimeBudget::charge(&self.budget.steps, amount, self.budget.limits.max_steps) {
+            Ok(())
+        } else {
+            Err(self.error("runtime resource limit exceeded: execution steps", span))
+        }
+    }
+
+    fn charge_output(&self, amount: u64, span: Span) -> RuntimeResult<()> {
+        if RuntimeBudget::charge(
+            &self.budget.output_bytes,
+            amount,
+            self.budget.limits.max_output_bytes,
+        ) {
+            Ok(())
+        } else {
+            Err(self.error(
+                "runtime resource limit exceeded: printed output bytes",
+                span,
+            ))
+        }
+    }
+
+    fn charge_process_start(&self, span: Span) -> RuntimeResult<()> {
+        if RuntimeBudget::charge(
+            &self.budget.process_starts,
+            1,
+            self.budget.limits.max_process_starts,
+        ) {
+            Ok(())
+        } else {
+            Err(self.error(
+                "runtime resource limit exceeded: child-process launch attempts",
+                span,
+            ))
+        }
+    }
+
+    fn acquire_handle(&self, span: Span) -> RuntimeResult<RuntimeHandlePermit> {
+        if RuntimeBudget::charge(&self.budget.live_handles, 1, self.budget.limits.max_handles) {
+            Ok(RuntimeHandlePermit(Arc::clone(&self.budget)))
+        } else {
+            Err(self.error(
+                "runtime resource limit exceeded: live resource handles",
+                span,
+            ))
+        }
+    }
+
+    fn reconcile_object_memory(&mut self, span: Span) -> RuntimeResult<()> {
+        let mut seen = HashSet::new();
+        let mut next = 0u64;
+        for scope in &self.scopes {
+            heap_sum(&mut next, map_storage(scope));
+            for (name, value) in scope {
+                heap_sum(&mut next, string_heap(name));
+                heap_sum(&mut next, value.heap_bytes(&mut seen));
+            }
+        }
+        if !self
+            .budget
+            .reconcile_object_memory(self.accounted_object_bytes, next)
+        {
+            return Err(self.error(
+                "runtime resource limit exceeded: managed memory bytes",
+                span,
+            ));
+        }
+        self.accounted_object_bytes = next;
+        Ok(())
+    }
+
+    fn validate_collection_capacity(
+        &self,
+        capacity: usize,
+        slots_per_item: usize,
+        span: Span,
+    ) -> RuntimeResult<()> {
+        let bytes = capacity
+            .checked_mul(slots_per_item)
+            .and_then(|slots| slots.checked_mul(std::mem::size_of::<Value>()))
+            .and_then(|bytes| u64::try_from(bytes).ok());
+        if bytes.is_none_or(|bytes| !self.budget.can_fit_additional_memory(bytes)) {
+            Err(self.error(
+                "runtime resource limit exceeded: managed memory bytes",
+                span,
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn validate_string_capacity(&self, capacity: usize, span: Span) -> RuntimeResult<()> {
+        if !self
+            .budget
+            .can_fit_additional_memory(u64::try_from(capacity).unwrap_or(u64::MAX))
+        {
+            Err(self.error(
+                "runtime resource limit exceeded: managed memory bytes",
+                span,
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     fn execute_block_contents(&mut self, program: &Program, block: &Block) -> RuntimeResult<Flow> {
         for statement in &block.statements {
             let flow = self.execute_statement(program, &statement.node, statement.span)?;
+            self.reconcile_object_memory(statement.span)?;
             if !matches!(flow, Flow::Normal) {
                 return Ok(flow);
             }
@@ -5025,6 +6317,7 @@ impl Interpreter {
         statement: &Statement,
         span: Span,
     ) -> RuntimeResult<Flow> {
+        self.charge_steps(1, span)?;
         match statement {
             Statement::Binding {
                 name,
@@ -5190,6 +6483,7 @@ impl Interpreter {
                 } else {
                     current < end
                 } {
+                    self.charge_steps(1, span)?;
                     self.push_scope(HashMap::from([(name.clone(), Value::Int(current))]));
                     let flow = self.execute_block_contents(program, body);
                     self.pop_scope();
@@ -5227,6 +6521,7 @@ impl Interpreter {
                     }
                 };
                 for value in values {
+                    self.charge_steps(1, span)?;
                     self.push_scope(HashMap::from([(name.clone(), value)]));
                     let flow = self.execute_block_contents(program, body);
                     self.pop_scope();
@@ -5240,6 +6535,7 @@ impl Interpreter {
             }
             Statement::Loop(body) => {
                 loop {
+                    self.charge_steps(1, span)?;
                     match self.execute_block(program, body)? {
                         Flow::Normal | Flow::Continue => {}
                         Flow::Break => break,
@@ -5248,7 +6544,7 @@ impl Interpreter {
                 }
                 Ok(Flow::Normal)
             }
-            Statement::Unsafe(body) => self.execute_block(program, body),
+            Statement::Unsafe { body, .. } => self.execute_block(program, body),
             Statement::Break => Ok(Flow::Break),
             Statement::Continue => Ok(Flow::Continue),
         }
@@ -5709,7 +7005,7 @@ impl Interpreter {
                     Value::UInt(value) => value,
                     _ => return Err(io::Error::other("DISP Data limit is outside uint range")),
                 };
-                if amount > 100_000 {
+                if amount > limits::DATABASE_ROWS as u64 {
                     return Err(io::Error::other("DISP Data limit exceeds 100000 rows"));
                 }
                 sql.push_str(&format!(" LIMIT {amount}"));
@@ -5793,6 +7089,7 @@ impl Interpreter {
     }
 
     fn evaluate(&mut self, program: &Program, expression: &Expr) -> RuntimeResult<Value> {
+        self.charge_steps(1, expression.span)?;
         match &expression.node {
             Expression::Integer(value) => {
                 if *value <= i64::MAX as u128 {
@@ -5809,6 +7106,7 @@ impl Interpreter {
                 .collect::<Result<Vec<_>, _>>()
                 .map(Value::Array),
             Expression::DataStore { path } => {
+                let permit = self.acquire_handle(expression.span)?;
                 let result = if let Some(path) = path {
                     let Value::Path(path) = self.evaluate(program, path)? else {
                         unreachable!("type checking validates data store paths")
@@ -5820,9 +7118,9 @@ impl Interpreter {
                         )
                     });
                     path.map(PathBuf::from)
-                        .and_then(RuntimeDatabase::native_open)
+                        .and_then(|path| RuntimeDatabase::native_open(path, permit))
                 } else {
-                    RuntimeDatabase::native_memory()
+                    RuntimeDatabase::native_memory(permit)
                 };
                 Ok(runtime_result(result.map(Value::Database)))
             }
@@ -6155,6 +7453,34 @@ impl Interpreter {
                     )));
                 }
                 if let Expression::FieldAccess { object, field, .. } = &callee.node
+                    && matches!(&object.node, Expression::Identifier(name) if name == "Channel")
+                    && field == "bounded"
+                {
+                    let capacity = self.index_value(program, &arguments[0])?;
+                    if capacity != 0 {
+                        self.validate_collection_capacity(capacity, 1, expression.span)?;
+                    }
+                    if capacity == 0 {
+                        return Ok(runtime_result(Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "Channel capacity must be greater than zero",
+                        ))));
+                    }
+                    let permit = self.acquire_handle(expression.span)?;
+                    return Ok(match RuntimeChannel::bounded(capacity, permit) {
+                        Ok(channel) => Value::Enum {
+                            type_name: "Result".into(),
+                            variant: "Ok".into(),
+                            payload: vec![Value::Channel(channel)],
+                        },
+                        Err(message) => Value::Enum {
+                            type_name: "Result".into(),
+                            variant: "Err".into(),
+                            payload: vec![Value::String(RuntimeString::literal(message.into()))],
+                        },
+                    });
+                }
+                if let Expression::FieldAccess { object, field, .. } = &callee.node
                     && matches!(&object.node, Expression::Identifier(name) if name == "TcpListener")
                     && field == "bind"
                 {
@@ -6164,14 +7490,21 @@ impl Interpreter {
                             self.error("TcpListener.bind expects SocketAddress", arguments[0].span)
                         );
                     };
-                    let bound = StdTcpListener::bind((address.host.as_str(), address.port))
+                    let listener = match StdTcpListener::bind((address.host.as_str(), address.port))
                         .and_then(|listener| {
                             listener.set_nonblocking(true)?;
-                            Ok(Value::TcpListener(RuntimeTcpListener(Arc::new(
-                                StdMutex::new(Some(listener)),
-                            ))))
-                        });
-                    return Ok(runtime_result(bound));
+                            Ok(listener)
+                        }) {
+                        Ok(listener) => listener,
+                        Err(error) => return Ok(runtime_result(Err(error))),
+                    };
+                    let permit = self.acquire_handle(expression.span)?;
+                    return Ok(runtime_result(Ok(Value::TcpListener(RuntimeTcpListener(
+                        Arc::new(StdMutex::new(RuntimeTcpListenerState {
+                            socket: Some(listener),
+                            permit: Some(permit),
+                        })),
+                    )))));
                 }
                 if let Expression::FieldAccess { object, field, .. } = &callee.node
                     && matches!(&object.node, Expression::Identifier(name) if name == "UdpSocket")
@@ -6183,13 +7516,17 @@ impl Interpreter {
                             self.error("UdpSocket.bind expects SocketAddress", arguments[0].span)
                         );
                     };
-                    let bound =
-                        StdUdpSocket::bind((address.host.as_str(), address.port)).map(|socket| {
-                            Value::UdpSocket(RuntimeUdpSocket(Arc::new(StdMutex::new(Some(
-                                socket,
-                            )))))
-                        });
-                    return Ok(runtime_result(bound));
+                    let socket = match StdUdpSocket::bind((address.host.as_str(), address.port)) {
+                        Ok(socket) => socket,
+                        Err(error) => return Ok(runtime_result(Err(error))),
+                    };
+                    let permit = self.acquire_handle(expression.span)?;
+                    return Ok(runtime_result(Ok(Value::UdpSocket(RuntimeUdpSocket(
+                        Arc::new(StdMutex::new(RuntimeUdpSocketState {
+                            socket: Some(socket),
+                            permit: Some(permit),
+                        })),
+                    )))));
                 }
                 if matches!(&callee.node, Expression::Identifier(name) if name == "String") {
                     return Ok(Value::String(RuntimeString::with_capacity(0)));
@@ -6571,17 +7908,8 @@ impl Interpreter {
                     return match field.as_str() {
                         "new" => Ok(Value::String(RuntimeString::with_capacity(0))),
                         "with_capacity" => {
-                            let value = self.evaluate(program, &arguments[0])?;
-                            let capacity = match value {
-                                Value::Int(x) if x >= 0 => x as usize,
-                                Value::UInt(x) => x as usize,
-                                _ => {
-                                    return Err(self.error(
-                                        "capacity must be a non-negative integer",
-                                        arguments[0].span,
-                                    ));
-                                }
-                            };
+                            let capacity = self.index_value(program, &arguments[0])?;
+                            self.validate_string_capacity(capacity, arguments[0].span)?;
                             Ok(Value::String(RuntimeString::with_capacity(capacity)))
                         }
                         _ => Err(self.error("unknown String constructor", expression.span)),
@@ -6616,23 +7944,52 @@ impl Interpreter {
                 {
                     let size = self.index_value(program, &arguments[0])?;
                     let alignment = self.index_value(program, &arguments[1])?;
-                    return Ok(match RuntimeMemory::new(size, alignment) {
-                        Ok(memory) => Value::Enum {
-                            type_name: "Result".into(),
-                            variant: "Ok".into(),
-                            payload: vec![Value::Memory(memory)],
-                        },
-                        Err(message) => Value::Enum {
+                    if let Err(message) = RuntimeMemory::validate(size, alignment) {
+                        return Ok(Value::Enum {
                             type_name: "Result".into(),
                             variant: "Err".into(),
                             payload: vec![Value::String(RuntimeString::literal(message.into()))],
+                        });
+                    }
+                    let reserved = u64::try_from(size).map_err(|_| {
+                        self.error(
+                            "runtime resource limit exceeded: managed memory bytes",
+                            arguments[0].span,
+                        )
+                    })?;
+                    if !self.budget.charge_explicit_memory(reserved) {
+                        return Err(self.error(
+                            "runtime resource limit exceeded: managed memory bytes",
+                            arguments[0].span,
+                        ));
+                    }
+                    return Ok(
+                        match RuntimeMemory::new(size, alignment, Arc::clone(&self.budget)) {
+                            Ok(memory) => Value::Enum {
+                                type_name: "Result".into(),
+                                variant: "Ok".into(),
+                                payload: vec![Value::Memory(memory)],
+                            },
+                            Err(message) => {
+                                if message != "Memory allocation failed" {
+                                    self.budget.release_explicit_memory(reserved);
+                                }
+                                Value::Enum {
+                                    type_name: "Result".into(),
+                                    variant: "Err".into(),
+                                    payload: vec![Value::String(RuntimeString::literal(
+                                        message.into(),
+                                    ))],
+                                }
+                            }
                         },
-                    });
+                    );
                 }
                 if let Expression::FieldAccess { object, field, .. } = &callee.node
                     && matches!(&object.node, Expression::Identifier(name) if name == "List")
                 {
                     if field == "of" {
+                        self.validate_collection_capacity(arguments.len(), 1, expression.span)?;
                         let mut values = Vec::with_capacity(arguments.len());
                         for argument in arguments {
                             values.push(self.consume(program, argument)?);
@@ -6647,6 +8004,7 @@ impl Interpreter {
                     } else {
                         0
                     };
+                    self.validate_collection_capacity(capacity, 1, expression.span)?;
                     return Ok(Value::List {
                         values: Vec::new(),
                         capacity,
@@ -6656,6 +8014,7 @@ impl Interpreter {
                     && matches!(&object.node, Expression::Identifier(name) if name == "Map")
                 {
                     if field == "of" {
+                        self.validate_collection_capacity(arguments.len() / 2, 2, expression.span)?;
                         let mut entries = Vec::with_capacity(arguments.len() / 2);
                         for pair in arguments.chunks_exact(2) {
                             let key = self.consume(program, &pair[0])?;
@@ -6678,6 +8037,7 @@ impl Interpreter {
                     } else {
                         0
                     };
+                    self.validate_collection_capacity(capacity, 2, expression.span)?;
                     return Ok(Value::Map {
                         entries: Vec::new(),
                         capacity,
@@ -6687,6 +8047,7 @@ impl Interpreter {
                     && matches!(&object.node, Expression::Identifier(name) if name == "Set")
                 {
                     if field == "of" {
+                        self.validate_collection_capacity(arguments.len(), 1, expression.span)?;
                         let mut values = Vec::with_capacity(arguments.len());
                         for argument in arguments {
                             let value = self.consume(program, argument)?;
@@ -6704,6 +8065,7 @@ impl Interpreter {
                     } else {
                         0
                     };
+                    self.validate_collection_capacity(capacity, 1, expression.span)?;
                     return Ok(Value::Set {
                         values: Vec::new(),
                         capacity,
@@ -6721,7 +8083,17 @@ impl Interpreter {
                                     self.error("Async.spawn requires a Future", arguments[0].span)
                                 );
                             };
-                            let task = RuntimeTask::new(future);
+                            if !RuntimeBudget::charge(
+                                &self.budget.live_tasks,
+                                1,
+                                self.budget.limits.max_tasks,
+                            ) {
+                                return Err(self.error(
+                                    "runtime resource limit exceeded: live tasks",
+                                    expression.span,
+                                ));
+                            }
+                            let task = RuntimeTask::new(future, Arc::clone(&self.budget));
                             self.tasks.push(Arc::downgrade(&task.0));
                             Ok(Value::Task(task))
                         }
@@ -6846,8 +8218,619 @@ impl Interpreter {
                             | "Process"
                             | "Database"
                             | "DataStore"
+                            | "Crypto"
                     )
                 {
+                    if owner == "Crypto" {
+                        return match field.as_str() {
+                            "random_bytes" | "random_secret" => {
+                                let secret_result = field == "random_secret";
+                                let length = self.evaluate(program, &arguments[0])?;
+                                let length = match length {
+                                    Value::Int(value) if value >= 0 => usize::try_from(value).ok(),
+                                    Value::UInt(value) => usize::try_from(value).ok(),
+                                    Value::Signed(value, _) if value >= 0 => {
+                                        usize::try_from(value).ok()
+                                    }
+                                    Value::Unsigned(value, _) => usize::try_from(value).ok(),
+                                    _ => None,
+                                };
+                                let result = length
+                                    .ok_or_else(|| {
+                                        "secure-random byte length must be a non-negative platform-sized integer".to_owned()
+                                    })
+                                    .and_then(|length| {
+                                        if !(1..=crate::crypto::MAX_RANDOM_BYTES).contains(&length) {
+                                            return Err(format!(
+                                                "secure-random {} length must be between 1 and 1048576",
+                                                if secret_result { "secret" } else { "byte" }
+                                            ));
+                                        }
+                                        crate::crypto::SecretBytes::random(length)
+                                            .map_err(|error| error.to_string())
+                                    });
+                                Ok(match result {
+                                    Ok(secret) if secret_result => Value::Enum {
+                                        type_name: "Result".into(),
+                                        variant: "Ok".into(),
+                                        payload: vec![Value::SecretBytes(RuntimeSecret(Arc::new(
+                                            secret,
+                                        )))],
+                                    },
+                                    Ok(secret) => Value::Enum {
+                                        type_name: "Result".into(),
+                                        variant: "Ok".into(),
+                                        payload: vec![Value::List {
+                                            capacity: secret.len(),
+                                            values: secret
+                                                .expose_secret()
+                                                .iter()
+                                                .map(|byte| Value::Unsigned((*byte).into(), 8))
+                                                .collect(),
+                                        }],
+                                    },
+                                    Err(error) => Value::Enum {
+                                        type_name: "Result".into(),
+                                        variant: "Err".into(),
+                                        payload: vec![Value::String(RuntimeString::literal(error))],
+                                    },
+                                })
+                            }
+                            "import_secret" => {
+                                let bytes =
+                                    runtime_list_bytes(self.consume(program, &arguments[0])?)
+                                        .expect("type checking validates secret imports");
+                                Ok(match crate::crypto::SecretBytes::from_vec(bytes) {
+                                    Ok(secret) => Value::Enum {
+                                        type_name: "Result".into(),
+                                        variant: "Ok".into(),
+                                        payload: vec![Value::SecretBytes(RuntimeSecret(Arc::new(
+                                            secret,
+                                        )))],
+                                    },
+                                    Err(error) => Value::Enum {
+                                        type_name: "Result".into(),
+                                        variant: "Err".into(),
+                                        payload: vec![Value::String(RuntimeString::literal(
+                                            error.to_string(),
+                                        ))],
+                                    },
+                                })
+                            }
+                            "sha256" | "hmac_sha256" | "hmac_sha256_verify" => {
+                                let (key, message_index) = if field == "sha256" {
+                                    (None, 0)
+                                } else {
+                                    let Value::SecretBytes(key) =
+                                        self.evaluate(program, &arguments[0])?
+                                    else {
+                                        unreachable!("type checking validates HMAC key")
+                                    };
+                                    (Some(key), 1)
+                                };
+                                let message = runtime_list_bytes(
+                                    self.evaluate(program, &arguments[message_index])?,
+                                )
+                                .expect("type checking validates cryptographic byte messages");
+                                let result = if message.len()
+                                    > crate::crypto::MAX_CRYPTO_MESSAGE_BYTES
+                                {
+                                    Err(format!(
+                                        "{} message requested {} bytes but the maximum is {}",
+                                        if field == "sha256" {
+                                            "SHA-256"
+                                        } else {
+                                            "HMAC-SHA-256"
+                                        },
+                                        message.len(),
+                                        crate::crypto::MAX_CRYPTO_MESSAGE_BYTES
+                                    ))
+                                } else {
+                                    match field.as_str() {
+                                        "sha256" => Ok(runtime_bytes(
+                                            crate::crypto::sha256(&message).to_vec(),
+                                        )),
+                                        "hmac_sha256" => crate::crypto::hmac_sha256(
+                                            &key.as_ref().unwrap().0,
+                                            &message,
+                                        )
+                                        .map(|digest| runtime_bytes(digest.to_vec()))
+                                        .map_err(|error| error.to_string()),
+                                        "hmac_sha256_verify" => {
+                                            let expected = runtime_list_bytes(
+                                                self.evaluate(program, &arguments[2])?,
+                                            )
+                                            .expect("type checking validates HMAC authenticators");
+                                            crate::crypto::hmac_sha256_verify(
+                                                &key.as_ref().unwrap().0,
+                                                &message,
+                                                &expected,
+                                            )
+                                            .map(Value::Bool)
+                                            .map_err(|error| error.to_string())
+                                        }
+                                        _ => unreachable!(),
+                                    }
+                                };
+                                Ok(match result {
+                                    Ok(value) => Value::Enum {
+                                        type_name: "Result".into(),
+                                        variant: "Ok".into(),
+                                        payload: vec![value],
+                                    },
+                                    Err(error) => Value::Enum {
+                                        type_name: "Result".into(),
+                                        variant: "Err".into(),
+                                        payload: vec![Value::String(RuntimeString::literal(error))],
+                                    },
+                                })
+                            }
+                            "hkdf_sha256" => {
+                                let salt =
+                                    runtime_list_bytes(self.evaluate(program, &arguments[0])?)
+                                        .expect("type checking validates HKDF salt");
+                                let Value::SecretBytes(input) =
+                                    self.evaluate(program, &arguments[1])?
+                                else {
+                                    unreachable!("type checking validates HKDF input key material")
+                                };
+                                let info =
+                                    runtime_list_bytes(self.evaluate(program, &arguments[2])?)
+                                        .expect("type checking validates HKDF info");
+                                let output_length = runtime_nonnegative_usize(
+                                    self.evaluate(program, &arguments[3])?,
+                                );
+                                let result = if salt.len() > crate::crypto::MAX_HKDF_CONTEXT_BYTES {
+                                    Err(format!(
+                                        "HKDF-SHA-256 salt requested {} bytes but the maximum is {}",
+                                        salt.len(),
+                                        crate::crypto::MAX_HKDF_CONTEXT_BYTES
+                                    ))
+                                } else if info.len() > crate::crypto::MAX_HKDF_CONTEXT_BYTES {
+                                    Err(format!(
+                                        "HKDF-SHA-256 info requested {} bytes but the maximum is {}",
+                                        info.len(),
+                                        crate::crypto::MAX_HKDF_CONTEXT_BYTES
+                                    ))
+                                } else if let Some(output_length) = output_length {
+                                    crate::crypto::hkdf_sha256(
+                                        Some(&salt),
+                                        &input.0,
+                                        &info,
+                                        output_length,
+                                    )
+                                    .map_err(|error| error.to_string())
+                                } else {
+                                    Err("HKDF-SHA-256 output length must be a non-negative platform-sized integer".to_owned())
+                                };
+                                Ok(match result {
+                                    Ok(secret) => Value::Enum {
+                                        type_name: "Result".into(),
+                                        variant: "Ok".into(),
+                                        payload: vec![Value::SecretBytes(RuntimeSecret(Arc::new(
+                                            secret,
+                                        )))],
+                                    },
+                                    Err(error) => Value::Enum {
+                                        type_name: "Result".into(),
+                                        variant: "Err".into(),
+                                        payload: vec![Value::String(RuntimeString::literal(error))],
+                                    },
+                                })
+                            }
+                            "aes256_gcm_siv_seal" => {
+                                let Value::SecretBytes(key) =
+                                    self.evaluate(program, &arguments[0])?
+                                else {
+                                    unreachable!("type checking validates AEAD keys")
+                                };
+                                let Value::SecretBytes(plaintext) =
+                                    self.evaluate(program, &arguments[1])?
+                                else {
+                                    unreachable!("type checking validates AEAD plaintext")
+                                };
+                                let associated_data =
+                                    runtime_list_bytes(self.evaluate(program, &arguments[2])?)
+                                        .expect("type checking validates AEAD associated data");
+                                Ok(
+                                    match crate::crypto::aes256_gcm_siv_seal(
+                                        &key.0,
+                                        &plaintext.0,
+                                        &associated_data,
+                                    ) {
+                                        Ok(envelope) => Value::Enum {
+                                            type_name: "Result".into(),
+                                            variant: "Ok".into(),
+                                            payload: vec![Value::AeadEnvelope(
+                                                RuntimeAeadEnvelope(Arc::new(envelope)),
+                                            )],
+                                        },
+                                        Err(error) => Value::Enum {
+                                            type_name: "Result".into(),
+                                            variant: "Err".into(),
+                                            payload: vec![Value::String(RuntimeString::literal(
+                                                error.to_string(),
+                                            ))],
+                                        },
+                                    },
+                                )
+                            }
+                            "aes256_gcm_siv_open" => {
+                                let Value::SecretBytes(key) =
+                                    self.evaluate(program, &arguments[0])?
+                                else {
+                                    unreachable!("type checking validates AEAD keys")
+                                };
+                                let Value::AeadEnvelope(envelope) =
+                                    self.evaluate(program, &arguments[1])?
+                                else {
+                                    unreachable!("type checking validates AEAD envelopes")
+                                };
+                                let associated_data =
+                                    runtime_list_bytes(self.evaluate(program, &arguments[2])?)
+                                        .expect("type checking validates AEAD associated data");
+                                Ok(
+                                    match crate::crypto::aes256_gcm_siv_open(
+                                        &key.0,
+                                        &envelope.0,
+                                        &associated_data,
+                                    ) {
+                                        Ok(plaintext) => Value::Enum {
+                                            type_name: "Result".into(),
+                                            variant: "Ok".into(),
+                                            payload: vec![Value::SecretBytes(RuntimeSecret(
+                                                Arc::new(plaintext),
+                                            ))],
+                                        },
+                                        Err(error) => Value::Enum {
+                                            type_name: "Result".into(),
+                                            variant: "Err".into(),
+                                            payload: vec![Value::String(RuntimeString::literal(
+                                                error.to_string(),
+                                            ))],
+                                        },
+                                    },
+                                )
+                            }
+                            "encode_aead_envelope" => {
+                                let Value::AeadEnvelope(envelope) =
+                                    self.evaluate(program, &arguments[0])?
+                                else {
+                                    unreachable!("type checking validates AEAD envelopes")
+                                };
+                                Ok(Value::Enum {
+                                    type_name: "Result".into(),
+                                    variant: "Ok".into(),
+                                    payload: vec![runtime_bytes(envelope.0.encode())],
+                                })
+                            }
+                            "decode_aead_envelope" => {
+                                let encoded =
+                                    runtime_list_bytes(self.evaluate(program, &arguments[0])?)
+                                        .expect("type checking validates encoded AEAD envelopes");
+                                Ok(match crate::crypto::AeadEnvelope::decode(&encoded) {
+                                    Ok(envelope) => Value::Enum {
+                                        type_name: "Result".into(),
+                                        variant: "Ok".into(),
+                                        payload: vec![Value::AeadEnvelope(RuntimeAeadEnvelope(
+                                            Arc::new(envelope),
+                                        ))],
+                                    },
+                                    Err(error) => Value::Enum {
+                                        type_name: "Result".into(),
+                                        variant: "Err".into(),
+                                        payload: vec![Value::String(RuntimeString::literal(
+                                            error.to_string(),
+                                        ))],
+                                    },
+                                })
+                            }
+                            "ed25519_generate" => {
+                                Ok(match crate::crypto::Ed25519SigningKey::generate() {
+                                    Ok(key) => Value::Enum {
+                                        type_name: "Result".into(),
+                                        variant: "Ok".into(),
+                                        payload: vec![Value::Ed25519SigningKey(
+                                            RuntimeEd25519SigningKey(Arc::new(key)),
+                                        )],
+                                    },
+                                    Err(error) => Value::Enum {
+                                        type_name: "Result".into(),
+                                        variant: "Err".into(),
+                                        payload: vec![Value::String(RuntimeString::literal(
+                                            error.to_string(),
+                                        ))],
+                                    },
+                                })
+                            }
+                            "ed25519_public_key" => {
+                                let Value::Ed25519SigningKey(key) =
+                                    self.evaluate(program, &arguments[0])?
+                                else {
+                                    unreachable!("type checking validates Ed25519 signing keys")
+                                };
+                                Ok(Value::Enum {
+                                    type_name: "Result".into(),
+                                    variant: "Ok".into(),
+                                    payload: vec![runtime_bytes(key.0.public_key().to_vec())],
+                                })
+                            }
+                            "ed25519_sign" => {
+                                let Value::Ed25519SigningKey(key) =
+                                    self.evaluate(program, &arguments[0])?
+                                else {
+                                    unreachable!("type checking validates Ed25519 signing keys")
+                                };
+                                let message =
+                                    runtime_list_bytes(self.evaluate(program, &arguments[1])?)
+                                        .expect("type checking validates Ed25519 messages");
+                                Ok(if message.len() > crate::crypto::MAX_CRYPTO_MESSAGE_BYTES {
+                                    Value::Enum {
+                                        type_name: "Result".into(),
+                                        variant: "Err".into(),
+                                        payload: vec![Value::String(RuntimeString::literal(
+                                            "Ed25519 message exceeds 16777216 bytes".into(),
+                                        ))],
+                                    }
+                                } else {
+                                    Value::Enum {
+                                        type_name: "Result".into(),
+                                        variant: "Ok".into(),
+                                        payload: vec![runtime_bytes(key.0.sign(&message).to_vec())],
+                                    }
+                                })
+                            }
+                            "ed25519_verify" => {
+                                let public_key =
+                                    runtime_list_bytes(self.evaluate(program, &arguments[0])?)
+                                        .expect("type checking validates Ed25519 public keys");
+                                let message =
+                                    runtime_list_bytes(self.evaluate(program, &arguments[1])?)
+                                        .expect("type checking validates Ed25519 messages");
+                                let signature =
+                                    runtime_list_bytes(self.evaluate(program, &arguments[2])?)
+                                        .expect("type checking validates Ed25519 signatures");
+                                Ok(if message.len() > crate::crypto::MAX_CRYPTO_MESSAGE_BYTES {
+                                    Value::Enum {
+                                        type_name: "Result".into(),
+                                        variant: "Err".into(),
+                                        payload: vec![Value::String(RuntimeString::literal(
+                                            "Ed25519 message exceeds 16777216 bytes".into(),
+                                        ))],
+                                    }
+                                } else {
+                                    Value::Enum {
+                                        type_name: "Result".into(),
+                                        variant: "Ok".into(),
+                                        payload: vec![Value::Bool(
+                                            crate::crypto::ed25519_verify_strict(
+                                                &public_key,
+                                                &message,
+                                                &signature,
+                                            ),
+                                        )],
+                                    }
+                                })
+                            }
+                            "ed25519_key_id" => {
+                                let public_key =
+                                    runtime_list_bytes(self.evaluate(program, &arguments[0])?)
+                                        .expect("type checking validates Ed25519 public keys");
+                                Ok(match crate::crypto::ed25519_key_id(&public_key) {
+                                    Ok(key_id) => Value::Enum {
+                                        type_name: "Result".into(),
+                                        variant: "Ok".into(),
+                                        payload: vec![runtime_bytes(key_id.to_vec())],
+                                    },
+                                    Err(error) => Value::Enum {
+                                        type_name: "Result".into(),
+                                        variant: "Err".into(),
+                                        payload: vec![Value::String(RuntimeString::literal(
+                                            error.to_string(),
+                                        ))],
+                                    },
+                                })
+                            }
+                            "ed25519_verify_keyed" => {
+                                let expected_key_id =
+                                    runtime_list_bytes(self.evaluate(program, &arguments[0])?)
+                                        .expect("type checking validates Ed25519 key identifiers");
+                                let public_key =
+                                    runtime_list_bytes(self.evaluate(program, &arguments[1])?)
+                                        .expect("type checking validates Ed25519 public keys");
+                                let message =
+                                    runtime_list_bytes(self.evaluate(program, &arguments[2])?)
+                                        .expect("type checking validates Ed25519 messages");
+                                let signature =
+                                    runtime_list_bytes(self.evaluate(program, &arguments[3])?)
+                                        .expect("type checking validates Ed25519 signatures");
+                                let result =
+                                    if message.len() > crate::crypto::MAX_CRYPTO_MESSAGE_BYTES {
+                                        Err(crate::crypto::CryptoError::InvalidLength {
+                                            operation: "Ed25519 message",
+                                            requested: message.len(),
+                                            maximum: crate::crypto::MAX_CRYPTO_MESSAGE_BYTES,
+                                        })
+                                    } else {
+                                        crate::crypto::ed25519_verify_keyed(
+                                            &expected_key_id,
+                                            &public_key,
+                                            &message,
+                                            &signature,
+                                        )
+                                    };
+                                Ok(match result {
+                                    Ok(valid) => Value::Enum {
+                                        type_name: "Result".into(),
+                                        variant: "Ok".into(),
+                                        payload: vec![Value::Bool(valid)],
+                                    },
+                                    Err(error) => Value::Enum {
+                                        type_name: "Result".into(),
+                                        variant: "Err".into(),
+                                        payload: vec![Value::String(RuntimeString::literal(
+                                            error.to_string(),
+                                        ))],
+                                    },
+                                })
+                            }
+                            "ed25519_verify_lifecycle" => {
+                                let expected_key_id =
+                                    runtime_list_bytes(self.evaluate(program, &arguments[0])?)
+                                        .expect("type checking validates Ed25519 key identifiers");
+                                let public_key =
+                                    runtime_list_bytes(self.evaluate(program, &arguments[1])?)
+                                        .expect("type checking validates Ed25519 public keys");
+                                let message =
+                                    runtime_list_bytes(self.evaluate(program, &arguments[2])?)
+                                        .expect("type checking validates Ed25519 messages");
+                                let signature =
+                                    runtime_list_bytes(self.evaluate(program, &arguments[3])?)
+                                        .expect("type checking validates Ed25519 signatures");
+                                let valid_from = runtime_u64(
+                                    self.evaluate(program, &arguments[4])?,
+                                )
+                                .expect("type checking validates Ed25519 lifecycle timestamps");
+                                let valid_until = runtime_u64(
+                                    self.evaluate(program, &arguments[5])?,
+                                )
+                                .expect("type checking validates Ed25519 lifecycle timestamps");
+                                let Value::Bool(revoked) = self.evaluate(program, &arguments[6])?
+                                else {
+                                    unreachable!("type checking validates Ed25519 revoked state")
+                                };
+                                let evaluation_time = runtime_u64(
+                                    self.evaluate(program, &arguments[7])?,
+                                )
+                                .expect("type checking validates Ed25519 lifecycle timestamps");
+                                let result =
+                                    if message.len() > crate::crypto::MAX_CRYPTO_MESSAGE_BYTES {
+                                        Err(crate::crypto::CryptoError::InvalidLength {
+                                            operation: "Ed25519 message",
+                                            requested: message.len(),
+                                            maximum: crate::crypto::MAX_CRYPTO_MESSAGE_BYTES,
+                                        })
+                                    } else {
+                                        crate::crypto::ed25519_verify_lifecycle(
+                                            &expected_key_id,
+                                            &public_key,
+                                            &message,
+                                            &signature,
+                                            valid_from,
+                                            valid_until,
+                                            revoked,
+                                            evaluation_time,
+                                        )
+                                    };
+                                Ok(match result {
+                                    Ok(valid) => Value::Enum {
+                                        type_name: "Result".into(),
+                                        variant: "Ok".into(),
+                                        payload: vec![Value::Bool(valid)],
+                                    },
+                                    Err(error) => Value::Enum {
+                                        type_name: "Result".into(),
+                                        variant: "Err".into(),
+                                        payload: vec![Value::String(RuntimeString::literal(
+                                            error.to_string(),
+                                        ))],
+                                    },
+                                })
+                            }
+                            "encode_ed25519_public_key"
+                            | "decode_ed25519_public_key"
+                            | "encode_ed25519_signature"
+                            | "decode_ed25519_signature" => {
+                                let bytes =
+                                    runtime_list_bytes(self.evaluate(program, &arguments[0])?)
+                                        .expect("type checking validates Ed25519 record bytes");
+                                let result = match field.as_str() {
+                                    "encode_ed25519_public_key" => {
+                                        crate::crypto::encode_ed25519_public_key(&bytes)
+                                    }
+                                    "decode_ed25519_public_key" => {
+                                        crate::crypto::decode_ed25519_public_key(&bytes)
+                                    }
+                                    "encode_ed25519_signature" => {
+                                        crate::crypto::encode_ed25519_signature(&bytes)
+                                    }
+                                    "decode_ed25519_signature" => {
+                                        crate::crypto::decode_ed25519_signature(&bytes)
+                                    }
+                                    _ => unreachable!(),
+                                };
+                                Ok(match result {
+                                    Ok(bytes) => Value::Enum {
+                                        type_name: "Result".into(),
+                                        variant: "Ok".into(),
+                                        payload: vec![runtime_bytes(bytes)],
+                                    },
+                                    Err(error) => Value::Enum {
+                                        type_name: "Result".into(),
+                                        variant: "Err".into(),
+                                        payload: vec![Value::String(RuntimeString::literal(
+                                            error.to_string(),
+                                        ))],
+                                    },
+                                })
+                            }
+                            "argon2id_hash_password" => {
+                                let Value::SecretBytes(password) =
+                                    self.evaluate(program, &arguments[0])?
+                                else {
+                                    unreachable!("type checking validates Argon2id passwords")
+                                };
+                                Ok(match crate::crypto::argon2id_hash_password(&password.0) {
+                                    Ok(encoded) => Value::Enum {
+                                        type_name: "Result".into(),
+                                        variant: "Ok".into(),
+                                        payload: vec![Value::String(RuntimeString::literal(
+                                            encoded,
+                                        ))],
+                                    },
+                                    Err(error) => Value::Enum {
+                                        type_name: "Result".into(),
+                                        variant: "Err".into(),
+                                        payload: vec![Value::String(RuntimeString::literal(
+                                            error.to_string(),
+                                        ))],
+                                    },
+                                })
+                            }
+                            "argon2id_verify_password" => {
+                                let Value::SecretBytes(password) =
+                                    self.evaluate(program, &arguments[0])?
+                                else {
+                                    unreachable!("type checking validates Argon2id passwords")
+                                };
+                                let Value::String(encoded) =
+                                    self.evaluate(program, &arguments[1])?
+                                else {
+                                    unreachable!("type checking validates Argon2id hashes")
+                                };
+                                Ok(
+                                    match crate::crypto::argon2id_verify_password(
+                                        &password.0,
+                                        &encoded.text,
+                                    ) {
+                                        Ok(valid) => Value::Enum {
+                                            type_name: "Result".into(),
+                                            variant: "Ok".into(),
+                                            payload: vec![Value::Bool(valid)],
+                                        },
+                                        Err(error) => Value::Enum {
+                                            type_name: "Result".into(),
+                                            variant: "Err".into(),
+                                            payload: vec![Value::String(RuntimeString::literal(
+                                                error.to_string(),
+                                            ))],
+                                        },
+                                    },
+                                )
+                            }
+                            _ => Err(self.error("unknown Crypto operation", expression.span)),
+                        };
+                    }
                     if owner == "Environment" {
                         return match field.as_str() {
                             "arguments" => {
@@ -6912,6 +8895,7 @@ impl Interpreter {
                                 timeout: None,
                             })));
                         }
+                        self.charge_process_start(expression.span)?;
                         let Value::List { values, .. } = self.evaluate(program, &arguments[1])?
                         else {
                             unreachable!("type checking validates process arguments")
@@ -6923,6 +8907,7 @@ impl Interpreter {
                             };
                             process_arguments.push(value.text);
                         }
+                        let _permit = self.acquire_handle(expression.span)?;
                         return Ok(runtime_result(execute_process(RuntimeProcessCommand {
                             program: program_path,
                             arguments: process_arguments,
@@ -6934,8 +8919,9 @@ impl Interpreter {
                         })));
                     }
                     if owner == "Database" {
+                        let permit = self.acquire_handle(expression.span)?;
                         let result = match field.as_str() {
-                            "memory" => RuntimeDatabase::open(":memory:"),
+                            "memory" => RuntimeDatabase::open(":memory:", permit),
                             "open" => {
                                 let Value::Path(path) = self.evaluate(program, &arguments[0])?
                                 else {
@@ -6947,7 +8933,7 @@ impl Interpreter {
                                         "database path is not valid UTF-8",
                                     )
                                 });
-                                path.and_then(RuntimeDatabase::open)
+                                path.and_then(|path| RuntimeDatabase::open(path, permit))
                             }
                             _ => unreachable!("type checking validates Database constructors"),
                         };
@@ -6973,6 +8959,14 @@ impl Interpreter {
                                     .duration_since(UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_secs(),
+                            )),
+                            "ticks" => Ok(Value::UInt(
+                                ((TIMER_ORIGIN
+                                    .get_or_init(StdInstant::now)
+                                    .elapsed()
+                                    .as_millis()
+                                    / 10)
+                                    & u128::from(u32::MAX)) as u64,
                             )),
                             "sleep" => {
                                 let Value::Duration(duration) =
@@ -7004,6 +8998,7 @@ impl Interpreter {
                         runtime_path(self.evaluate(program, &arguments[0])?).ok_or_else(|| {
                             self.error("filesystem path must be Path", arguments[0].span)
                         })?;
+                    let _permit = self.acquire_handle(expression.span)?;
                     if owner == "File" {
                         return match field.as_str() {
                             "read_text" => Ok(runtime_result(
@@ -7041,16 +9036,12 @@ impl Interpreter {
                                         arguments[1].span,
                                     ));
                                 };
-                                let result = if field == "append_text" {
-                                    use std::io::Write;
-                                    fs::OpenOptions::new()
-                                        .create(true)
-                                        .append(true)
-                                        .open(path)
-                                        .and_then(|mut file| file.write_all(text.text.as_bytes()))
-                                } else {
-                                    fs::write(path, text.text)
-                                };
+                                let result = transactional_file_write(
+                                    &path,
+                                    text.text.as_bytes(),
+                                    field == "append_text",
+                                    self.budget.limits.max_file_write_bytes,
+                                );
                                 Ok(runtime_result(result.map(|_| Value::Unit)))
                             }
                             "write_bytes" | "append_bytes" => {
@@ -7073,16 +9064,12 @@ impl Interpreter {
                                                 .error("file byte is not u8", arguments[1].span)),
                                         })
                                         .collect::<Result<Vec<_>, _>>()?;
-                                let result = if field == "append_bytes" {
-                                    use std::io::Write;
-                                    fs::OpenOptions::new()
-                                        .create(true)
-                                        .append(true)
-                                        .open(path)
-                                        .and_then(|mut file| file.write_all(&bytes))
-                                } else {
-                                    fs::write(path, bytes)
-                                };
+                                let result = transactional_file_write(
+                                    &path,
+                                    &bytes,
+                                    field == "append_bytes",
+                                    self.budget.limits.max_file_write_bytes,
+                                );
                                 Ok(runtime_result(result.map(|_| Value::Unit)))
                             }
                             "exists" => Ok(Value::Bool(path.is_file())),
@@ -7097,7 +9084,13 @@ impl Interpreter {
                                             arguments[1].span,
                                         )
                                     })?;
-                                Ok(runtime_result(fs::copy(path, to).map(|_| Value::Unit)))
+                                let result = transactional_file_copy(
+                                    &path,
+                                    &to,
+                                    self.budget.limits.max_file_write_bytes,
+                                )
+                                .map(|_| Value::Unit);
+                                Ok(runtime_result(result))
                             }
                             "move" => {
                                 let to = runtime_path(self.evaluate(program, &arguments[1])?)
@@ -7212,6 +9205,11 @@ impl Interpreter {
                                 {
                                     Some(std::mem::replace(&mut entry.1, value))
                                 } else {
+                                    self.validate_collection_capacity(
+                                        entries.len().saturating_add(1),
+                                        2,
+                                        expression.span,
+                                    )?;
                                     grow_list_capacity(&mut capacity, entries.len() + 1)
                                         .map_err(|message| self.error(message, expression.span))?;
                                     entries.push((key, value));
@@ -7292,6 +9290,11 @@ impl Interpreter {
                                 let added = if values.contains(&value) {
                                     false
                                 } else {
+                                    self.validate_collection_capacity(
+                                        values.len().saturating_add(1),
+                                        1,
+                                        expression.span,
+                                    )?;
                                     grow_list_capacity(&mut capacity, values.len() + 1)
                                         .map_err(|message| self.error(message, expression.span))?;
                                     values.push(value);
@@ -7373,31 +9376,35 @@ impl Interpreter {
                         let Value::Mutex(mutex) = self.evaluate(program, object)? else {
                             return Err(self.error("Mutex method requires a Mutex", object.span));
                         };
-                        return Ok(Value::MutexGuard(mutex.lock()));
+                        return Ok(Value::MutexGuard(
+                            mutex.lock(expression.span).map_err(RuntimeFault::Error)?,
+                        ));
                     }
                     if field == "share" && arguments.is_empty() {
                         return match self.evaluate(program, object)? {
                             Value::Mutex(mutex) => Ok(Value::Mutex(mutex)),
                             Value::AtomicInt(atomic) => Ok(Value::AtomicInt(atomic)),
-                            _ => {
-                                Err(self.error("share requires a Mutex or AtomicInt", object.span))
-                            }
+                            Value::Channel(channel) => Ok(Value::Channel(channel)),
+                            _ => Err(self.error(
+                                "share requires a Mutex, AtomicInt, or Channel",
+                                object.span,
+                            )),
                         };
                     }
-                    if matches!(
-                        field.as_str(),
-                        "share" | "load" | "store" | "add" | "fetch_add"
-                    ) && let Value::AtomicInt(atomic) = self.evaluate(program, object)?
+                    if (field == "share" || atomic_operation(field).is_some())
+                        && let Value::AtomicInt(atomic) = self.evaluate(program, object)?
                     {
-                        return match field.as_str() {
+                        let operation = atomic_operation(field);
+                        let order = atomic_order(field);
+                        return match operation.unwrap_or(field) {
                             "share" => Ok(Value::AtomicInt(atomic)),
-                            "load" => Ok(Value::Int(atomic.0.load(Ordering::SeqCst))),
+                            "load" => Ok(Value::Int(atomic.0.load(order))),
                             "store" => {
                                 let Value::Int(value) = self.evaluate(program, &arguments[0])?
                                 else {
                                     unreachable!("type checking validates AtomicInt.store")
                                 };
-                                atomic.0.store(value, Ordering::SeqCst);
+                                atomic.0.store(value, order);
                                 Ok(Value::Unit)
                             }
                             "add" | "fetch_add" => {
@@ -7406,9 +9413,85 @@ impl Interpreter {
                                     unreachable!("type checking validates AtomicInt.add")
                                 };
                                 let (previous, next) = atomic
-                                    .add(value, expression.span)
+                                    .add(value, order, expression.span)
                                     .map_err(RuntimeFault::Error)?;
                                 Ok(Value::Int(if field == "add" { next } else { previous }))
+                            }
+                            _ => unreachable!(),
+                        };
+                    }
+                    if matches!(
+                        field.as_str(),
+                        "share" | "send" | "receive" | "close" | "len" | "capacity" | "is_closed"
+                    ) && let Value::Channel(channel) = self.evaluate(program, object)?
+                    {
+                        return match field.as_str() {
+                            "share" => Ok(Value::Channel(channel)),
+                            "send" => {
+                                let value = self.consume(program, &arguments[0])?;
+                                Ok(Value::Bool(
+                                    channel
+                                        .send(value, expression.span)
+                                        .map_err(RuntimeFault::Error)?,
+                                ))
+                            }
+                            "receive" => Ok(
+                                match channel
+                                    .receive(expression.span)
+                                    .map_err(RuntimeFault::Error)?
+                                {
+                                    Some(value) => Value::Enum {
+                                        type_name: "Option".into(),
+                                        variant: "Some".into(),
+                                        payload: vec![value],
+                                    },
+                                    None => Value::Enum {
+                                        type_name: "Option".into(),
+                                        variant: "None".into(),
+                                        payload: vec![],
+                                    },
+                                },
+                            ),
+                            "close" => {
+                                channel
+                                    .close(expression.span)
+                                    .map_err(RuntimeFault::Error)?;
+                                Ok(Value::Unit)
+                            }
+                            "len" => Ok(Value::UInt(
+                                channel
+                                    .inspect(expression.span)
+                                    .map_err(RuntimeFault::Error)?
+                                    .0 as u64,
+                            )),
+                            "capacity" => Ok(Value::UInt(
+                                channel
+                                    .inspect(expression.span)
+                                    .map_err(RuntimeFault::Error)?
+                                    .1 as u64,
+                            )),
+                            "is_closed" => Ok(Value::Bool(
+                                channel
+                                    .inspect(expression.span)
+                                    .map_err(RuntimeFault::Error)?
+                                    .2,
+                            )),
+                            _ => unreachable!(),
+                        };
+                    }
+                    if matches!(field.as_str(), "len" | "is_empty" | "constant_time_equals")
+                        && let Value::SecretBytes(secret) = self.evaluate(program, object)?
+                    {
+                        return match field.as_str() {
+                            "len" => Ok(Value::UInt(secret.0.len() as u64)),
+                            "is_empty" => Ok(Value::Bool(secret.0.is_empty())),
+                            "constant_time_equals" => {
+                                let Value::SecretBytes(other) =
+                                    self.evaluate(program, &arguments[0])?
+                                else {
+                                    unreachable!("type checking validates SecretBytes comparison")
+                                };
+                                Ok(Value::Bool(secret.0.constant_time_eq(&other.0)))
                             }
                             _ => unreachable!(),
                         };
@@ -7431,27 +9514,50 @@ impl Interpreter {
                                     }
                                     _ => unreachable!("type checking validates pointer offset"),
                                 };
-                                let Some(PlaceSegment::Index(index)) = place.fields.last_mut()
-                                else {
+                                let Some(PlaceSegment::Index(index)) = place.fields.last() else {
                                     return Err(self.error(
                                         "interpreter raw pointer has no addressable element",
                                         object.span,
                                     ));
                                 };
-                                *index =
+                                let next =
                                     index.checked_add_signed(offset as isize).ok_or_else(|| {
-                                        self.error("raw pointer offset overflow", arguments[0].span)
+                                        self.error(
+                                            "Memory pointer offset is out of bounds",
+                                            arguments[0].span,
+                                        )
                                     })?;
+                                let mut allocation = place.clone();
+                                allocation.fields.pop();
+                                if let Some(Value::Memory(memory)) = self.read_place(&allocation) {
+                                    let length = memory.len().ok_or_else(|| {
+                                        self.error("Memory state lock is poisoned", object.span)
+                                    })?;
+                                    if next > length {
+                                        return Err(self.error(
+                                            "Memory pointer offset is out of bounds",
+                                            arguments[0].span,
+                                        ));
+                                    }
+                                }
+                                let Some(PlaceSegment::Index(index)) = place.fields.last_mut()
+                                else {
+                                    unreachable!()
+                                };
+                                *index = next;
                                 Ok(Value::Reference(place, mutable))
                             }
                             "read" => self.read_place(&place).ok_or_else(|| {
-                                self.error("raw pointer read is out of bounds", expression.span)
+                                self.error(
+                                    "Memory pointer access is out of bounds",
+                                    expression.span,
+                                )
                             }),
                             "write" if mutable => {
                                 let value = self.evaluate(program, &arguments[0])?;
                                 self.write_place(&place, value).ok_or_else(|| {
                                     self.error(
-                                        "raw pointer write is out of bounds",
+                                        "Memory pointer access is out of bounds",
                                         expression.span,
                                     )
                                 })?;
@@ -7471,6 +9577,34 @@ impl Interpreter {
                             );
                         };
                         return handle.join(expression.span).map_err(RuntimeFault::Error);
+                    }
+                    if field == "cancel" && arguments.is_empty() {
+                        let Value::Task(task) = self.consume(program, object)? else {
+                            return Err(self.error("Task.cancel requires a Task", object.span));
+                        };
+                        let mut work = task
+                            .0
+                            .work
+                            .lock()
+                            .map_err(|_| self.error("task state is poisoned", object.span))?;
+                        if matches!(*work, RuntimeTaskWork::Running) {
+                            return Err(
+                                self.error("a running task cannot cancel itself", object.span)
+                            );
+                        }
+                        *work = RuntimeTaskWork::Consumed;
+                        return Ok(Value::Unit);
+                    }
+                    if field == "is_finished" && arguments.is_empty() {
+                        let Value::Task(task) = self.evaluate(program, object)? else {
+                            return Err(self.error("Task.is_finished requires a Task", object.span));
+                        };
+                        let work = task
+                            .0
+                            .work
+                            .lock()
+                            .map_err(|_| self.error("task state is poisoned", object.span))?;
+                        return Ok(Value::Bool(matches!(*work, RuntimeTaskWork::Ready(_))));
                     }
                     if let Value::TcpListener(listener) = self.evaluate(program, object)? {
                         return match field.as_str() {
@@ -7493,7 +9627,7 @@ impl Interpreter {
                                 let guard = listener.0.lock().map_err(|_| {
                                     self.error("TCP listener state is poisoned", object.span)
                                 })?;
-                                let port = match guard.as_ref() {
+                                let port = match guard.socket.as_ref() {
                                     Some(listener) => listener
                                         .local_addr()
                                         .map(|address| Value::UInt(address.port() as u64)),
@@ -7508,7 +9642,8 @@ impl Interpreter {
                                 let mut guard = listener.0.lock().map_err(|_| {
                                     self.error("TCP listener state is poisoned", object.span)
                                 })?;
-                                guard.take();
+                                guard.socket.take();
+                                guard.permit.take();
                                 Ok(Value::Unit)
                             }
                             _ => Err(self.error("unknown TcpListener operation", expression.span)),
@@ -7518,7 +9653,7 @@ impl Interpreter {
                         return match field.as_str() {
                             "read" | "read_async" | "read_async_timeout" => {
                                 let limit = self.index_value(program, &arguments[0])?;
-                                if limit > 16 * 1024 * 1024 {
+                                if limit > limits::TCP_READ_BYTES {
                                     return Err(self.error(
                                         "TCP read limit exceeds the 16 MiB safety limit",
                                         arguments[0].span,
@@ -7622,6 +9757,7 @@ impl Interpreter {
                                 if let Some(socket) = guard.socket.take() {
                                     let _ = socket.shutdown(Shutdown::Both);
                                 }
+                                guard.permit.take();
                                 Ok(Value::Unit)
                             }
                             "shutdown_read" | "shutdown_write" => {
@@ -7667,7 +9803,7 @@ impl Interpreter {
                         return match field.as_str() {
                             "read" | "read_async" | "read_async_timeout" => {
                                 let limit = self.index_value(program, &arguments[0])?;
-                                if limit > 16 * 1024 * 1024 {
+                                if limit > limits::TCP_READ_BYTES {
                                     return Err(self.error(
                                         "TLS read limit exceeds the 16 MiB safety limit",
                                         arguments[0].span,
@@ -7691,7 +9827,7 @@ impl Interpreter {
                                 let mut guard = stream.0.lock().map_err(|_| {
                                     self.error("TLS stream state is poisoned", object.span)
                                 })?;
-                                let result = if let Some(stream) = guard.as_mut() {
+                                let result = if let Some(stream) = guard.socket.as_mut() {
                                     let mut bytes = vec![0; limit];
                                     stream.read(&mut bytes).map(|count| {
                                         bytes.truncate(count);
@@ -7736,7 +9872,7 @@ impl Interpreter {
                                 let mut guard = stream.0.lock().map_err(|_| {
                                     self.error("TLS stream state is poisoned", object.span)
                                 })?;
-                                let result = if let Some(stream) = guard.as_mut() {
+                                let result = if let Some(stream) = guard.socket.as_mut() {
                                     stream
                                         .write_all(&bytes)
                                         .map(|()| Value::UInt(bytes.len() as u64))
@@ -7752,10 +9888,11 @@ impl Interpreter {
                                 let mut guard = stream.0.lock().map_err(|_| {
                                     self.error("TLS stream state is poisoned", object.span)
                                 })?;
-                                if let Some(mut secure) = guard.take() {
+                                if let Some(mut secure) = guard.socket.take() {
                                     let _ = secure.shutdown();
                                     let _ = secure.get_ref().shutdown(Shutdown::Both);
                                 }
+                                guard.permit.take();
                                 Ok(Value::Unit)
                             }
                             _ => Err(self.error("unknown TlsStream operation", expression.span)),
@@ -7934,7 +10071,7 @@ impl Interpreter {
                             | "receive_from_async"
                             | "receive_from_async_timeout" => {
                                 let limit = self.index_value(program, &arguments[0])?;
-                                if limit > 65_535 {
+                                if limit > limits::UDP_RECEIVE_BYTES {
                                     return Err(self.error(
                                         "UDP receive limit exceeds 65535 bytes",
                                         arguments[0].span,
@@ -8000,7 +10137,7 @@ impl Interpreter {
                                 let guard = socket.0.lock().map_err(|_| {
                                     self.error("UDP socket state is poisoned", object.span)
                                 })?;
-                                let port = match guard.as_ref() {
+                                let port = match guard.socket.as_ref() {
                                     Some(socket) => socket
                                         .local_addr()
                                         .map(|address| Value::UInt(address.port() as u64)),
@@ -8015,7 +10152,8 @@ impl Interpreter {
                                 let mut guard = socket.0.lock().map_err(|_| {
                                     self.error("UDP socket state is poisoned", object.span)
                                 })?;
-                                guard.take();
+                                guard.socket.take();
+                                guard.permit.take();
                                 Ok(Value::Unit)
                             }
                             _ => Err(self.error("unknown UdpSocket operation", expression.span)),
@@ -8301,8 +10439,16 @@ impl Interpreter {
                                     };
                                     command.timeout = Some(value);
                                 }
-                                "run" => return Ok(runtime_result(execute_process(*command))),
-                                "start" => return Ok(runtime_result(start_process(*command))),
+                                "run" => {
+                                    self.charge_process_start(expression.span)?;
+                                    let _permit = self.acquire_handle(expression.span)?;
+                                    return Ok(runtime_result(execute_process(*command)));
+                                }
+                                "start" => {
+                                    self.charge_process_start(expression.span)?;
+                                    let permit = self.acquire_handle(expression.span)?;
+                                    return Ok(runtime_result(start_process(*command, permit)));
+                                }
                                 _ => {
                                     return Err(self.error(
                                         "unknown ProcessCommand operation",
@@ -8566,6 +10712,11 @@ impl Interpreter {
                                 {
                                     Some(std::mem::replace(&mut entry.1, value))
                                 } else {
+                                    self.validate_collection_capacity(
+                                        entries.len().saturating_add(1),
+                                        2,
+                                        expression.span,
+                                    )?;
                                     grow_list_capacity(&mut capacity, entries.len() + 1)
                                         .map_err(|message| self.error(message, expression.span))?;
                                     entries.push((key, value));
@@ -8625,6 +10776,11 @@ impl Interpreter {
                                 let added = if values.contains(&value) {
                                     false
                                 } else {
+                                    self.validate_collection_capacity(
+                                        values.len().saturating_add(1),
+                                        1,
+                                        expression.span,
+                                    )?;
                                     grow_list_capacity(&mut capacity, values.len() + 1)
                                         .map_err(|message| self.error(message, expression.span))?;
                                     values.push(value);
@@ -8683,6 +10839,11 @@ impl Interpreter {
                             }
                             "push" => {
                                 let value = self.consume(program, &arguments[0])?;
+                                self.validate_collection_capacity(
+                                    values.len().saturating_add(1),
+                                    1,
+                                    expression.span,
+                                )?;
                                 grow_list_capacity(&mut capacity, values.len() + 1)
                                     .map_err(|message| self.error(message, expression.span))?;
                                 values.push(value);
@@ -8735,6 +10896,11 @@ impl Interpreter {
                                     ));
                                 }
                                 let value = self.consume(program, &arguments[1])?;
+                                self.validate_collection_capacity(
+                                    values.len().saturating_add(1),
+                                    1,
+                                    expression.span,
+                                )?;
                                 grow_list_capacity(&mut capacity, values.len() + 1)
                                     .map_err(|message| self.error(message, expression.span))?;
                                 values.insert(index, value);
@@ -8935,12 +11101,36 @@ impl Interpreter {
                         };
                         match field.as_str() {
                             "push" => match self.evaluate(program, &arguments[0])? {
-                                Value::Char(ch) => value.push(ch),
+                                Value::Char(ch) => {
+                                    let needed = value
+                                        .len()
+                                        .checked_add(ch.len_utf8())
+                                        .ok_or_else(|| {
+                                            self.error(
+                                                "runtime resource limit exceeded: managed memory bytes",
+                                                expression.span,
+                                            )
+                                        })?;
+                                    self.validate_string_capacity(needed, expression.span)?;
+                                    value.push(ch);
+                                }
                                 _ => unreachable!(),
                             },
                             "push_str" | "append" | "add" => {
                                 match self.evaluate(program, &arguments[0])? {
-                                    Value::String(text) => value.push_str(&text),
+                                    Value::String(text) => {
+                                        let needed = value
+                                            .len()
+                                            .checked_add(text.len())
+                                            .ok_or_else(|| {
+                                                self.error(
+                                                    "runtime resource limit exceeded: managed memory bytes",
+                                                    expression.span,
+                                                )
+                                            })?;
+                                        self.validate_string_capacity(needed, expression.span)?;
+                                        value.push_str(&text);
+                                    }
                                     _ => unreachable!(),
                                 }
                             }
@@ -9012,12 +11202,19 @@ impl Interpreter {
                             .ok_or_else(|| self.error("dangling reference", arguments[0].span))?,
                         value => value,
                     };
+                    let rendered = display_value(value);
+                    self.charge_output(
+                        u64::try_from(rendered.len())
+                            .unwrap_or(u64::MAX)
+                            .saturating_add(1),
+                        expression.span,
+                    )?;
                     self.output
                         .lock()
                         .map_err(|_| {
                             self.error("interpreter output lock is poisoned", expression.span)
                         })?
-                        .push(display_value(value));
+                        .push(rendered);
                     return Ok(Value::Unit);
                 }
                 let callee_value = self.evaluate(program, callee)?;
@@ -9089,6 +11286,27 @@ impl Interpreter {
                     let mut bindings = HashMap::new();
                     if pattern_matches(&arm.pattern.node, &value, &mut bindings) {
                         self.push_scope(bindings);
+                        if let Some(guard) = &arm.guard {
+                            let guard_value = self.evaluate(program, guard);
+                            match guard_value {
+                                Ok(Value::Bool(true)) => {}
+                                Ok(Value::Bool(false)) => {
+                                    self.pop_scope();
+                                    continue;
+                                }
+                                Ok(_) => {
+                                    self.pop_scope();
+                                    return Err(self.error(
+                                        "match guard did not evaluate to bool",
+                                        guard.span,
+                                    ));
+                                }
+                                Err(error) => {
+                                    self.pop_scope();
+                                    return Err(error);
+                                }
+                            }
+                        }
                         let result = self.evaluate(program, &arm.value);
                         self.pop_scope();
                         return result;
@@ -9129,10 +11347,10 @@ impl Interpreter {
                     Value::Future(future) => self.await_future(program, future, expression.span),
                     Value::Task(task) => {
                         let work = {
-                            let mut work = task
-                                .0
-                                .lock()
-                                .map_err(|_| self.error("task state is poisoned", future.span))?;
+                            let mut work =
+                                task.0.work.lock().map_err(|_| {
+                                    self.error("task state is poisoned", future.span)
+                                })?;
                             std::mem::replace(&mut *work, RuntimeTaskWork::Consumed)
                         };
                         match work {
@@ -9199,12 +11417,18 @@ impl Interpreter {
         }
         let child_program = program.clone();
         let output = Arc::clone(&self.output);
+        let budget = Arc::clone(&self.budget);
+        if !RuntimeBudget::charge(&budget.live_threads, 1, budget.limits.max_threads) {
+            return Err(self.error("runtime resource limit exceeded: live threads", span));
+        }
+        let thread_permit = RuntimeThreadPermit(Arc::clone(&budget));
         let program_arguments = self.program_arguments.clone();
         let call_span = task.span;
         let handle = thread::Builder::new()
             .name(format!("disp-{name}"))
             .stack_size(INTERPRETER_STACK_BYTES)
             .spawn(move || {
+                let _thread_permit = thread_permit;
                 let mut child = Interpreter {
                     scopes: Vec::new(),
                     scope_orders: Vec::new(),
@@ -9213,6 +11437,8 @@ impl Interpreter {
                     tasks: Vec::new(),
                     http_pool: HashMap::new(),
                     program_arguments,
+                    budget,
+                    accounted_object_bytes: 0,
                 };
                 child
                     .call_function(&child_program, &function, values, call_span)
@@ -9808,6 +12034,9 @@ fn value_type_name(value: &Value) -> &str {
         Value::CString(_) => "CString",
         Value::CStr(_) => "CStr",
         Value::Memory(_) => "Memory",
+        Value::SecretBytes(_) => "SecretBytes",
+        Value::AeadEnvelope(_) => "AeadEnvelope",
+        Value::Ed25519SigningKey(_) => "Ed25519SigningKey",
         Value::Path(_) => "Path",
         Value::Url(_) => "Url",
         Value::Json(_) => "Json",
@@ -9831,6 +12060,7 @@ fn value_type_name(value: &Value) -> &str {
         Value::Task(_) => "Task",
         Value::Mutex(_) => "Mutex",
         Value::MutexGuard(_) => "MutexGuard",
+        Value::Channel(_) => "Channel",
         Value::AtomicInt(_) => "AtomicInt",
         Value::Array(_) => "Array",
         Value::Slice(_) => "Slice",
@@ -9889,6 +12119,7 @@ fn value_is_copy(program: &Program, value: &Value) -> bool {
         | Value::Task(_)
         | Value::Mutex(_)
         | Value::MutexGuard(_)
+        | Value::Channel(_)
         | Value::AtomicInt(_)
         | Value::Path(_)
         | Value::ProcessOutput(_)
@@ -9908,6 +12139,9 @@ fn value_is_copy(program: &Program, value: &Value) -> bool {
         | Value::String(_)
         | Value::CString(_)
         | Value::Memory(_)
+        | Value::SecretBytes(_)
+        | Value::AeadEnvelope(_)
+        | Value::Ed25519SigningKey(_)
         | Value::Closure(_)
         | Value::Uninitialized => false,
     }
@@ -10220,9 +12454,39 @@ fn pattern_matches(
             Value::Unsigned(value, _) => *value == *pattern,
             _ => false,
         },
+        Pattern::NegativeInteger(pattern) => match value {
+            Value::Int(value) => value.unsigned_abs() as u128 == *pattern && *value <= 0,
+            Value::Signed(value, _) => value.unsigned_abs() == *pattern && *value <= 0,
+            _ => *pattern == 0 && matches!(value, Value::UInt(0) | Value::Unsigned(0, _)),
+        },
         Pattern::String(pattern) => matches!(value, Value::String(value) if value.text == *pattern),
         Pattern::Character(pattern) => matches!(value, Value::Char(value) if value == pattern),
         Pattern::Bool(pattern) => matches!(value, Value::Bool(value) if value == pattern),
+        Pattern::Or(alternatives) => alternatives.iter().any(|alternative| {
+            let mut candidate = bindings.clone();
+            let matched = pattern_matches(&alternative.node, value, &mut candidate);
+            if matched {
+                *bindings = candidate;
+            }
+            matched
+        }),
+        Pattern::Struct {
+            type_name, fields, ..
+        } => {
+            let Value::Struct {
+                type_name: value_type,
+                fields: values,
+            } = value
+            else {
+                return false;
+            };
+            value_type == type_name
+                && fields.iter().all(|field| {
+                    values
+                        .get(&field.name)
+                        .is_some_and(|value| pattern_matches(&field.pattern.node, value, bindings))
+                })
+        }
         Pattern::Variant {
             type_name,
             variant,
@@ -10269,6 +12533,9 @@ fn display_value(value: Value) -> String {
         Value::String(value) => value.text,
         Value::CString(value) | Value::CStr(value) => value.text(),
         Value::Memory(_) => "<Memory>".into(),
+        Value::SecretBytes(_) => "<SecretBytes:redacted>".into(),
+        Value::AeadEnvelope(_) => "<AeadEnvelope>".into(),
+        Value::Ed25519SigningKey(_) => "<Ed25519SigningKey:redacted>".into(),
         Value::Path(value) => value.to_string_lossy().into_owned(),
         Value::Url(value) => value.text,
         Value::Json(value) => value.text,
@@ -10298,6 +12565,7 @@ fn display_value(value: Value) -> String {
         Value::Task(_) => "<Task>".into(),
         Value::Mutex(_) => "<Mutex>".into(),
         Value::MutexGuard(_) => "<MutexGuard>".into(),
+        Value::Channel(_) => "<Channel>".into(),
         Value::AtomicInt(_) => "<AtomicInt>".into(),
         Value::Array(values) => format!(
             "[{}]",

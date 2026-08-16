@@ -1,0 +1,4 @@
+fn main() {
+    print("Hello from AArch64 DISP")
+    print("Direct non-x86 machine code")
+}

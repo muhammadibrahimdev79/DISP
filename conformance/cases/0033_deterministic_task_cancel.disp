@@ -1,0 +1,11 @@
+async fn deferred(message: String) -> String {
+    print("unexpected")
+    return message
+}
+
+async fn main() {
+    task = Async.spawn(deferred("owned by cancelled task"))
+    print(task.is_finished())
+    task.cancel()
+    print("cancelled")
+}

@@ -1,0 +1,15 @@
+fn produce(queue: Channel<int>) {
+    queue.send(7)
+    queue.close()
+}
+
+fn exercise() -> Result<int, String> {
+    var queue: Channel<int> = Channel.bounded(1)?
+    worker = spawn produce(queue.share())
+    print(match queue.receive() { Some(value) => value None => -1 })
+    worker.join()
+    print(match queue.receive() { Some(_) => false None => true })
+    return Ok(0)
+}
+
+fn main() { print(match exercise() { Ok(value) => value Err(_) => -1 }) }

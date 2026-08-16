@@ -1,0 +1,10 @@
+struct Box<T: Copy> {
+    item: T
+}
+
+fn identity<T: Copy>(入力: T) -> T = 入力
+
+fn main() {
+    let 答え = Box { item: identity(42) }
+    print(答え.item)
+}

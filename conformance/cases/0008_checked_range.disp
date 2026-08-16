@@ -1,0 +1,4 @@
+fn main() {
+    let value: i8 = 128
+    print(value)
+}

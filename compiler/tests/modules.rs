@@ -256,6 +256,45 @@ fn malformed_manifests_fail_closed_with_exact_locations() {
 }
 
 #[test]
+fn compiler_extension_manifests_fail_closed_with_security_guidance() {
+    for (index, (manifest, name, line)) in [
+        (
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nbuild = \"build.disp\"\n",
+            "build",
+            4,
+        ),
+        (
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n[proc-macro]\nentry = \"macro.disp\"\n",
+            "proc-macro",
+            4,
+        ),
+        (
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n[plugins]\n",
+            "plugins",
+            4,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let marker = project(
+            &format!("extension-manifest-{index}"),
+            &[("DISP.toml", manifest), ("src/main.disp", "fn main() {}")],
+        );
+        let error = check_path(marker.parent().unwrap()).unwrap_err();
+        assert_eq!(
+            error.message,
+            format!("compiler extension `{name}` is disabled in DISP edition 1")
+        );
+        assert_eq!(error.span.start.line, line);
+        assert!(error.file.unwrap().ends_with("DISP.toml"));
+        let help = error.help.expect("extension rejection needs security guidance");
+        assert!(help.contains("never execute in the compiler process"), "{help}");
+        assert!(help.contains("sandboxed out-of-process"), "{help}");
+    }
+}
+
+#[test]
 fn malformed_manifest_forms_never_receive_guessed_meanings() {
     let cases = [
         (

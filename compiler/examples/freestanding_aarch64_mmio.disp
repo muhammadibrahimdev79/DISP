@@ -1,0 +1,14 @@
+fn probe_uart() -> u32 uses DeviceIo {
+    unsafe uses DeviceIo {
+        let status: u32 = Mmio.read_u32(u16(24))
+        Mmio.write_u32(u16(0), u32(77))
+        return status
+    }
+}
+
+fn main() {
+    let status: u32 = probe_uart()
+    if status >= u32(0) {
+        print("MIO capability access active")
+    }
+}

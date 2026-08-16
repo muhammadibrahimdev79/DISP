@@ -2,6 +2,7 @@ use disp::{
     backend::{self, BuildOptions},
     check_source, lower_source, run_source,
 };
+use native_tls::TlsConnector;
 use std::{
     fs,
     io::{ErrorKind, Read},
@@ -87,6 +88,39 @@ fn public_tls_available(host: &str) -> bool {
         .is_some()
 }
 
+fn public_tls_handshake_available(host: &str) -> bool {
+    let mut builder = TlsConnector::builder();
+    builder.danger_accept_invalid_certs(true);
+    let Ok(connector) = builder.build() else {
+        return false;
+    };
+    let Ok(addresses) = (host, 443).to_socket_addrs() else {
+        return false;
+    };
+    addresses.into_iter().any(|address| {
+        let Ok(stream) = TcpStream::connect_timeout(&address, Duration::from_secs(2)) else {
+            return false;
+        };
+        if stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .is_err()
+            || stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .is_err()
+        {
+            return false;
+        }
+        connector.connect(host, stream).is_ok()
+    })
+}
+
+fn remote_tls_transport_timed_out(output: &str) -> bool {
+    matches!(
+        output,
+        "Result.Err(connection timed out)\n" | "Result.Err(TCP connect timed out)\n"
+    )
+}
+
 #[test]
 fn verified_tls13_https_io_is_native_interpreter_differential() {
     if !public_tls_available("example.com") {
@@ -120,7 +154,9 @@ async fn main() { print(await inspect()) }"#;
         assert_eq!(compiled, interpreted);
     }
 
-    if !public_tls_available("self-signed.badssl.com") {
+    // A TCP accept alone does not prove that the remote TLS endpoint is reachable:
+    // captive portals and filtered networks can accept port 443 and then stall.
+    if !public_tls_handshake_available("self-signed.badssl.com") {
         return;
     }
     let untrusted = r#"async fn inspect() -> Result<bool, NetworkError> {
@@ -128,11 +164,17 @@ tcp = (await Async.connect_timeout(SocketAddress("self-signed.badssl.com", 443),
 result = await Tls.connect_timeout(tcp, "self-signed.badssl.com", Duration.from_seconds(5))
 return Ok(match result { Ok(stream) => false, Err(error) => true })
 }
-async fn main() { print(await inspect()) }"#;
+    async fn main() { print(await inspect()) }"#;
     let interpreted = run_source(untrusted).unwrap().join("\n") + "\n";
+    if remote_tls_transport_timed_out(&interpreted) {
+        return;
+    }
     assert_eq!(interpreted, "Result.Ok(true)\n");
     let (compiled, _) = native("untrusted-certificate", untrusted, false);
     if let Some(compiled) = compiled {
+        if remote_tls_transport_timed_out(&compiled) {
+            return;
+        }
         assert_eq!(compiled, interpreted);
     }
 }

@@ -1,0 +1,10 @@
+fn main() {
+    var total = 0
+    for value in 0..=3 {
+        if value == 2 {
+            continue
+        }
+        total += value
+    }
+    print(total)
+}

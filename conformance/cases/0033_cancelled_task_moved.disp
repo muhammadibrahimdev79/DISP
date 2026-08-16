@@ -1,0 +1,7 @@
+async fn work() -> int { return 1 }
+
+async fn main() {
+    task = Async.spawn(work())
+    task.cancel()
+    print(await task)
+}

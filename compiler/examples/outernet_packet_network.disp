@@ -1,0 +1,206 @@
+struct Packet {
+    source: u8,
+    destination: u8,
+    sequence: u8,
+    hop_limit: u8,
+    payload: u8,
+    authenticator: List<u8>,
+}
+
+struct Frame {
+    node: u8,
+    packet: Packet,
+}
+
+fn packet_message(source: u8, destination: u8, sequence: u8, payload: u8) -> List<u8> {
+    return List.of(source, destination, sequence, payload)
+}
+
+fn next_hop(node: u8, destination: u8) -> Option<u8> {
+    if node == destination {
+        return Some(node)
+    }
+    if node == 1 && destination == 3 {
+        return Some(u8(2))
+    }
+    if node == 2 && destination == 3 {
+        return Some(u8(3))
+    }
+    return None
+}
+
+fn simulate(key_one: SecretBytes, key_two: SecretBytes) -> Result<bool, CryptoError> uses Pure {
+    let tag_one = Crypto.hmac_sha256(key_one, packet_message(u8(1), u8(3), u8(1), u8(11)))?
+    let tag_two_a = Crypto.hmac_sha256(key_one, packet_message(u8(1), u8(3), u8(2), u8(22)))?
+    let tag_two_b = Crypto.hmac_sha256(key_one, packet_message(u8(1), u8(3), u8(2), u8(22)))?
+    let forged_tag = Crypto.hmac_sha256(key_one, packet_message(u8(2), u8(3), u8(4), u8(44)))?
+    let tag_five = Crypto.hmac_sha256(key_one, packet_message(u8(1), u8(3), u8(5), u8(55)))?
+
+    var queue: List<Frame> = List.with_capacity(5)
+    queue.insert(0, Frame {
+        node: u8(1),
+        packet: Packet {
+            source: u8(1),
+            destination: u8(3),
+            sequence: u8(2),
+            hop_limit: u8(4),
+            payload: u8(22),
+            authenticator: tag_two_a,
+        },
+    })
+    queue.push(Frame {
+        node: u8(1),
+        packet: Packet {
+            source: u8(1),
+            destination: u8(3),
+            sequence: u8(1),
+            hop_limit: u8(4),
+            payload: u8(11),
+            authenticator: tag_one,
+        },
+    })
+    queue.insert(1, Frame {
+        node: u8(1),
+        packet: Packet {
+            source: u8(1),
+            destination: u8(3),
+            sequence: u8(2),
+            hop_limit: u8(4),
+            payload: u8(22),
+            authenticator: tag_two_b,
+        },
+    })
+    queue.push(Frame {
+        node: u8(1),
+        packet: Packet {
+            source: u8(2),
+            destination: u8(3),
+            sequence: u8(4),
+            hop_limit: u8(4),
+            payload: u8(44),
+            authenticator: forged_tag,
+        },
+    })
+    queue.push(Frame {
+        node: u8(1),
+        packet: Packet {
+            source: u8(1),
+            destination: u8(3),
+            sequence: u8(5),
+            hop_limit: u8(0),
+            payload: u8(55),
+            authenticator: tag_five,
+        },
+    })
+
+    print("DROP_LOSS")
+    print(3)
+    if queue.len() >= 5 {
+        print("DROP_QUEUE_FULL")
+        print(6)
+    }
+
+    var delivered = 0
+    var forwarded = 0
+    var dropped = 2
+    var steps = 0
+    var delivered_sequences: Set<u8> = Set.new()
+    while !queue.is_empty() && steps < 16 {
+        steps += 1
+        let frame = queue.remove(0)
+        let message = packet_message(
+            frame.packet.source,
+            frame.packet.destination,
+            frame.packet.sequence,
+            frame.packet.payload
+        )
+        var valid = false
+        if frame.packet.source == 1 {
+            valid = Crypto.hmac_sha256_verify(key_one, message, frame.packet.authenticator)?
+        } else if frame.packet.source == 2 {
+            valid = Crypto.hmac_sha256_verify(key_two, message, frame.packet.authenticator)?
+        }
+        if !valid {
+            print("DROP_AUTH")
+            print(frame.packet.sequence)
+            dropped += 1
+            continue
+        }
+        if frame.packet.hop_limit == 0 {
+            print("DROP_HOP_LIMIT")
+            print(frame.packet.sequence)
+            dropped += 1
+            continue
+        }
+        if frame.node == frame.packet.destination {
+            if delivered_sequences.has(frame.packet.sequence) {
+                print("DROP_DUPLICATE")
+                print(frame.packet.sequence)
+                dropped += 1
+                continue
+            }
+            delivered_sequences.add(frame.packet.sequence)
+            print("DELIVER")
+            print(frame.packet.sequence)
+            print(frame.packet.payload)
+            delivered += 1
+            continue
+        }
+        let next = next_hop(frame.node, frame.packet.destination)
+        let node = match next { Some(value) => value, None => u8(0) }
+        if node == 0 {
+            print("DROP_NO_ROUTE")
+            print(frame.packet.sequence)
+            dropped += 1
+            continue
+        }
+        if queue.len() >= 5 {
+            print("DROP_QUEUE_FULL")
+            print(frame.packet.sequence)
+            dropped += 1
+        } else {
+            print("FORWARD")
+            print(frame.packet.sequence)
+            print(node)
+            forwarded += 1
+            queue.push(Frame {
+                node: node,
+                packet: Packet {
+                    source: frame.packet.source,
+                    destination: frame.packet.destination,
+                    sequence: frame.packet.sequence,
+                    hop_limit: frame.packet.hop_limit - u8(1),
+                    payload: frame.packet.payload,
+                    authenticator: frame.packet.authenticator,
+                },
+            })
+        }
+    }
+
+    print("SUMMARY")
+    print(delivered)
+    print(forwarded)
+    print(dropped)
+    print(steps)
+    return Ok(delivered == 2 && forwarded == 6 && dropped == 5 && steps == 11)
+}
+
+fn run() -> Result<bool, CryptoError> uses Pure {
+    let key_one_bytes: List<u8> = List.of(
+        u8(79), u8(117), u8(116), u8(101), u8(114), u8(110), u8(101), u8(116),
+        u8(45), u8(80), u8(101), u8(101), u8(114), u8(45), u8(75), u8(101),
+        u8(121)
+    )
+    let key_two_bytes: List<u8> = List.of(
+        u8(80), u8(101), u8(101), u8(114), u8(45), u8(84), u8(119), u8(111),
+        u8(45), u8(79), u8(117), u8(116), u8(101), u8(114), u8(110), u8(101),
+        u8(116)
+    )
+    let key_one = Crypto.import_secret(key_one_bytes)?
+    let key_two = Crypto.import_secret(key_two_bytes)?
+    return simulate(key_one, key_two)
+}
+
+fn main() uses Pure {
+    print(run())
+}

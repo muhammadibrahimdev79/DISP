@@ -1,0 +1,82 @@
+fn add(left: u32, right: u32) -> u32 {
+    return left + right
+}
+
+fn nested(value: u32) -> u32 {
+    return add(value, add(2, 3))
+}
+
+fn signed_half(value: i32) -> i32 {
+    return value / -2
+}
+
+fn is_ordered(signed: i32, wide: u32) -> bool {
+    return signed < -1 && wide > 3999999999
+}
+
+fn loop_total() -> u16 {
+    var outer: u16 = 0
+    var total: u16 = 0
+    loop {
+        outer += 1
+        if outer > 3 {
+            break
+        }
+        var inner: u16 = 0
+        loop {
+            inner += 1
+            if inner == 2 {
+                continue
+            }
+            if inner > 3 {
+                break
+            }
+            total += outer
+        }
+    }
+    return total
+}
+
+fn factorial(value: u16) -> u16 {
+    if value <= 1 {
+        return 1
+    }
+    var previous: u16 = value - 1
+    var partial: u16 = factorial(previous)
+    return value * partial
+}
+
+fn byte_total(left: u8, right: u8) -> u8 {
+    return left + right
+}
+
+fn main() {
+    if false {
+        print("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+    }
+    var total: u16 = 0
+    var next: u16 = 1
+    while next <= 10 {
+        total += next
+        next += 1
+    }
+    print(total)
+    var wide: u32 = add(4000000000, 5)
+    print(wide)
+    var wide_divisor: u32 = 5
+    var wide_quotient: u32 = wide / wide_divisor
+    print(wide_quotient)
+    var signed: i32 = -2000000000
+    signed -= 100
+    print(signed)
+    var signed_quotient: i32 = signed_half(signed)
+    print(signed_quotient)
+    var minimum: i32 = -2147483648
+    print(minimum)
+    var ordered: bool = is_ordered(signed, wide)
+    print(ordered)
+    print(nested(10))
+    print(loop_total())
+    print(factorial(6))
+    print(byte_total(250, 3))
+}

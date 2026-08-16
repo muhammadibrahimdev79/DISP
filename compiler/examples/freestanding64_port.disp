@@ -1,0 +1,13 @@
+fn probe() -> u8 uses DeviceIo {
+    var status: u8 = 0
+    unsafe uses DeviceIo {
+        status = Port.read_u8(u16(146))
+        Port.write_u8(u16(233), u8(80))
+    }
+    return status
+}
+
+fn main() {
+    var ignored: u8 = probe()
+    print("ort I/O authorized in x86-64")
+}

@@ -1,0 +1,5 @@
+fn double(value: int) -> int = value * 2
+
+fn main() {
+    print(double(21))
+}

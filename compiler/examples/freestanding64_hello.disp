@@ -1,0 +1,4 @@
+fn main() {
+    print("Hello from 64-bit DISP")
+    print("Long mode, four-level paging, 64-bit IDT")
+}

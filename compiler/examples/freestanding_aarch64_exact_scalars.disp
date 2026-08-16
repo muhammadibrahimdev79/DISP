@@ -1,0 +1,21 @@
+fn main() {
+    var byte: u8 = 250
+    byte += 5
+
+    var word: u16 = 60000
+    word /= 3
+
+    var signed: i32 = -6
+    signed *= 7
+    signed /= 1
+
+    let minimum: i32 = -2147483648
+    let ready: bool = byte == 255 && word == 20000 && signed == -42
+
+    print("AArch64 exact scalar output")
+    print(byte)
+    print(word)
+    print(signed)
+    print(minimum)
+    print(ready)
+}

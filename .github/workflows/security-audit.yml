@@ -1,0 +1,345 @@
+name: Dependency security audit
+
+on:
+  push:
+    paths:
+      - "compiler/Cargo.toml"
+      - "compiler/Cargo.lock"
+      - "compiler/crypto-native/Cargo.toml"
+      - "compiler/crypto-native/Cargo.lock"
+      - "compiler/fuzz/Cargo.toml"
+      - "compiler/fuzz/Cargo.lock"
+      - "compiler/.cargo/audit.toml"
+      - ".github/workflows/security-audit.yml"
+  pull_request:
+    paths:
+      - "compiler/Cargo.toml"
+      - "compiler/Cargo.lock"
+      - "compiler/crypto-native/Cargo.toml"
+      - "compiler/crypto-native/Cargo.lock"
+      - "compiler/fuzz/Cargo.toml"
+      - "compiler/fuzz/Cargo.lock"
+      - "compiler/.cargo/audit.toml"
+      - ".github/workflows/security-audit.yml"
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SECURITY_NIGHTLY: nightly-2026-08-15
+
+concurrency:
+  group: dependency-security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rustsec:
+    name: RustSec locked dependency graph
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    defaults:
+      run:
+        working-directory: compiler
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v6
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Select stable Rust
+        run: rustup default stable
+
+      - name: Install Linux native dependencies
+        run: sudo apt-get update && sudo apt-get install --yes build-essential pkg-config libssl-dev
+
+      - name: Install pinned cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Install pinned cargo-auditable
+        run: cargo install cargo-auditable --version 0.7.4 --locked
+
+      - name: Reject vulnerable, unsound, unmaintained, notice, or yanked dependencies
+        run: |
+          cargo audit
+          cargo audit --file crypto-native/Cargo.lock
+          cargo audit --file fuzz/Cargo.lock
+
+      - name: Build release artifacts with embedded dependency provenance
+        run: |
+          cargo auditable build --release --locked
+          cargo auditable build --release --locked --manifest-path crypto-native/Cargo.toml
+
+      - name: Audit the produced compiler and cryptographic companion
+        run: |
+          cargo audit bin target/release/disp
+          cargo audit bin crypto-native/target/release/libdisp_crypto_native.so
+
+      - name: Generate and verify locked CycloneDX release SBOMs
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --pretty=%ct)"
+          python ../tools/security/test_generate_sbom.py
+          python ../tools/security/generate_sbom.py --manifest Cargo.toml \
+            --artifact target/release/disp --output target/sbom/disp.cdx.json
+          python ../tools/security/generate_sbom.py --manifest crypto-native/Cargo.toml \
+            --artifact crypto-native/target/release/libdisp_crypto_native.so \
+            --output target/sbom/crypto-native.cdx.json
+          python ../tools/security/generate_sbom.py --manifest fuzz/Cargo.toml \
+            --output target/sbom/fuzz.cdx.json
+          python ../tools/security/verify_sbom.py --require-native target/sbom/disp.cdx.json
+          python ../tools/security/verify_sbom.py --require-native target/sbom/crypto-native.cdx.json
+          python ../tools/security/verify_sbom.py target/sbom/fuzz.cdx.json
+
+      - name: Publish verified CycloneDX SBOMs
+        uses: actions/upload-artifact@v4
+        with:
+          name: disp-linux-cyclonedx-sboms
+          path: compiler/target/sbom/*.cdx.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attest Linux release build provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            compiler/target/release/disp
+            compiler/crypto-native/target/release/libdisp_crypto_native.so
+            compiler/target/sbom/*.cdx.json
+
+      - name: Attest Linux compiler SBOM
+        if: github.event_name != 'pull_request'
+        uses: actions/attest@v4
+        with:
+          subject-path: compiler/target/release/disp
+          sbom-path: compiler/target/sbom/disp.cdx.json
+
+      - name: Attest Linux crypto-companion SBOM
+        if: github.event_name != 'pull_request'
+        uses: actions/attest@v4
+        with:
+          subject-path: compiler/crypto-native/target/release/libdisp_crypto_native.so
+          sbom-path: compiler/target/sbom/crypto-native.cdx.json
+
+  fuzz-smoke:
+    name: libFuzzer trust-boundary smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: compiler
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v6
+
+      - name: Install nightly Rust with sanitizer support
+        run: rustup toolchain install ${SECURITY_NIGHTLY} --profile minimal
+
+      - name: Install Linux native dependencies
+        run: sudo apt-get update && sudo apt-get install --yes build-essential pkg-config libssl-dev
+
+      - name: Install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+
+      - name: Fuzz lexer, frontend, and security frames
+        run: |
+          cargo +${SECURITY_NIGHTLY} fuzz run lexer -- -max_total_time=20 -timeout=5
+          cargo +${SECURITY_NIGHTLY} fuzz run frontend -- -max_total_time=20 -timeout=5
+          cargo +${SECURITY_NIGHTLY} fuzz run security_frames -- -max_total_time=40 -timeout=5 -dict=${{ github.workspace }}/compiler/fuzz/dictionaries/security_frames.dict
+
+  rust-sanitizers:
+    name: Rust AddressSanitizer and LeakSanitizer
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: compiler
+    env:
+      RUSTFLAGS: -Zsanitizer=address
+      RUSTDOCFLAGS: -Zsanitizer=address
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:abort_on_error=1
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v6
+
+      - name: Install pinned nightly Rust
+        run: rustup toolchain install ${SECURITY_NIGHTLY} --profile minimal
+
+      - name: Install Linux native dependencies
+        run: sudo apt-get update && sudo apt-get install --yes build-essential pkg-config libssl-dev
+
+      - name: Run high-risk Rust regression suites under ASan and LSan
+        run: |
+          cargo +${SECURITY_NIGHTLY} test --locked --target x86_64-unknown-linux-gnu --all-features \
+            --lib --test crypto --test crypto_native_abi --test fuzz_smoke \
+            --test security_governance -- --test-threads=1
+
+  windows-release-security:
+    name: Windows release provenance and native SBOM
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    defaults:
+      run:
+        working-directory: compiler
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v6
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Select stable Rust
+        run: rustup default stable
+
+      - name: Install pinned artifact security tools
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-auditable --version 0.7.4 --locked
+
+      - name: Build auditable Windows release artifacts
+        run: |
+          cargo auditable build --release --locked
+          cargo auditable build --release --locked --manifest-path crypto-native/Cargo.toml
+
+      - name: Audit embedded Windows artifact dependency graphs
+        run: |
+          cargo audit bin target/release/disp.exe
+          cargo audit bin crypto-native/target/release/disp_crypto_native.dll
+
+      - name: Generate and verify Windows PE-import CycloneDX SBOMs
+        run: |
+          $env:SOURCE_DATE_EPOCH = git log -1 --pretty=%ct
+          python ../tools/security/test_generate_sbom.py
+          python ../tools/security/generate_sbom.py --manifest Cargo.toml --artifact target/release/disp.exe --output target/sbom/disp-windows.cdx.json
+          python ../tools/security/generate_sbom.py --manifest crypto-native/Cargo.toml --artifact crypto-native/target/release/disp_crypto_native.dll --output target/sbom/crypto-native-windows.cdx.json
+          python ../tools/security/verify_sbom.py --require-native target/sbom/disp-windows.cdx.json
+          python ../tools/security/verify_sbom.py --require-native target/sbom/crypto-native-windows.cdx.json
+
+      - name: Publish verified Windows CycloneDX SBOMs
+        uses: actions/upload-artifact@v4
+        with:
+          name: disp-windows-cyclonedx-sboms
+          path: compiler/target/sbom/*-windows.cdx.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attest Windows release build provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            compiler/target/release/disp.exe
+            compiler/crypto-native/target/release/disp_crypto_native.dll
+            compiler/target/sbom/*-windows.cdx.json
+
+      - name: Attest Windows compiler SBOM
+        if: github.event_name != 'pull_request'
+        uses: actions/attest@v4
+        with:
+          subject-path: compiler/target/release/disp.exe
+          sbom-path: compiler/target/sbom/disp-windows.cdx.json
+
+      - name: Attest Windows crypto-companion SBOM
+        if: github.event_name != 'pull_request'
+        uses: actions/attest@v4
+        with:
+          subject-path: compiler/crypto-native/target/release/disp_crypto_native.dll
+          sbom-path: compiler/target/sbom/crypto-native-windows.cdx.json
+
+  macos-release-security:
+    name: macOS release provenance and native SBOM
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    defaults:
+      run:
+        working-directory: compiler
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v6
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Select stable Rust
+        run: rustup default stable
+
+      - name: Install pinned artifact security tools
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-auditable --version 0.7.4 --locked
+
+      - name: Build auditable macOS release artifacts
+        run: |
+          cargo auditable build --release --locked
+          cargo auditable build --release --locked --manifest-path crypto-native/Cargo.toml
+
+      - name: Audit embedded macOS artifact dependency graphs
+        run: |
+          cargo audit bin target/release/disp
+          cargo audit bin crypto-native/target/release/libdisp_crypto_native.dylib
+
+      - name: Generate and verify macOS Mach-O CycloneDX SBOMs
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --pretty=%ct)"
+          python ../tools/security/test_generate_sbom.py
+          python ../tools/security/generate_sbom.py --manifest Cargo.toml \
+            --artifact target/release/disp --output target/sbom/disp-macos.cdx.json
+          python ../tools/security/generate_sbom.py --manifest crypto-native/Cargo.toml \
+            --artifact crypto-native/target/release/libdisp_crypto_native.dylib \
+            --output target/sbom/crypto-native-macos.cdx.json
+          python ../tools/security/verify_sbom.py --require-native target/sbom/disp-macos.cdx.json
+          python ../tools/security/verify_sbom.py --require-native target/sbom/crypto-native-macos.cdx.json
+
+      - name: Publish verified macOS CycloneDX SBOMs
+        uses: actions/upload-artifact@v4
+        with:
+          name: disp-macos-cyclonedx-sboms
+          path: compiler/target/sbom/*-macos.cdx.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attest macOS release build provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            compiler/target/release/disp
+            compiler/crypto-native/target/release/libdisp_crypto_native.dylib
+            compiler/target/sbom/*-macos.cdx.json
+
+      - name: Attest macOS compiler SBOM
+        if: github.event_name != 'pull_request'
+        uses: actions/attest@v4
+        with:
+          subject-path: compiler/target/release/disp
+          sbom-path: compiler/target/sbom/disp-macos.cdx.json
+
+      - name: Attest macOS crypto-companion SBOM
+        if: github.event_name != 'pull_request'
+        uses: actions/attest@v4
+        with:
+          subject-path: compiler/crypto-native/target/release/libdisp_crypto_native.dylib
+          sbom-path: compiler/target/sbom/crypto-native-macos.cdx.json

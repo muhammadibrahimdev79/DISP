@@ -9,9 +9,11 @@ use std::collections::{HashMap, HashSet};
 enum Ty {
     Copy,
     Owned(String),
+    Nominal(String, Vec<Ty>),
     Generic(String),
     Reference(Box<Ty>, bool),
     RawPointer(Box<Ty>, bool),
+    MemoryPointer(Box<Ty>, bool),
     Option(Box<Ty>),
     Result(Box<Ty>, Box<Ty>),
     Array(Box<Ty>),
@@ -24,10 +26,12 @@ enum Ty {
     Task(Box<Ty>),
     Mutex(Box<Ty>),
     MutexGuard(Box<Ty>),
+    Channel(Box<Ty>),
     AtomicInt,
     Str,
     CString,
     CStr,
+    CRegistration,
     Memory,
     Path,
     Url,
@@ -45,6 +49,100 @@ enum Ty {
     Duration,
     Function,
     Unit,
+}
+
+fn substitute_ownership_ty(ty: Ty, substitutions: &HashMap<String, Ty>) -> Ty {
+    match ty {
+        Ty::Generic(name) => substitutions
+            .get(&name)
+            .cloned()
+            .unwrap_or(Ty::Generic(name)),
+        Ty::Nominal(name, arguments) => Ty::Nominal(
+            name,
+            arguments
+                .into_iter()
+                .map(|argument| substitute_ownership_ty(argument, substitutions))
+                .collect(),
+        ),
+        Ty::Reference(inner, mutable) => Ty::Reference(
+            Box::new(substitute_ownership_ty(*inner, substitutions)),
+            mutable,
+        ),
+        Ty::RawPointer(inner, mutable) => Ty::RawPointer(
+            Box::new(substitute_ownership_ty(*inner, substitutions)),
+            mutable,
+        ),
+        Ty::MemoryPointer(inner, mutable) => Ty::MemoryPointer(
+            Box::new(substitute_ownership_ty(*inner, substitutions)),
+            mutable,
+        ),
+        Ty::Option(inner) => Ty::Option(Box::new(substitute_ownership_ty(*inner, substitutions))),
+        Ty::Result(ok, error) => Ty::Result(
+            Box::new(substitute_ownership_ty(*ok, substitutions)),
+            Box::new(substitute_ownership_ty(*error, substitutions)),
+        ),
+        Ty::Array(inner) => Ty::Array(Box::new(substitute_ownership_ty(*inner, substitutions))),
+        Ty::Slice(inner) => Ty::Slice(Box::new(substitute_ownership_ty(*inner, substitutions))),
+        Ty::List(inner) => Ty::List(Box::new(substitute_ownership_ty(*inner, substitutions))),
+        Ty::Map(key, value) => Ty::Map(
+            Box::new(substitute_ownership_ty(*key, substitutions)),
+            Box::new(substitute_ownership_ty(*value, substitutions)),
+        ),
+        Ty::Set(inner) => Ty::Set(Box::new(substitute_ownership_ty(*inner, substitutions))),
+        Ty::Thread(inner) => Ty::Thread(Box::new(substitute_ownership_ty(*inner, substitutions))),
+        Ty::Future(inner) => Ty::Future(Box::new(substitute_ownership_ty(*inner, substitutions))),
+        Ty::Task(inner) => Ty::Task(Box::new(substitute_ownership_ty(*inner, substitutions))),
+        Ty::Mutex(inner) => Ty::Mutex(Box::new(substitute_ownership_ty(*inner, substitutions))),
+        Ty::MutexGuard(inner) => {
+            Ty::MutexGuard(Box::new(substitute_ownership_ty(*inner, substitutions)))
+        }
+        Ty::Channel(inner) => Ty::Channel(Box::new(substitute_ownership_ty(*inner, substitutions))),
+        other => other,
+    }
+}
+
+fn collect_ownership_substitutions(
+    template: &Ty,
+    actual: &Ty,
+    substitutions: &mut HashMap<String, Ty>,
+) {
+    match (template, actual) {
+        (Ty::Generic(name), actual) => {
+            substitutions
+                .entry(name.clone())
+                .or_insert_with(|| actual.clone());
+        }
+        (
+            Ty::Nominal(template_name, template_arguments),
+            Ty::Nominal(actual_name, actual_arguments),
+        ) if template_name == actual_name => {
+            for (template, actual) in template_arguments.iter().zip(actual_arguments) {
+                collect_ownership_substitutions(template, actual, substitutions);
+            }
+        }
+        (Ty::Reference(template, _), Ty::Reference(actual, _))
+        | (Ty::RawPointer(template, _), Ty::RawPointer(actual, _))
+        | (Ty::MemoryPointer(template, _), Ty::MemoryPointer(actual, _))
+        | (Ty::Option(template), Ty::Option(actual))
+        | (Ty::Array(template), Ty::Array(actual))
+        | (Ty::Slice(template), Ty::Slice(actual))
+        | (Ty::List(template), Ty::List(actual))
+        | (Ty::Set(template), Ty::Set(actual))
+        | (Ty::Thread(template), Ty::Thread(actual))
+        | (Ty::Future(template), Ty::Future(actual))
+        | (Ty::Task(template), Ty::Task(actual))
+        | (Ty::Mutex(template), Ty::Mutex(actual))
+        | (Ty::MutexGuard(template), Ty::MutexGuard(actual))
+        | (Ty::Channel(template), Ty::Channel(actual)) => {
+            collect_ownership_substitutions(template, actual, substitutions);
+        }
+        (Ty::Result(template_ok, template_error), Ty::Result(actual_ok, actual_error))
+        | (Ty::Map(template_ok, template_error), Ty::Map(actual_ok, actual_error)) => {
+            collect_ownership_substitutions(template_ok, actual_ok, substitutions);
+            collect_ownership_substitutions(template_error, actual_error, substitutions);
+        }
+        _ => {}
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -74,6 +172,7 @@ struct Slot {
     scope_depth: usize,
     parameter: bool,
     reference_origin: Option<Place>,
+    borrow_origins: Vec<(Place, bool)>,
     closure_origins: Vec<(Place, bool)>,
 }
 
@@ -124,6 +223,7 @@ struct Analyzer<'a> {
     generic_copy: HashSet<String>,
     generic_traits: HashMap<String, Vec<String>>,
     self_type: Option<String>,
+    return_has_reference: bool,
     report: OwnershipReport,
 }
 
@@ -162,6 +262,7 @@ pub fn check(program: &Program) -> Result<OwnershipReport, Diagnostic> {
         generic_copy: HashSet::new(),
         generic_traits: HashMap::new(),
         self_type: None,
+        return_has_reference: false,
         report: OwnershipReport::default(),
     };
     analyzer.validate_copy_implementations()?;
@@ -180,6 +281,80 @@ pub fn check(program: &Program) -> Result<OwnershipReport, Diagnostic> {
 
 impl<'a> Analyzer<'a> {
     fn validate_copy_implementations(&self) -> Result<(), Diagnostic> {
+        for implementation in self
+            .program
+            .implementations
+            .iter()
+            .filter(|implementation| {
+                implementation
+                    .trait_name
+                    .as_ref()
+                    .is_some_and(|trait_name| trait_name.name == "Copy")
+            })
+        {
+            let declaration_generics = self
+                .program
+                .structs
+                .iter()
+                .find(|declaration| declaration.name == implementation.target.name)
+                .map(|declaration| &declaration.generics)
+                .or_else(|| {
+                    self.program
+                        .enums
+                        .iter()
+                        .find(|declaration| declaration.name == implementation.target.name)
+                        .map(|declaration| &declaration.generics)
+                })
+                .unwrap();
+            let implementation_constraints = implementation
+                .generics
+                .iter()
+                .map(|parameter| {
+                    (
+                        parameter.name.as_str(),
+                        parameter
+                            .constraints
+                            .iter()
+                            .map(|constraint| constraint.name.as_str())
+                            .collect::<HashSet<_>>(),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let mut used = HashSet::new();
+            let universal = implementation.target.arguments.len() == declaration_generics.len()
+                && implementation.generics.len() == declaration_generics.len()
+                && implementation
+                    .target
+                    .arguments
+                    .iter()
+                    .zip(declaration_generics)
+                    .all(|(argument, declaration_generic)| {
+                        let expected = declaration_generic
+                            .constraints
+                            .iter()
+                            .map(|constraint| constraint.name.as_str())
+                            .collect::<HashSet<_>>();
+                        argument.qualifier == TypeQualifier::Owned
+                            && argument.arguments.is_empty()
+                            && used.insert(argument.name.as_str())
+                            && implementation_constraints
+                                .get(argument.name.as_str())
+                                .is_some_and(|actual| *actual == expected)
+                    });
+            if !universal {
+                return Err(Diagnostic::new(
+                    DiagnosticKind::Type,
+                    format!(
+                        "`Copy` implementation for `{}` must cover every permitted instantiation",
+                        implementation.target.name
+                    ),
+                    implementation.span,
+                )
+                .with_help(
+                    "use one implementation generic per aggregate generic and mirror its declaration constraints",
+                ));
+            }
+        }
         for declaration in &self.program.structs {
             if self.copy_types.contains(&declaration.name) {
                 let generic_copy = declaration
@@ -254,12 +429,11 @@ impl<'a> Analyzer<'a> {
             })
             .collect();
         self.push_scope();
-        let return_ty = function
+        self.return_has_reference = function
             .return_type
             .as_ref()
-            .map(|ty| self.ty_from_name(ty))
-            .unwrap_or(Ty::Unit);
-        if ty_contains_reference(&return_ty)
+            .is_some_and(|ty| self.type_name_contains_reference(ty));
+        if self.return_has_reference
             && function
                 .parameters
                 .iter()
@@ -289,13 +463,24 @@ impl<'a> Analyzer<'a> {
             )?;
             let slot = self.slots.get_mut(&id).unwrap();
             slot.parameter = true;
-            if matches!(ty, Ty::Slice(_) | Ty::Str | Ty::CStr) {
-                slot.reference_origin = Some(Place {
+            if matches!(&ty, Ty::Slice(_) | Ty::Str | Ty::CStr) {
+                let origin = Place {
                     root: id,
                     fields: vec![],
-                });
+                };
+                slot.reference_origin = Some(origin.clone());
+                slot.borrow_origins.push((origin, false));
+            } else if let Ty::Reference(_, mutable)
+            | Ty::RawPointer(_, mutable)
+            | Ty::MemoryPointer(_, mutable) = &ty
+            {
+                let origin = Place {
+                    root: id,
+                    fields: vec![],
+                };
+                slot.borrow_origins.push((origin, *mutable));
             }
-            if matches!(ty, Ty::Function) {
+            if matches!(&ty, Ty::Function) {
                 // A callable parameter may carry captures chosen by its caller.
                 // Keep that hidden lifetime symbolic so it cannot be smuggled
                 // into a return value or longer-lived aggregate.
@@ -448,12 +633,7 @@ impl<'a> Analyzer<'a> {
                         true,
                         Some(place.clone()),
                     )?;
-                    self.loans.push(Loan {
-                        place,
-                        mutable: false,
-                        borrower: Some(id),
-                        at: object.span,
-                    });
+                    self.attach_borrow_origins(id, vec![(place, false)], object.span)?;
                     if last_uses.get(name).copied().unwrap_or(index) == index {
                         self.loans.retain(|loan| loan.borrower != Some(id));
                     }
@@ -463,6 +643,10 @@ impl<'a> Analyzer<'a> {
                     .as_ref()
                     .map(|value| self.closure_origins(value))
                     .unwrap_or_default();
+                let borrow_origins = value
+                    .as_ref()
+                    .map(|value| self.borrow_origins(value))
+                    .unwrap_or_default();
                 let (ty, origin) = if let Some(value) = value {
                     let ty = self.check_expr(value, UseMode::Consume)?;
                     (
@@ -470,7 +654,7 @@ impl<'a> Analyzer<'a> {
                             .as_ref()
                             .map(|a| self.ty_from_name(a))
                             .unwrap_or(ty),
-                        self.reference_origin(value),
+                        borrow_origins.first().map(|(place, _)| place.clone()),
                     )
                 } else {
                     (
@@ -487,17 +671,8 @@ impl<'a> Analyzer<'a> {
                     origin.clone(),
                 )?;
                 self.attach_closure_origins(id, closure_origins, *name_span);
-                if let Some(origin) = origin
-                    && ty_contains_reference(&ty)
-                {
-                    let mutable = ty_contains_mutable_reference(&ty);
-                    self.check_borrow(&origin, mutable, *name_span)?;
-                    self.loans.push(Loan {
-                        place: origin,
-                        mutable,
-                        borrower: Some(id),
-                        at: *name_span,
-                    });
+                if !borrow_origins.is_empty() {
+                    self.attach_borrow_origins(id, borrow_origins, *name_span)?;
                     if last_uses.get(name).copied().unwrap_or(index) == index {
                         self.loans.retain(|loan| loan.borrower != Some(id));
                     }
@@ -530,34 +705,21 @@ impl<'a> Analyzer<'a> {
                             true,
                             Some(place.clone()),
                         )?;
-                        self.loans.push(Loan {
-                            place,
-                            mutable: false,
-                            borrower: Some(id),
-                            at: object.span,
-                        });
+                        self.attach_borrow_origins(id, vec![(place, false)], object.span)?;
                         if last_uses.get(name).copied().unwrap_or(index) == index {
                             self.loans.retain(|loan| loan.borrower != Some(id));
                         }
                         return Ok(());
                     }
                     let closure_origins = self.closure_origins(value);
+                    let borrow_origins = self.borrow_origins(value);
                     let ty = self.check_expr(value, UseMode::Consume)?;
-                    let origin = self.reference_origin(value);
+                    let origin = borrow_origins.first().map(|(place, _)| place.clone());
                     let id =
                         self.declare(name, ty.clone(), *name_span, true, true, origin.clone())?;
                     self.attach_closure_origins(id, closure_origins, *name_span);
-                    if let Some(origin) = origin
-                        && ty_contains_reference(&ty)
-                    {
-                        let mutable = ty_contains_mutable_reference(&ty);
-                        self.check_borrow(&origin, mutable, *name_span)?;
-                        self.loans.push(Loan {
-                            place: origin,
-                            mutable,
-                            borrower: Some(id),
-                            at: *name_span,
-                        });
+                    if !borrow_origins.is_empty() {
+                        self.attach_borrow_origins(id, borrow_origins, *name_span)?;
                         if last_uses.get(name).copied().unwrap_or(index) == index {
                             self.loans.retain(|loan| loan.borrower != Some(id));
                         }
@@ -584,6 +746,7 @@ impl<'a> Analyzer<'a> {
             Statement::Return(value) => {
                 if let Some(value) = value {
                     let closure_origins = self.closure_origins(value);
+                    let borrow_origins = self.borrow_origins(value);
                     if let Expression::Identifier(name) = &value.node
                         && self.lookup(name).is_some_and(|id| {
                             self.slots[&id].parameter && matches!(self.slots[&id].ty, Ty::Function)
@@ -610,21 +773,23 @@ impl<'a> Analyzer<'a> {
                         .with_help("return a `move` closure that owns every captured value"));
                     }
                     let ty = self.check_expr(value, UseMode::Consume)?;
-                    if ty_contains_reference(&ty) {
-                        let direct_reference_parameter = match &value.node {
-                            Expression::Identifier(name) => self.lookup(name).is_some_and(|id| {
-                                self.slots[&id].parameter
-                                    && ty_is_borrowed_view(&self.slots[&id].ty)
-                            }),
-                            _ => false,
-                        };
-                        let origin = self.reference_origin(value);
-                        let borrowed_reference_parameter = origin.as_ref().is_some_and(|origin| {
-                            self.slots[&origin.root].parameter
-                                && ty_is_borrowed_view(&self.slots[&origin.root].ty)
-                        });
-                        if !direct_reference_parameter && !borrowed_reference_parameter {
-                            let local = origin.map(|origin| self.slots[&origin.root].name.clone());
+                    if self.return_has_reference
+                        || self.ty_contains_reference(&ty)
+                        || !borrow_origins.is_empty()
+                    {
+                        let roots = borrow_origins
+                            .iter()
+                            .map(|(origin, _)| origin.root)
+                            .collect::<HashSet<_>>();
+                        let borrowed_reference_parameter = roots.len() == 1
+                            && roots.iter().all(|root| {
+                                self.slots[root].parameter
+                                    && ty_is_borrowed_view(&self.slots[root].ty)
+                            });
+                        if !borrowed_reference_parameter {
+                            let local = borrow_origins
+                                .first()
+                                .map(|(origin, _)| self.slots[&origin.root].name.clone());
                             let message = local.map_or_else(
                                 || "returned reference has no provable live origin".to_string(),
                                 |name| format!("cannot return a reference to local `{name}`"),
@@ -834,7 +999,7 @@ impl<'a> Analyzer<'a> {
                         .skip(before.report.drops.len()),
                 );
             }
-            Statement::Unsafe(body) => self.check_block(body)?,
+            Statement::Unsafe { body, .. } => self.check_block(body)?,
             Statement::Break => self.record_live_drops(span, DropReason::Break),
             Statement::Continue => self.record_live_drops(span, DropReason::Continue),
         }
@@ -869,9 +1034,9 @@ impl<'a> Analyzer<'a> {
             ));
         }
         self.ensure_no_conflicting_loan(place, true, span)?;
+        let value_origins = self.borrow_origins(value);
         self.check_expr(value, UseMode::Consume)?;
-        let reference_origin = self.reference_origin(value);
-        if let Some(origin) = &reference_origin {
+        for (origin, _) in &value_origins {
             let target_depth = self.slots[&place.root].scope_depth;
             let origin_depth = self.slots[&origin.root].scope_depth;
             if target_depth < origin_depth {
@@ -885,14 +1050,31 @@ impl<'a> Analyzer<'a> {
                 ));
             }
         }
+        let whole_assignment = place.fields.is_empty();
+        let mut carried_origins = if whole_assignment {
+            Vec::new()
+        } else {
+            self.slots[&place.root].borrow_origins.clone()
+        };
+        let adds_origins = !value_origins.is_empty();
+        carried_origins.extend(value_origins);
         let slot = self.slots.get_mut(&place.root).unwrap();
         if place.fields.is_empty() {
             slot.state = InitState::Initialized;
-            slot.reference_origin = reference_origin;
         } else if let InitState::Partial { fields } = &mut slot.state {
             fields.remove(&place.fields[0]);
             if fields.is_empty() {
                 slot.state = InitState::Initialized;
+            }
+        }
+        if whole_assignment || adds_origins {
+            self.loans.retain(|loan| loan.borrower != Some(place.root));
+            if carried_origins.is_empty() {
+                let slot = self.slots.get_mut(&place.root).unwrap();
+                slot.reference_origin = None;
+                slot.borrow_origins.clear();
+            } else {
+                self.attach_borrow_origins(place.root, carried_origins, span)?;
             }
         }
         Ok(())
@@ -1127,9 +1309,10 @@ impl<'a> Analyzer<'a> {
                 Ok(Ty::Reference(Box::new(ty), *mutable))
             }
             Expression::Dereference(target) => match self.check_expr(target, UseMode::Read)? {
-                Ty::Reference(inner, _) | Ty::RawPointer(inner, _) | Ty::MutexGuard(inner) => {
-                    Ok(*inner)
-                }
+                Ty::Reference(inner, _)
+                | Ty::RawPointer(inner, _)
+                | Ty::MemoryPointer(inner, _)
+                | Ty::MutexGuard(inner) => Ok(*inner),
                 _ => Err(Diagnostic::new(
                     DiagnosticKind::Type,
                     "cannot dereference this value",
@@ -1137,10 +1320,32 @@ impl<'a> Analyzer<'a> {
                 )),
             },
             Expression::StructConstruct { name, fields, .. } => {
-                for field in fields {
-                    self.check_expr(&field.value, UseMode::Consume)?;
-                }
-                Ok(Ty::Owned(name.clone()))
+                let actual_fields = fields
+                    .iter()
+                    .map(|field| {
+                        self.check_expr(&field.value, UseMode::Consume)
+                            .map(|ty| (field.name.as_str(), ty))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let components = self
+                    .program
+                    .structs
+                    .iter()
+                    .find(|declaration| declaration.name == *name)
+                    .map(|declaration| {
+                        declaration
+                            .fields
+                            .iter()
+                            .filter_map(|field| {
+                                actual_fields
+                                    .iter()
+                                    .find(|(actual_name, _)| *actual_name == field.name)
+                                    .map(|(_, actual)| (field.ty.clone(), actual.clone()))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                Ok(self.instantiated_nominal_ty(name, &components))
             }
             Expression::FieldAccess { object, field, .. } => {
                 if matches!(&object.node, Expression::Identifier(name) if self.program.enums.iter().any(|declaration| declaration.name == *name))
@@ -1183,6 +1388,7 @@ impl<'a> Analyzer<'a> {
                 _ => Ok(Ty::Owned("future-output".into())),
             },
             Expression::Match { value, arms } => {
+                let matched_origins = self.borrow_origins(value);
                 let matched = self.check_expr(value, UseMode::Consume)?;
                 let before = self.clone();
                 let mut branch_states = Vec::new();
@@ -1190,7 +1396,29 @@ impl<'a> Analyzer<'a> {
                 for arm in arms {
                     let mut arm_state = before.clone();
                     arm_state.push_scope();
-                    arm_state.bind_pattern(&arm.pattern.node, &matched, arm.pattern.span)?;
+                    arm_state.bind_pattern(
+                        &arm.pattern.node,
+                        &matched,
+                        &matched_origins,
+                        arm.pattern.span,
+                    )?;
+                    if let Some(guard) = &arm.guard {
+                        let loan_start = arm_state.loans.len();
+                        arm_state
+                            .loans
+                            .extend(arm_state.slots.keys().copied().map(|root| Loan {
+                                place: Place {
+                                    root,
+                                    fields: vec![],
+                                },
+                                mutable: false,
+                                borrower: None,
+                                at: guard.span,
+                            }));
+                        let guard_result = arm_state.check_expr(guard, UseMode::Read);
+                        arm_state.loans.truncate(loan_start);
+                        guard_result?;
+                    }
                     result = arm_state.check_expr(&arm.value, mode)?;
                     arm_state.pop_scope(arm.span, DropReason::ScopeEnd);
                     branch_states.push(arm_state);
@@ -1521,12 +1749,17 @@ impl<'a> Analyzer<'a> {
                         | "Process"
                         | "Database"
                         | "DataStore"
+                        | "Crypto"
+                        | "Port"
+                        | "Mmio"
                 )
             {
                 for argument in arguments {
                     self.check_expr(
                         argument,
-                        if owner == "Process" && field == "command" {
+                        if (owner == "Process" && field == "command")
+                            || (owner == "Crypto" && field == "import_secret")
+                        {
                             UseMode::Consume
                         } else {
                             UseMode::Read
@@ -1556,6 +1789,7 @@ impl<'a> Analyzer<'a> {
                     }
                     ("Time", "now") => Ty::Instant,
                     ("Time", "unix_seconds") => Ty::Copy,
+                    ("Time", "ticks") => Ty::Copy,
                     ("Time", "sleep") => Ty::Unit,
                     ("Duration", _) => Ty::Duration,
                     ("Environment", "arguments") => Ty::List(Box::new(Ty::Owned("String".into()))),
@@ -1569,6 +1803,88 @@ impl<'a> Analyzer<'a> {
                         Box::new(Ty::Owned("Database".into())),
                         Box::new(Ty::Owned("DataError".into())),
                     ),
+                    ("Crypto", "random_bytes") => Ty::Result(
+                        Box::new(Ty::List(Box::new(Ty::Copy))),
+                        Box::new(Ty::Owned("CryptoError".into())),
+                    ),
+                    ("Crypto", "random_secret" | "import_secret") => Ty::Result(
+                        Box::new(Ty::Owned("SecretBytes".into())),
+                        Box::new(Ty::Owned("CryptoError".into())),
+                    ),
+                    ("Crypto", "sha256" | "hmac_sha256") => Ty::Result(
+                        Box::new(Ty::List(Box::new(Ty::Copy))),
+                        Box::new(Ty::Owned("CryptoError".into())),
+                    ),
+                    ("Crypto", "hmac_sha256_verify") => Ty::Result(
+                        Box::new(Ty::Copy),
+                        Box::new(Ty::Owned("CryptoError".into())),
+                    ),
+                    ("Crypto", "hkdf_sha256") => Ty::Result(
+                        Box::new(Ty::Owned("SecretBytes".into())),
+                        Box::new(Ty::Owned("CryptoError".into())),
+                    ),
+                    ("Crypto", "aes256_gcm_siv_seal") => Ty::Result(
+                        Box::new(Ty::Owned("AeadEnvelope".into())),
+                        Box::new(Ty::Owned("CryptoError".into())),
+                    ),
+                    ("Crypto", "aes256_gcm_siv_open") => Ty::Result(
+                        Box::new(Ty::Owned("SecretBytes".into())),
+                        Box::new(Ty::Owned("CryptoError".into())),
+                    ),
+                    ("Crypto", "encode_aead_envelope") => Ty::Result(
+                        Box::new(Ty::List(Box::new(Ty::Copy))),
+                        Box::new(Ty::Owned("CryptoError".into())),
+                    ),
+                    ("Crypto", "decode_aead_envelope") => Ty::Result(
+                        Box::new(Ty::Owned("AeadEnvelope".into())),
+                        Box::new(Ty::Owned("CryptoError".into())),
+                    ),
+                    ("Crypto", "ed25519_generate") => Ty::Result(
+                        Box::new(Ty::Owned("Ed25519SigningKey".into())),
+                        Box::new(Ty::Owned("CryptoError".into())),
+                    ),
+                    ("Crypto", "ed25519_public_key" | "ed25519_sign") => Ty::Result(
+                        Box::new(Ty::List(Box::new(Ty::Copy))),
+                        Box::new(Ty::Owned("CryptoError".into())),
+                    ),
+                    ("Crypto", "ed25519_verify") => Ty::Result(
+                        Box::new(Ty::Copy),
+                        Box::new(Ty::Owned("CryptoError".into())),
+                    ),
+                    ("Crypto", "ed25519_key_id") => Ty::Result(
+                        Box::new(Ty::List(Box::new(Ty::Copy))),
+                        Box::new(Ty::Owned("CryptoError".into())),
+                    ),
+                    ("Crypto", "ed25519_verify_keyed") => Ty::Result(
+                        Box::new(Ty::Copy),
+                        Box::new(Ty::Owned("CryptoError".into())),
+                    ),
+                    ("Crypto", "ed25519_verify_lifecycle") => Ty::Result(
+                        Box::new(Ty::Copy),
+                        Box::new(Ty::Owned("CryptoError".into())),
+                    ),
+                    (
+                        "Crypto",
+                        "encode_ed25519_public_key"
+                        | "decode_ed25519_public_key"
+                        | "encode_ed25519_signature"
+                        | "decode_ed25519_signature",
+                    ) => Ty::Result(
+                        Box::new(Ty::List(Box::new(Ty::Copy))),
+                        Box::new(Ty::Owned("CryptoError".into())),
+                    ),
+                    ("Crypto", "argon2id_hash_password") => Ty::Result(
+                        Box::new(Ty::Owned("String".into())),
+                        Box::new(Ty::Owned("CryptoError".into())),
+                    ),
+                    ("Crypto", "argon2id_verify_password") => Ty::Result(
+                        Box::new(Ty::Copy),
+                        Box::new(Ty::Owned("CryptoError".into())),
+                    ),
+                    ("Port", "read_u8") => Ty::Copy,
+                    ("Port", "write_u8") => Ty::Unit,
+                    ("Mmio", "read_u8" | "read_u16" | "read_u32") => Ty::Copy,
+                    ("Mmio", "write_u8" | "write_u16" | "write_u32") => Ty::Unit,
                     _ => Ty::Unit,
                 });
             }
@@ -1623,6 +1939,30 @@ impl<'a> Analyzer<'a> {
                     Box::new(Ty::Owned("String".into())),
                 ));
             }
+            if matches!(&object.node, Expression::Identifier(name) if name == "CExport")
+                && field == "callback"
+                && arguments.len() == 1
+            {
+                self.check_expr(&arguments[0], UseMode::Read)?;
+                return Ok(Ty::Copy);
+            }
+            if matches!(&object.node, Expression::Identifier(name) if name == "CRegistration")
+                && ((field == "adopt" && arguments.len() == 2)
+                    || (field == "adopt_async" && arguments.len() == 3)
+                    || (field == "register_async" && arguments.len() == 4))
+            {
+                for (index, argument) in arguments.iter().enumerate() {
+                    self.check_expr(
+                        argument,
+                        if field == "register_async" && index == 0 {
+                            UseMode::Consume
+                        } else {
+                            UseMode::Read
+                        },
+                    )?;
+                }
+                return Ok(Ty::CRegistration);
+            }
             if matches!(&object.node, Expression::Identifier(name) if name == "Memory")
                 && field == "allocate"
                 && arguments.len() == 2
@@ -1661,6 +2001,16 @@ impl<'a> Analyzer<'a> {
             {
                 self.check_expr(&arguments[0], UseMode::Read)?;
                 return Ok(Ty::AtomicInt);
+            }
+            if matches!(&object.node, Expression::Identifier(name) if name == "Channel")
+                && field == "bounded"
+                && arguments.len() == 1
+            {
+                self.check_expr(&arguments[0], UseMode::Read)?;
+                return Ok(Ty::Result(
+                    Box::new(Ty::Channel(Box::new(Ty::Owned("inferred".into())))),
+                    Box::new(Ty::Owned("String".into())),
+                ));
             }
             if matches!(&object.node, Expression::Identifier(name) if name == "Map") {
                 for argument in arguments {
@@ -2008,6 +2358,16 @@ impl<'a> Analyzer<'a> {
                 self.check_expr(object, UseMode::Consume)?;
                 return Ok(*result);
             }
+            if matches!(self.expr_ty(object), Ok(Ty::Task(_))) && arguments.is_empty() {
+                if field == "cancel" {
+                    self.check_expr(object, UseMode::Consume)?;
+                    return Ok(Ty::Unit);
+                }
+                if field == "is_finished" {
+                    self.check_expr(object, UseMode::Read)?;
+                    return Ok(Ty::Copy);
+                }
+            }
             if let Ok(Ty::Mutex(value)) = self.expr_ty(object) {
                 if field == "share" && arguments.is_empty() {
                     self.check_expr(object, UseMode::Read)?;
@@ -2018,6 +2378,25 @@ impl<'a> Analyzer<'a> {
                     return Ok(Ty::MutexGuard(value));
                 }
             }
+            if let Ok(Ty::Channel(value)) = self.expr_ty(object) {
+                self.check_expr(object, UseMode::Read)?;
+                for argument in arguments {
+                    self.check_expr(
+                        argument,
+                        if field == "send" {
+                            UseMode::Consume
+                        } else {
+                            UseMode::Read
+                        },
+                    )?;
+                }
+                return Ok(match field.as_str() {
+                    "share" => Ty::Channel(value),
+                    "receive" => Ty::Option(value),
+                    "close" => Ty::Unit,
+                    _ => Ty::Copy,
+                });
+            }
             if matches!(self.expr_ty(object), Ok(Ty::AtomicInt)) {
                 self.check_expr(object, UseMode::Read)?;
                 for argument in arguments {
@@ -2025,7 +2404,7 @@ impl<'a> Analyzer<'a> {
                 }
                 return Ok(match field.as_str() {
                     "share" => Ty::AtomicInt,
-                    "store" => Ty::Unit,
+                    name if name.starts_with("store") => Ty::Unit,
                     _ => Ty::Copy,
                 });
             }
@@ -2047,6 +2426,17 @@ impl<'a> Analyzer<'a> {
                     _ => Ty::Copy,
                 });
             }
+            if matches!(self.expr_ty(object), Ok(Ty::CRegistration)) {
+                self.check_expr(
+                    object,
+                    if field == "close" {
+                        UseMode::Consume
+                    } else {
+                        UseMode::Read
+                    },
+                )?;
+                return Ok(if field == "close" { Ty::Unit } else { Ty::Copy });
+            }
             if matches!(self.expr_ty(object), Ok(Ty::CStr)) {
                 self.check_expr(object, UseMode::Read)?;
                 return Ok(if field == "to_string" {
@@ -2054,6 +2444,13 @@ impl<'a> Analyzer<'a> {
                 } else {
                     Ty::Copy
                 });
+            }
+            if matches!(self.expr_ty(object), Ok(Ty::Owned(name)) if name == "SecretBytes") {
+                self.check_expr(object, UseMode::Read)?;
+                for argument in arguments {
+                    self.check_expr(argument, UseMode::Read)?;
+                }
+                return Ok(Ty::Copy);
             }
             if matches!(self.expr_ty(object), Ok(Ty::Memory)) {
                 if matches!(
@@ -2069,12 +2466,13 @@ impl<'a> Analyzer<'a> {
                     self.check_expr(argument, UseMode::Read)?;
                 }
                 return Ok(match field.as_str() {
-                    "as_ptr" => Ty::RawPointer(Box::new(Ty::Copy), false),
-                    "as_mut_ptr" => Ty::RawPointer(Box::new(Ty::Copy), true),
+                    "as_ptr" => Ty::MemoryPointer(Box::new(Ty::Copy), false),
+                    "as_mut_ptr" => Ty::MemoryPointer(Box::new(Ty::Copy), true),
                     _ => Ty::Copy,
                 });
             }
-            if let Ok(Ty::RawPointer(inner, mutable)) = self.expr_ty(object)
+            if let Ok(Ty::RawPointer(inner, mutable) | Ty::MemoryPointer(inner, mutable)) =
+                self.expr_ty(object)
                 && matches!(field.as_str(), "offset" | "read" | "write")
             {
                 self.check_expr(object, UseMode::Read)?;
@@ -2082,7 +2480,10 @@ impl<'a> Analyzer<'a> {
                     self.check_expr(argument, UseMode::Read)?;
                 }
                 return Ok(match field.as_str() {
-                    "offset" => Ty::RawPointer(inner, mutable),
+                    "offset" => match self.expr_ty(object)? {
+                        Ty::MemoryPointer(_, _) => Ty::MemoryPointer(inner, mutable),
+                        _ => Ty::RawPointer(inner, mutable),
+                    },
                     "read" => *inner,
                     _ => Ty::Unit,
                 });
@@ -2243,14 +2644,36 @@ impl<'a> Analyzer<'a> {
             }
             if matches!(&object.node, Expression::Identifier(name) if self.program.enums.iter().any(|declaration| declaration.name == *name))
             {
-                for argument in arguments {
-                    self.check_expr(argument, UseMode::Consume)?;
-                }
+                let actual_payload = arguments
+                    .iter()
+                    .map(|argument| self.check_expr(argument, UseMode::Consume))
+                    .collect::<Result<Vec<_>, _>>()?;
                 self.loans.truncate(temporary_start);
-                return Ok(Ty::Owned(match &object.node {
+                let owner = match &object.node {
                     Expression::Identifier(name) => name.clone(),
                     _ => unreachable!(),
-                }));
+                };
+                let components = self
+                    .program
+                    .enums
+                    .iter()
+                    .find(|declaration| declaration.name == owner)
+                    .and_then(|declaration| {
+                        declaration
+                            .variants
+                            .iter()
+                            .find(|variant| variant.name == *field)
+                    })
+                    .map(|variant| {
+                        variant
+                            .payload
+                            .iter()
+                            .cloned()
+                            .zip(actual_payload)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                return Ok(self.instantiated_nominal_ty(&owner, &components));
             }
             if matches!(&object.node, Expression::Identifier(name) if is_numeric_type_name(name)) {
                 for argument in arguments {
@@ -2492,7 +2915,9 @@ impl<'a> Analyzer<'a> {
                 }
                 let mut place = if let Expression::Identifier(name) = &object.node {
                     if let Some(id) = self.lookup(name) {
-                        if let Some(origin) = self.slots[&id].reference_origin.clone() {
+                        if ty_is_borrowed_view(&self.slots[&id].ty)
+                            && let Some(origin) = self.slots[&id].reference_origin.clone()
+                        {
                             origin
                         } else if matches!(self.slots[&id].ty, Ty::Reference(_, _)) {
                             Place {
@@ -2587,9 +3012,10 @@ impl<'a> Analyzer<'a> {
         for field in &place.fields {
             if field == "<deref>" {
                 ty = match ty {
-                    Ty::Reference(inner, _) | Ty::RawPointer(inner, _) | Ty::MutexGuard(inner) => {
-                        *inner
-                    }
+                    Ty::Reference(inner, _)
+                    | Ty::RawPointer(inner, _)
+                    | Ty::MemoryPointer(inner, _)
+                    | Ty::MutexGuard(inner) => *inner,
                     other => other,
                 };
                 continue;
@@ -2619,8 +3045,10 @@ impl<'a> Analyzer<'a> {
                 };
                 continue;
             }
-            let Ty::Owned(name) = ty else {
-                return Ok(Ty::Owned("field".into()));
+            let (name, arguments) = match ty {
+                Ty::Owned(name) => (name, Vec::new()),
+                Ty::Nominal(name, arguments) => (name, arguments),
+                _ => return Ok(Ty::Owned("field".into())),
             };
             let declaration = self
                 .program
@@ -2634,11 +3062,17 @@ impl<'a> Analyzer<'a> {
                         self.slots[&place.root].defined,
                     )
                 })?;
+            let substitutions = declaration
+                .generics
+                .iter()
+                .map(|generic| generic.name.clone())
+                .zip(arguments)
+                .collect::<HashMap<_, _>>();
             ty = declaration
                 .fields
                 .iter()
                 .find(|candidate| candidate.name == *field)
-                .map(|field| self.ty_from_name(&field.ty))
+                .map(|field| substitute_ownership_ty(self.ty_from_name(&field.ty), &substitutions))
                 .unwrap_or(Ty::Owned("field".into()));
         }
         Ok(ty)
@@ -2667,7 +3101,34 @@ impl<'a> Analyzer<'a> {
             | Expression::Character(_)
             | Expression::Bool(_) => Ok(Ty::Copy),
             Expression::String(_) => Ok(Ty::Owned("String".into())),
-            Expression::StructConstruct { name, .. } => Ok(Ty::Owned(name.clone())),
+            Expression::StructConstruct { name, fields, .. } => {
+                let actual_fields = fields
+                    .iter()
+                    .map(|field| {
+                        self.expr_ty(&field.value)
+                            .map(|ty| (field.name.as_str(), ty))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let components = self
+                    .program
+                    .structs
+                    .iter()
+                    .find(|declaration| declaration.name == *name)
+                    .map(|declaration| {
+                        declaration
+                            .fields
+                            .iter()
+                            .filter_map(|field| {
+                                actual_fields
+                                    .iter()
+                                    .find(|(actual_name, _)| *actual_name == field.name)
+                                    .map(|(_, actual)| (field.ty.clone(), actual.clone()))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                Ok(self.instantiated_nominal_ty(name, &components))
+            }
             Expression::Call { callee, .. } => {
                 let Expression::FieldAccess { object, field, .. } = &callee.node else {
                     return Ok(Ty::Owned("expression".into()));
@@ -2741,17 +3202,91 @@ impl<'a> Analyzer<'a> {
     }
 
     fn reference_origin(&self, expression: &Expr) -> Option<Place> {
-        match &expression.node {
-            Expression::Borrow { target, .. } => self.place(target).ok(),
-            Expression::Try(operand) => self.reference_origin(operand),
+        self.borrow_origins(expression)
+            .first()
+            .map(|(place, _)| place.clone())
+    }
+
+    fn borrow_origins(&self, expression: &Expr) -> Vec<(Place, bool)> {
+        let mut origins = match &expression.node {
+            Expression::Borrow { mutable, target } => self
+                .place(target)
+                .ok()
+                .map(|place| vec![(place, *mutable)])
+                .unwrap_or_default(),
             Expression::Identifier(name) => self
                 .lookup(name)
-                .and_then(|id| self.slots[&id].reference_origin.clone()),
+                .map(|id| self.slots[&id].borrow_origins.clone())
+                .unwrap_or_default(),
+            Expression::Try(value) | Expression::Move(value) => self.borrow_origins(value),
+            Expression::Array(values) => values
+                .iter()
+                .flat_map(|value| self.borrow_origins(value))
+                .collect(),
+            Expression::StructConstruct { fields, .. } => fields
+                .iter()
+                .flat_map(|field| self.borrow_origins(&field.value))
+                .collect(),
+            Expression::FieldAccess { object, .. }
+            | Expression::Index { object, .. }
+            | Expression::Subslice { object, .. }
+            | Expression::Dereference(object) => self.borrow_origins(object),
+            Expression::Match { value, arms } => {
+                let mut origins = self.borrow_origins(value);
+                origins.extend(arms.iter().flat_map(|arm| self.borrow_origins(&arm.value)));
+                origins
+            }
             Expression::Call { callee, arguments }
-                if matches!(&callee.node, Expression::Identifier(name) if matches!(name.as_str(), "Some" | "Ok" | "Err"))
-                    && arguments.len() == 1 =>
+                if matches!(
+                    &callee.node,
+                    Expression::Identifier(name)
+                        if matches!(name.as_str(), "Some" | "Ok" | "Err")
+                ) || matches!(
+                    &callee.node,
+                    Expression::FieldAccess { object, field, .. }
+                        if matches!(&object.node, Expression::Identifier(name)
+                            if matches!(name.as_str(), "List" | "Map" | "Set" | "Mutex"))
+                            && matches!(field.as_str(), "of" | "new")
+                ) || matches!(
+                    &callee.node,
+                    Expression::FieldAccess { object, .. }
+                        if matches!(&object.node, Expression::Identifier(name)
+                            if self.program.enums.iter().any(|declaration| declaration.name == *name))
+                ) =>
             {
-                self.reference_origin(&arguments[0])
+                arguments
+                    .iter()
+                    .flat_map(|argument| self.borrow_origins(argument))
+                    .collect()
+            }
+            Expression::Call { callee, arguments }
+                if arguments.is_empty()
+                    && matches!(
+                        &callee.node,
+                        Expression::FieldAccess { object, field, .. }
+                            if matches!(field.as_str(), "as_ptr" | "as_mut_ptr")
+                                && matches!(self.expr_ty(object), Ok(Ty::Memory))
+                    ) =>
+            {
+                let Expression::FieldAccess { object, field, .. } = &callee.node else {
+                    unreachable!()
+                };
+                self.place(object)
+                    .ok()
+                    .map(|place| vec![(place, field == "as_mut_ptr")])
+                    .unwrap_or_default()
+            }
+            Expression::Call { callee, arguments }
+                if arguments.len() == 1
+                    && matches!(
+                        &callee.node,
+                        Expression::FieldAccess { field, .. } if field == "offset"
+                    ) =>
+            {
+                let Expression::FieldAccess { object, .. } = &callee.node else {
+                    unreachable!()
+                };
+                self.borrow_origins(object)
             }
             Expression::Call { callee, arguments }
                 if matches!(
@@ -2760,15 +3295,20 @@ impl<'a> Analyzer<'a> {
                         if matches!(field.as_str(), "get" | "get_mut")
                 ) && arguments.len() == 1 =>
             {
-                let Expression::FieldAccess { object, .. } = &callee.node else {
+                let Expression::FieldAccess { object, field, .. } = &callee.node else {
                     unreachable!()
                 };
-                let mut place = self.place(object).ok()?;
-                place.fields.push(match arguments[0].node {
-                    Expression::Integer(value) => format!("@i:{value}"),
-                    _ => "@i:*".into(),
-                });
-                Some(place)
+                let mut origins = self.borrow_origins(object);
+                if origins.is_empty()
+                    && let Ok(mut place) = self.place(object)
+                {
+                    place.fields.push(match arguments[0].node {
+                        Expression::Integer(value) => format!("@i:{value}"),
+                        _ => "@i:*".into(),
+                    });
+                    origins.push((place, field == "get_mut"));
+                }
+                origins
             }
             Expression::Call { callee, arguments }
                 if matches!(
@@ -2779,39 +3319,62 @@ impl<'a> Analyzer<'a> {
                 let Expression::FieldAccess { object, .. } = &callee.node else {
                     unreachable!()
                 };
-                self.place(object).ok()
+                self.place(object)
+                    .ok()
+                    .map(|place| vec![(place, false)])
+                    .unwrap_or_default()
             }
             Expression::Call { callee, arguments } => {
                 let Expression::Identifier(name) = &callee.node else {
-                    return None;
+                    return vec![];
                 };
-                let function = self
+                let Some(function) = self
                     .program
                     .functions
                     .iter()
-                    .find(|function| function.name == *name)?;
-                let return_ty = function
+                    .find(|function| function.name == *name)
+                else {
+                    return vec![];
+                };
+                if !function
                     .return_type
                     .as_ref()
-                    .map(|ty| self.ty_from_name(ty))
-                    .unwrap_or(Ty::Unit);
-                if !ty_contains_reference(&return_ty) {
-                    return None;
+                    .is_some_and(|ty| self.type_name_contains_reference(ty))
+                {
+                    return vec![];
                 }
-                let (index, _) =
-                    function
-                        .parameters
-                        .iter()
-                        .enumerate()
-                        .find(|(_, parameter)| {
-                            ty_is_borrowed_view(&self.ty_from_name(&parameter.ty))
-                        })?;
-                let argument = arguments.get(index)?;
-                self.reference_origin(argument)
-                    .or_else(|| self.place(argument).ok())
+                function
+                    .parameters
+                    .iter()
+                    .zip(arguments)
+                    .filter(|(parameter, _)| self.type_name_contains_reference(&parameter.ty))
+                    .flat_map(|(parameter, argument)| {
+                        let mut origins = self.borrow_origins(argument);
+                        if origins.is_empty()
+                            && let Ok(place) = self.place(argument)
+                        {
+                            origins.push((
+                                place,
+                                self.ty_contains_mutable_reference(
+                                    &self.ty_from_name(&parameter.ty),
+                                ),
+                            ));
+                        }
+                        origins
+                    })
+                    .collect()
             }
-            _ => None,
-        }
+            _ => vec![],
+        };
+        origins.sort_by(|(left, left_mutable), (right, right_mutable)| {
+            left.root
+                .0
+                .cmp(&right.root.0)
+                .then_with(|| left.fields.cmp(&right.fields))
+                .then_with(|| left_mutable.cmp(right_mutable))
+        });
+        origins.dedup();
+        origins
     }
 
     fn closure_origins(&self, expression: &Expr) -> Vec<(Place, bool)> {
@@ -2831,13 +3394,20 @@ impl<'a> Analyzer<'a> {
                     if !slot.closure_origins.is_empty() {
                         return slot.closure_origins.clone();
                     }
-                    if ty_contains_reference(&slot.ty) {
+                    if self.ty_contains_reference(&slot.ty) {
+                        if !slot.borrow_origins.is_empty() {
+                            return slot
+                                .borrow_origins
+                                .iter()
+                                .map(|(place, mutable)| (place.clone(), *mutable || usage.mutated))
+                                .collect();
+                        }
                         return vec![(
-                            slot.reference_origin.clone().unwrap_or(Place {
+                            Place {
                                 root,
                                 fields: vec![],
-                            }),
-                            usage.mutated || ty_contains_mutable_reference(&slot.ty),
+                            },
+                            usage.mutated || self.ty_contains_mutable_reference(&slot.ty),
                         )];
                     }
                     if *move_captures {
@@ -2875,6 +3445,12 @@ impl<'a> Analyzer<'a> {
             }
             Expression::Match { value, arms } => {
                 let mut origins = self.closure_origins(value);
+                origins.extend(arms.iter().flat_map(|arm| {
+                    arm.guard
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|guard| self.closure_origins(guard))
+                }));
                 origins.extend(arms.iter().flat_map(|arm| self.closure_origins(&arm.value)));
                 origins
             }
@@ -2926,11 +3502,324 @@ impl<'a> Analyzer<'a> {
         self.ty_contains_function_inner(ty, &mut HashSet::new())
     }
 
+    fn ty_contains_reference(&self, ty: &Ty) -> bool {
+        self.ty_contains_reference_inner(ty, &mut HashSet::new())
+    }
+
+    fn instantiated_nominal_ty(&self, name: &str, components: &[(TypeName, Ty)]) -> Ty {
+        let generics = self
+            .program
+            .structs
+            .iter()
+            .find(|declaration| declaration.name == name)
+            .map(|declaration| &declaration.generics)
+            .or_else(|| {
+                self.program
+                    .enums
+                    .iter()
+                    .find(|declaration| declaration.name == name)
+                    .map(|declaration| &declaration.generics)
+            });
+        let Some(generics) = generics else {
+            return Ty::Owned(name.into());
+        };
+        let mut substitutions = HashMap::new();
+        for (template, actual) in components {
+            collect_ownership_substitutions(
+                &self.ty_from_name(template),
+                actual,
+                &mut substitutions,
+            );
+        }
+        Ty::Nominal(
+            name.into(),
+            generics
+                .iter()
+                .map(|generic| {
+                    substitutions
+                        .get(&generic.name)
+                        .cloned()
+                        .unwrap_or_else(|| Ty::Generic(generic.name.clone()))
+                })
+                .collect(),
+        )
+    }
+
+    fn nominal_component_types(&self, name: &str, arguments: &[Ty]) -> Vec<Ty> {
+        if let Some(declaration) = self
+            .program
+            .structs
+            .iter()
+            .find(|declaration| declaration.name == name)
+        {
+            let substitutions = declaration
+                .generics
+                .iter()
+                .map(|generic| generic.name.clone())
+                .zip(arguments.iter().cloned())
+                .collect::<HashMap<_, _>>();
+            return declaration
+                .fields
+                .iter()
+                .map(|field| substitute_ownership_ty(self.ty_from_name(&field.ty), &substitutions))
+                .collect();
+        }
+        if let Some(declaration) = self
+            .program
+            .enums
+            .iter()
+            .find(|declaration| declaration.name == name)
+        {
+            let substitutions = declaration
+                .generics
+                .iter()
+                .map(|generic| generic.name.clone())
+                .zip(arguments.iter().cloned())
+                .collect::<HashMap<_, _>>();
+            return declaration
+                .variants
+                .iter()
+                .flat_map(|variant| variant.payload.iter())
+                .map(|payload| substitute_ownership_ty(self.ty_from_name(payload), &substitutions))
+                .collect();
+        }
+        Vec::new()
+    }
+
+    fn type_name_contains_reference(&self, ty: &TypeName) -> bool {
+        self.type_name_contains_reference_inner(ty, &mut HashSet::new())
+    }
+
+    fn type_name_contains_reference_inner(
+        &self,
+        ty: &TypeName,
+        visiting: &mut HashSet<String>,
+    ) -> bool {
+        if matches!(
+            ty.qualifier,
+            TypeQualifier::SharedReference
+                | TypeQualifier::MutableReference
+                | TypeQualifier::RawConstPointer
+                | TypeQualifier::RawMutPointer
+        ) {
+            return true;
+        }
+        if matches!(
+            ty.name.as_str(),
+            "str" | "[]" | "CStr" | "MemoryPtr" | "MemoryMutPtr"
+        ) {
+            return true;
+        }
+        if ty
+            .arguments
+            .iter()
+            .any(|argument| self.type_name_contains_reference_inner(argument, visiting))
+        {
+            return true;
+        }
+        if ty.qualifier != TypeQualifier::Owned {
+            return false;
+        }
+        let name = if ty.name == "Self" {
+            self.self_type.as_deref().unwrap_or("Self")
+        } else {
+            &ty.name
+        };
+        if !visiting.insert(name.to_owned()) {
+            return false;
+        }
+        let contains = self
+            .program
+            .structs
+            .iter()
+            .find(|declaration| declaration.name == name)
+            .is_some_and(|declaration| {
+                declaration
+                    .fields
+                    .iter()
+                    .any(|field| self.type_name_contains_reference_inner(&field.ty, visiting))
+            })
+            || self
+                .program
+                .enums
+                .iter()
+                .find(|declaration| declaration.name == name)
+                .is_some_and(|declaration| {
+                    declaration.variants.iter().any(|variant| {
+                        variant.payload.iter().any(|payload| {
+                            self.type_name_contains_reference_inner(payload, visiting)
+                        })
+                    })
+                });
+        visiting.remove(name);
+        contains
+    }
+
+    fn ty_contains_mutable_reference(&self, ty: &Ty) -> bool {
+        self.ty_contains_mutable_reference_inner(ty, &mut HashSet::new())
+    }
+
+    fn ty_contains_mutable_reference_inner(&self, ty: &Ty, visiting: &mut HashSet<String>) -> bool {
+        match ty {
+            Ty::Reference(_, true) | Ty::RawPointer(_, true) | Ty::MemoryPointer(_, true) => true,
+            Ty::Reference(_, false)
+            | Ty::RawPointer(_, false)
+            | Ty::MemoryPointer(_, false)
+            | Ty::Slice(_)
+            | Ty::Str
+            | Ty::CStr => false,
+            Ty::Option(inner)
+            | Ty::Array(inner)
+            | Ty::List(inner)
+            | Ty::Set(inner)
+            | Ty::Thread(inner)
+            | Ty::Future(inner)
+            | Ty::Task(inner)
+            | Ty::Mutex(inner)
+            | Ty::Channel(inner) => self.ty_contains_mutable_reference_inner(inner, visiting),
+            Ty::Map(key, value) | Ty::Result(key, value) => {
+                self.ty_contains_mutable_reference_inner(key, visiting)
+                    || self.ty_contains_mutable_reference_inner(value, visiting)
+            }
+            Ty::Nominal(name, arguments) => {
+                if arguments
+                    .iter()
+                    .any(|argument| self.ty_contains_mutable_reference_inner(argument, visiting))
+                {
+                    return true;
+                }
+                if !visiting.insert(name.clone()) {
+                    return false;
+                }
+                let contains = self
+                    .nominal_component_types(name, arguments)
+                    .iter()
+                    .any(|component| self.ty_contains_mutable_reference_inner(component, visiting));
+                visiting.remove(name);
+                contains
+            }
+            Ty::Owned(name) => {
+                if !visiting.insert(name.clone()) {
+                    return false;
+                }
+                let contains = self
+                    .program
+                    .structs
+                    .iter()
+                    .find(|declaration| declaration.name == *name)
+                    .is_some_and(|declaration| {
+                        declaration.fields.iter().any(|field| {
+                            self.ty_contains_mutable_reference_inner(
+                                &self.ty_from_name(&field.ty),
+                                visiting,
+                            )
+                        })
+                    })
+                    || self
+                        .program
+                        .enums
+                        .iter()
+                        .find(|declaration| declaration.name == *name)
+                        .is_some_and(|declaration| {
+                            declaration.variants.iter().any(|variant| {
+                                variant.payload.iter().any(|payload| {
+                                    self.ty_contains_mutable_reference_inner(
+                                        &self.ty_from_name(payload),
+                                        visiting,
+                                    )
+                                })
+                            })
+                        });
+                visiting.remove(name);
+                contains
+            }
+            _ => false,
+        }
+    }
+
+    fn ty_contains_reference_inner(&self, ty: &Ty, visiting: &mut HashSet<String>) -> bool {
+        match ty {
+            Ty::Reference(_, _)
+            | Ty::RawPointer(_, _)
+            | Ty::MemoryPointer(_, _)
+            | Ty::Slice(_)
+            | Ty::Str
+            | Ty::CStr => true,
+            Ty::Option(inner)
+            | Ty::Array(inner)
+            | Ty::List(inner)
+            | Ty::Set(inner)
+            | Ty::Thread(inner)
+            | Ty::Future(inner)
+            | Ty::Task(inner)
+            | Ty::Mutex(inner)
+            | Ty::Channel(inner) => self.ty_contains_reference_inner(inner, visiting),
+            Ty::Map(key, value) | Ty::Result(key, value) => {
+                self.ty_contains_reference_inner(key, visiting)
+                    || self.ty_contains_reference_inner(value, visiting)
+            }
+            Ty::Nominal(name, arguments) => {
+                if arguments
+                    .iter()
+                    .any(|argument| self.ty_contains_reference_inner(argument, visiting))
+                {
+                    return true;
+                }
+                if !visiting.insert(name.clone()) {
+                    return false;
+                }
+                let contains = self
+                    .nominal_component_types(name, arguments)
+                    .iter()
+                    .any(|component| self.ty_contains_reference_inner(component, visiting));
+                visiting.remove(name);
+                contains
+            }
+            Ty::Owned(name) => {
+                if !visiting.insert(name.clone()) {
+                    return false;
+                }
+                let contains = self
+                    .program
+                    .structs
+                    .iter()
+                    .find(|declaration| declaration.name == *name)
+                    .is_some_and(|declaration| {
+                        declaration.fields.iter().any(|field| {
+                            self.ty_contains_reference_inner(
+                                &self.ty_from_name(&field.ty),
+                                visiting,
+                            )
+                        })
+                    })
+                    || self
+                        .program
+                        .enums
+                        .iter()
+                        .find(|declaration| declaration.name == *name)
+                        .is_some_and(|declaration| {
+                            declaration.variants.iter().any(|variant| {
+                                variant.payload.iter().any(|payload| {
+                                    self.ty_contains_reference_inner(
+                                        &self.ty_from_name(payload),
+                                        visiting,
+                                    )
+                                })
+                            })
+                        });
+                visiting.remove(name);
+                contains
+            }
+            _ => false,
+        }
+    }
+
     fn ty_contains_function_inner(&self, ty: &Ty, visiting: &mut HashSet<String>) -> bool {
         match ty {
             Ty::Function | Ty::Generic(_) => true,
             Ty::Reference(inner, _)
             | Ty::RawPointer(inner, _)
+            | Ty::MemoryPointer(inner, _)
             | Ty::Option(inner)
             | Ty::Array(inner)
             | Ty::Slice(inner)
@@ -2940,10 +3829,28 @@ impl<'a> Analyzer<'a> {
             | Ty::Future(inner)
             | Ty::Task(inner)
             | Ty::Mutex(inner)
-            | Ty::MutexGuard(inner) => self.ty_contains_function_inner(inner, visiting),
+            | Ty::MutexGuard(inner)
+            | Ty::Channel(inner) => self.ty_contains_function_inner(inner, visiting),
             Ty::Map(key, value) | Ty::Result(key, value) => {
                 self.ty_contains_function_inner(key, visiting)
                     || self.ty_contains_function_inner(value, visiting)
+            }
+            Ty::Nominal(name, arguments) => {
+                if arguments
+                    .iter()
+                    .any(|argument| self.ty_contains_function_inner(argument, visiting))
+                {
+                    return true;
+                }
+                if !visiting.insert(name.clone()) {
+                    return false;
+                }
+                let contains = self
+                    .nominal_component_types(name, arguments)
+                    .iter()
+                    .any(|component| self.ty_contains_function_inner(component, visiting));
+                visiting.remove(name);
+                contains
             }
             Ty::Owned(name) => {
                 if !visiting.insert(name.clone()) {
@@ -2981,6 +3888,58 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    fn attach_borrow_origins(
+        &mut self,
+        id: SlotId,
+        mut origins: Vec<(Place, bool)>,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        origins.sort_by(|(left, left_mutable), (right, right_mutable)| {
+            left.root
+                .0
+                .cmp(&right.root.0)
+                .then_with(|| left.fields.cmp(&right.fields))
+                .then_with(|| left_mutable.cmp(right_mutable))
+        });
+        origins.dedup();
+        if origins.is_empty() {
+            return Ok(());
+        }
+        let moved_borrowers = origins
+            .iter()
+            .filter(|(_, mutable)| *mutable)
+            .filter_map(|(origin, _)| {
+                self.loans
+                    .iter()
+                    .find(|loan| loan.place == *origin)
+                    .and_then(|loan| loan.borrower)
+            })
+            .collect::<HashSet<_>>();
+        self.loans.retain(|loan| {
+            loan.borrower != Some(id)
+                && !loan
+                    .borrower
+                    .is_some_and(|borrower| moved_borrowers.contains(&borrower))
+                && !(loan.borrower.is_none()
+                    && origins
+                        .iter()
+                        .any(|(origin, mutable)| *origin == loan.place && *mutable == loan.mutable))
+        });
+        for (place, mutable) in &origins {
+            self.check_borrow(place, *mutable, span)?;
+            self.loans.push(Loan {
+                place: place.clone(),
+                mutable: *mutable,
+                borrower: Some(id),
+                at: span,
+            });
+        }
+        let slot = self.slots.get_mut(&id).expect("borrow carrier is live");
+        slot.reference_origin = origins.first().map(|(place, _)| place.clone());
+        slot.borrow_origins = origins;
+        Ok(())
+    }
+
     fn attach_closure_origins(&mut self, id: SlotId, origins: Vec<(Place, bool)>, span: Span) {
         if origins.is_empty() {
             return;
@@ -3014,11 +3973,72 @@ impl<'a> Analyzer<'a> {
         &mut self,
         pattern: &Pattern,
         matched: &Ty,
+        origins: &[(Place, bool)],
         span: Span,
     ) -> Result<(), Diagnostic> {
         match pattern {
             Pattern::Binding(name) => {
-                self.declare(name, matched.clone(), span, false, true, None)?;
+                let id = self.declare(
+                    name,
+                    matched.clone(),
+                    span,
+                    false,
+                    true,
+                    origins.first().map(|(place, _)| place.clone()),
+                )?;
+                if self.ty_contains_reference(matched) {
+                    self.attach_borrow_origins(id, origins.to_vec(), span)?;
+                }
+            }
+            Pattern::Struct { fields, .. } => {
+                let (owner, arguments) = match matched {
+                    Ty::Owned(owner) => (Some(owner), &[][..]),
+                    Ty::Nominal(owner, arguments) => (Some(owner), arguments.as_slice()),
+                    _ => (None, &[][..]),
+                };
+                let declaration = owner.and_then(|owner| {
+                    self.program
+                        .structs
+                        .iter()
+                        .find(|declaration| declaration.name == *owner)
+                });
+                let substitutions = declaration
+                    .map(|declaration| {
+                        declaration
+                            .generics
+                            .iter()
+                            .map(|generic| generic.name.clone())
+                            .zip(arguments.iter().cloned())
+                            .collect::<HashMap<_, _>>()
+                    })
+                    .unwrap_or_default();
+                for field in fields {
+                    let field_ty = declaration
+                        .and_then(|declaration| {
+                            declaration
+                                .fields
+                                .iter()
+                                .find(|candidate| candidate.name == field.name)
+                        })
+                        .map(|declaration| {
+                            substitute_ownership_ty(
+                                self.ty_from_name(&declaration.ty),
+                                &substitutions,
+                            )
+                        })
+                        .unwrap_or_else(|| Ty::Owned("field".into()));
+                    let field_origins = if self.ty_contains_reference(&field_ty) {
+                        origins
+                    } else {
+                        &[]
+                    };
+                    self.bind_pattern(
+                        &field.pattern.node,
+                        &field_ty,
+                        field_origins,
+                        field.pattern.span,
+                    )?;
+                }
             }
             Pattern::Variant {
                 variant, arguments, ..
@@ -3027,25 +4047,41 @@ impl<'a> Analyzer<'a> {
                     Ty::Option(inner) if variant == "Some" => vec![(**inner).clone()],
                     Ty::Result(ok, _) if variant == "Ok" => vec![(**ok).clone()],
                     Ty::Result(_, error) if variant == "Err" => vec![(**error).clone()],
-                    Ty::Owned(owner) => self
-                        .program
-                        .enums
-                        .iter()
-                        .find(|declaration| declaration.name == *owner)
-                        .and_then(|declaration| {
-                            declaration
-                                .variants
-                                .iter()
-                                .find(|candidate| candidate.name == *variant)
-                        })
-                        .map(|variant| {
-                            variant
-                                .payload
-                                .iter()
-                                .map(|ty| self.ty_from_name(ty))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
+                    Ty::Owned(owner) | Ty::Nominal(owner, _) => {
+                        let arguments = match matched {
+                            Ty::Nominal(_, arguments) => arguments.as_slice(),
+                            _ => &[][..],
+                        };
+                        self.program
+                            .enums
+                            .iter()
+                            .find(|declaration| declaration.name == *owner)
+                            .and_then(|declaration| {
+                                let substitutions = declaration
+                                    .generics
+                                    .iter()
+                                    .map(|generic| generic.name.clone())
+                                    .zip(arguments.iter().cloned())
+                                    .collect::<HashMap<_, _>>();
+                                declaration
+                                    .variants
+                                    .iter()
+                                    .find(|candidate| candidate.name == *variant)
+                                    .map(|variant| {
+                                        variant
+                                            .payload
+                                            .iter()
+                                            .map(|ty| {
+                                                substitute_ownership_ty(
+                                                    self.ty_from_name(ty),
+                                                    &substitutions,
+                                                )
+                                            })
+                                            .collect()
+                                    })
+                            })
+                            .unwrap_or_default()
+                    }
                     _ => Vec::new(),
                 };
                 for (index, argument) in arguments.iter().enumerate() {
@@ -3053,7 +4089,12 @@ impl<'a> Analyzer<'a> {
                         .get(index)
                         .cloned()
                         .unwrap_or_else(|| Ty::Owned("payload".into()));
-                    self.bind_pattern(&argument.node, &payload, argument.span)?;
+                    let payload_origins = if self.ty_contains_reference(&payload) {
+                        origins
+                    } else {
+                        &[]
+                    };
+                    self.bind_pattern(&argument.node, &payload, payload_origins, argument.span)?;
                 }
             }
             _ => {}
@@ -3086,9 +4127,9 @@ impl<'a> Analyzer<'a> {
             return None;
         }
         let receiver_name = match receiver {
-            Ty::Owned(name) => name,
+            Ty::Owned(name) | Ty::Nominal(name, _) => name,
             Ty::Reference(inner, _) => match &**inner {
-                Ty::Owned(name) => name,
+                Ty::Owned(name) | Ty::Nominal(name, _) => name,
                 _ => return None,
             },
             _ => return None,
@@ -3153,11 +4194,21 @@ impl<'a> Analyzer<'a> {
             "MutexGuard" if ty.arguments.len() == 1 => {
                 Ty::MutexGuard(Box::new(self.ty_from_name(&ty.arguments[0])))
             }
+            "Channel" if ty.arguments.len() == 1 => {
+                Ty::Channel(Box::new(self.ty_from_name(&ty.arguments[0])))
+            }
             "AtomicInt" => Ty::AtomicInt,
             "str" => Ty::Str,
             "CString" => Ty::CString,
             "CStr" => Ty::CStr,
+            "CRegistration" => Ty::CRegistration,
             "Memory" => Ty::Memory,
+            "MemoryPtr" if ty.arguments.len() == 1 => {
+                Ty::MemoryPointer(Box::new(self.ty_from_name(&ty.arguments[0])), false)
+            }
+            "MemoryMutPtr" if ty.arguments.len() == 1 => {
+                Ty::MemoryPointer(Box::new(self.ty_from_name(&ty.arguments[0])), true)
+            }
             "CInt" | "CUInt" | "CSize" | "CSSize" | "CChar" | "CUChar" | "CShort" | "CUShort"
             | "CLongLong" | "CULongLong" | "CFloat" | "CDouble" => Ty::Copy,
             "Path" => Ty::Path,
@@ -3189,7 +4240,13 @@ impl<'a> Analyzer<'a> {
                     .iter()
                     .any(|declaration| declaration.name == name) =>
             {
-                Ty::Owned(name.into())
+                Ty::Nominal(
+                    name.into(),
+                    ty.arguments
+                        .iter()
+                        .map(|argument| self.ty_from_name(argument))
+                        .collect(),
+                )
             }
             name if name.len() == 1 && name.chars().all(char::is_uppercase) => {
                 Ty::Generic(name.into())
@@ -3207,7 +4264,9 @@ impl<'a> Analyzer<'a> {
 
     fn ty_is_copy(&self, ty: &Ty) -> bool {
         match ty {
-            Ty::Copy | Ty::Reference(_, false) | Ty::RawPointer(_, _) => true,
+            Ty::Copy | Ty::Reference(_, false) | Ty::RawPointer(_, _) | Ty::MemoryPointer(_, _) => {
+                true
+            }
             Ty::Reference(_, true) => false,
             Ty::Option(value) => self.ty_is_copy(value),
             Ty::Result(ok, error) => self.ty_is_copy(ok) && self.ty_is_copy(error),
@@ -3225,6 +4284,7 @@ impl<'a> Analyzer<'a> {
             | Ty::UdpSocket
             | Ty::UdpDatagram
             | Ty::CString
+            | Ty::CRegistration
             | Ty::Memory
             | Ty::List(_)
             | Ty::Map(_, _)
@@ -3234,9 +4294,14 @@ impl<'a> Analyzer<'a> {
             | Ty::Task(_)
             | Ty::Mutex(_)
             | Ty::MutexGuard(_)
+            | Ty::Channel(_)
             | Ty::AtomicInt
             | Ty::Function => false,
             Ty::Owned(name) => self.copy_types.contains(name),
+            Ty::Nominal(name, arguments) => {
+                self.copy_types.contains(name)
+                    && arguments.iter().all(|argument| self.ty_is_copy(argument))
+            }
             Ty::Generic(name) => self.generic_copy.contains(name),
             Ty::Unit => true,
         }
@@ -3297,6 +4362,7 @@ impl<'a> Analyzer<'a> {
                 scope_depth: self.scopes.len() - 1,
                 parameter: false,
                 reference_origin,
+                borrow_origins: vec![],
                 closure_origins: vec![],
             },
         );
@@ -3374,6 +4440,18 @@ impl<'a> Analyzer<'a> {
                         .then_with(|| left_mutable.cmp(right_mutable))
                 });
             slot.closure_origins.dedup();
+            slot.borrow_origins = a.borrow_origins.clone();
+            slot.borrow_origins.extend(b.borrow_origins.clone());
+            slot.borrow_origins
+                .sort_by(|(left, left_mutable), (right, right_mutable)| {
+                    left.root
+                        .0
+                        .cmp(&right.root.0)
+                        .then_with(|| left.fields.cmp(&right.fields))
+                        .then_with(|| left_mutable.cmp(right_mutable))
+                });
+            slot.borrow_origins.dedup();
+            slot.reference_origin = slot.borrow_origins.first().map(|(place, _)| place.clone());
         }
         self.loans = left.loans.clone();
         for loan in &right.loans {
@@ -3412,6 +4490,18 @@ impl<'a> Analyzer<'a> {
                         .then_with(|| left_mutable.cmp(right_mutable))
                 });
             slot.closure_origins.dedup();
+            slot.borrow_origins = a.borrow_origins.clone();
+            slot.borrow_origins.extend(b.borrow_origins.clone());
+            slot.borrow_origins
+                .sort_by(|(left, left_mutable), (right, right_mutable)| {
+                    left.root
+                        .0
+                        .cmp(&right.root.0)
+                        .then_with(|| left.fields.cmp(&right.fields))
+                        .then_with(|| left_mutable.cmp(right_mutable))
+                });
+            slot.borrow_origins.dedup();
+            slot.reference_origin = slot.borrow_origins.first().map(|(place, _)| place.clone());
         }
         self.loans = before.loans.clone();
         for loan in &body.loans {
@@ -3479,44 +4569,16 @@ fn is_numeric_type_name(name: &str) -> bool {
     )
 }
 
-fn ty_contains_reference(ty: &Ty) -> bool {
-    match ty {
-        Ty::Reference(_, _) | Ty::Slice(_) | Ty::Str | Ty::CStr => true,
-        Ty::Option(inner)
-        | Ty::Array(inner)
-        | Ty::List(inner)
-        | Ty::Set(inner)
-        | Ty::Thread(inner)
-        | Ty::Future(inner)
-        | Ty::Task(inner)
-        | Ty::Mutex(inner) => ty_contains_reference(inner),
-        Ty::MutexGuard(_) => false,
-        Ty::Map(key, value) => ty_contains_reference(key) || ty_contains_reference(value),
-        Ty::Result(ok, error) => ty_contains_reference(ok) || ty_contains_reference(error),
-        _ => false,
-    }
-}
-
 fn ty_is_borrowed_view(ty: &Ty) -> bool {
-    matches!(ty, Ty::Reference(_, _) | Ty::Slice(_) | Ty::Str | Ty::CStr)
-}
-
-fn ty_contains_mutable_reference(ty: &Ty) -> bool {
-    match ty {
-        Ty::Reference(_, true) => true,
-        Ty::Option(inner)
-        | Ty::Array(inner)
-        | Ty::List(inner)
-        | Ty::Set(inner)
-        | Ty::Thread(inner)
-        | Ty::Future(inner)
-        | Ty::Task(inner)
-        | Ty::Mutex(inner) => ty_contains_mutable_reference(inner),
-        Ty::Map(key, value) | Ty::Result(key, value) => {
-            ty_contains_mutable_reference(key) || ty_contains_mutable_reference(value)
-        }
-        _ => false,
-    }
+    matches!(
+        ty,
+        Ty::Reference(_, _)
+            | Ty::RawPointer(_, _)
+            | Ty::MemoryPointer(_, _)
+            | Ty::Slice(_)
+            | Ty::Str
+            | Ty::CStr
+    )
 }
 
 fn places_overlap(left: &Place, right: &Place) -> bool {
@@ -3629,7 +4691,7 @@ fn collect_statement_names(statement: &Statement, names: &mut HashSet<String>) {
             collect_expr_names(iterable, names);
             collect_block_names(body, names);
         }
-        Statement::Loop(body) | Statement::Unsafe(body) => collect_block_names(body, names),
+        Statement::Loop(body) | Statement::Unsafe { body, .. } => collect_block_names(body, names),
     }
 }
 fn collect_block_names(block: &Block, names: &mut HashSet<String>) {
@@ -3726,6 +4788,9 @@ fn collect_expr_names(expression: &Expr, names: &mut HashSet<String>) {
         Expression::Match { value, arms } => {
             collect_expr_names(value, names);
             for arm in arms {
+                if let Some(guard) = &arm.guard {
+                    collect_expr_names(guard, names);
+                }
                 collect_expr_names(&arm.value, names);
             }
         }

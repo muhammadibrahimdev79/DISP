@@ -111,6 +111,76 @@ async fn main() {
 }
 
 #[test]
+fn explicit_task_cancellation_is_linear_deterministic_and_differential() {
+    let source = r#"
+async fn deferred(text: String) -> String {
+    print("unexpected")
+    return text
+}
+
+async fn main() {
+    task = Async.spawn(deferred("owned by explicit cancellation"))
+    print(task.is_finished())
+    task.cancel()
+    print("cancelled")
+}
+"#;
+    assert_eq!(run_source(source).unwrap(), ["false", "cancelled"]);
+    differential("explicit-cancel", source);
+
+    let reused = check_source(
+        "async fn work() -> int { return 1 } async fn main() { task = Async.spawn(work()) task.cancel() print(await task) }",
+    )
+    .unwrap_err();
+    assert!(reused.message.contains("moved"), "{}", reused.message);
+}
+
+#[test]
+fn task_completion_is_observable_without_consuming_the_result() {
+    let source = r#"
+async fn work() -> String {
+    await Async.yield()
+    return "done"
+}
+
+async fn main() {
+    task = Async.spawn(work())
+    await Async.yield()
+    await Async.yield()
+    print(task.is_finished())
+    print(await task)
+}
+"#;
+    assert_eq!(run_source(source).unwrap(), ["true", "done"]);
+    differential("finished", source);
+}
+
+#[test]
+fn cancelling_a_parent_cancels_pending_nested_tasks_before_later_side_effects() {
+    let source = r#"
+async fn child(message: String) {
+    await Async.sleep(Duration.from_millis(100))
+    print(message)
+}
+
+async fn parent() {
+    child_task = Async.spawn(child("unexpected"))
+    await Async.sleep(Duration.from_millis(100))
+}
+
+async fn main() {
+    parent_task = Async.spawn(parent())
+    await Async.yield()
+    parent_task.cancel()
+    await Async.sleep(Duration.from_millis(1))
+    print("cancelled tree")
+}
+"#;
+    assert_eq!(run_source(source).unwrap(), ["cancelled tree"]);
+    differential("cancel-tree", source);
+}
+
+#[test]
 fn spawn_and_task_diagnostics_are_source_spanned() {
     let outside = check_source(
         "async fn work() -> int { return 1 }\nfn main() { task = Async.spawn(work()) }",
@@ -177,6 +247,8 @@ async fn main() { task = Async.spawn(work()) print(await task) }
     assert!(generated.contains("disp_executor_tick"));
     assert!(generated.contains("disp_task_spawn"));
     assert!(generated.contains("disp_task_poll"));
+    assert!(generated.contains("disp_task_cancel"));
+    assert!(generated.contains("disp_task_is_finished"));
     assert!(generated.contains("disp_task_result_drop_s"));
     differential("owned-cleanup", source);
 }

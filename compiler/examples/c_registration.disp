@@ -1,0 +1,26 @@
+extern C {
+    fn malloc(size: CSize) -> mut ptr<Unit>
+    fn free(context: mut ptr<Unit>)
+}
+
+fn close_explicitly() uses Foreign {
+    unsafe uses Foreign {
+        context = malloc(1)
+        registration = CRegistration.adopt(context, free)
+        print(registration.is_active())
+        registration.close()
+    }
+}
+
+fn close_at_scope_exit() uses Foreign {
+    unsafe uses Foreign {
+        context = malloc(1)
+        registration = CRegistration.adopt(context, free)
+        print(registration.is_active())
+    }
+}
+
+fn main() uses Foreign {
+    close_explicitly()
+    close_at_scope_exit()
+}

@@ -1,0 +1,13 @@
+extern C {
+    fn abs(value: CInt) -> CInt
+}
+
+fn invoke(callback: CFunction<fn(CInt) -> CInt>, value: CInt) -> CInt uses Foreign {
+    unsafe uses Foreign {
+        return callback(value)
+    }
+}
+
+fn main() uses Foreign {
+    print(invoke(abs, -7))
+}

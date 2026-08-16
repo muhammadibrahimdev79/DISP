@@ -63,7 +63,7 @@ also includes nominal structured HTTP URLs with injection-safe path/query builde
 validated JSON documents with safe navigation, checked scalar extraction, array/object
 construction, automatic type-safe struct/enum conversion, native HTTP body integration,
 deterministic cleanup, and matching interpreter
-semantics. An owned SQLite `Database` foundation provides prepared parameter binding, bounded
+semantics. A lazily loaded legacy SQLite compatibility `Database` currently provides prepared parameter binding, bounded
 JSON-object query rows, explicit transactions, typed failures, and deterministic rollback/close
 in both native execution and the interpreter. First-class nominal `data` schemas and
 compiler-owned `data add`, `data save`, `data find`, and guarded `data remove` expressions now
@@ -74,11 +74,69 @@ so raw SQL methods cannot leak into DISP Data code. Durable `data open` uses DIS
 v2 format with fixed 4096-byte pages, page and payload integrity checks, changed-page
 write-ahead commits, crash recovery, exclusive operating-system-backed process locking, and
 automatic migration from v1 snapshots. Interpreter and native execution use the same bytes and
-recovery rules. DataStore-only native programs do not link SQLite; SQLite remains solely behind
-the explicitly selected compatibility `Database` API.
+recovery rules. The bootstrap compiler and DataStore-only native programs do not statically link
+SQLite; the system library is resolved only after a program explicitly constructs the compatibility
+`Database` API. It is not DISP's engine: before 1.0 that
+legacy boundary must move out of the core toolchain into an optional isolated connector. DISP's
+default compiler, runtime, native Data engine, and file formats will have no SQLite dependency.
+PostgreSQL will be a fully supported deployment and interoperability target through a typed,
+capability-gated connector, but never a required runtime or storage foundation. A DISP program that
+uses only the native Data engine must compile, run, recover, and operate offline without PostgreSQL
+or any other external database installation. Pass 22 now provides deterministic, bounded
+`disp header` ABI-v1 contracts for checked C imports and exported DISP functions, including exact
+scalar and raw-pointer types, C++ linkage guards, transactional output, and direct C11/C++17
+compilation evidence. Pure `export C fn` call graphs can be packaged with `disp build --library`;
+real C-host tests load their stable symbols and verify status/out-result handling plus checked-panic
+containment through allocation-free helpers and recursion. Generated exact callback typedefs support
+indirect C-to-DISP calls. Typed thin `CFunction` values support context-free DISP-to-C calls under
+explicit `Foreign` authority. Same-thread nested C→DISP→C→DISP entry is denied without disturbing
+the outer containment target. Linear `CRegistration` values now own opaque C contexts and release
+them exactly once on consuming close or native scope exit. Foreign C threads now use explicit
+thread-local attach/detach calls and may enter concurrently. `CRegistration.adopt_async` now joins a
+provider through an exact quiesce callback before releasing its context. `CExport.callback` exposes
+only checked status/out-result wrappers to real C provider threads, while
+`CRegistration.register_async` atomically owns structurally Send-compatible closure contexts,
+including heap-owning strings, until provider quiescence; each invocation borrows the reusable
+environment, and secrets, pointers, borrowed views, guards, functions, and registrations fail
+closed. Checked C exports admit heap-only owned locals through a transactional allocation ledger
+that reclaims abandoned storage and restores call-depth state on contained failure. Linear
+`CRegistration` handles now install type-specific rollback hooks, so contained failure performs
+exactly-once reverse-order provider cleanup; unhooked resource classes remain fail-closed. Explicit `export C struct`
+records now carry deterministic nested layouts with generated field-offset, size, and alignment
+assertions; a real C host passes an Outernet-style packet into a DISP library and receives its
+transformed record by value. The same fixed-record header is compiled to both Windows x86-64 and
+i686 assembly, proving their distinct register and stack aggregate calling sequences.
+The enforceable dependency classes, current bootstrap debt, and 1.0 release blockers are recorded in
+[`docs/INDEPENDENCE.md`](docs/INDEPENDENCE.md).
+Functions also carry inferred or explicit `uses` capability contracts for filesystem,
+network, process, foreign, raw-memory, hardware I/O, timers, randomness, GPU, and UI authority. Unsafe regions may declare strict
+maximum contracts such as `unsafe uses RawMemory { ... }`; nested regions cannot widen an
+enclosing contract, and unsafe context never disables ordinary static checks. Local `const` values are evaluated under fixed
+compile-time budgets and folded before HIR/MIR lowering. `Meta.repeat` and hygienic `Meta.map`
+provide bounded parsed-AST generation without textual preprocessing or native compiler plugins.
+Recoverable failures use explicit `Result<T,E>` or `Option<T>` values. Postfix `?` preserves the
+exact carrier and error type, evaluates once, and performs reverse-order, exactly-once cleanup on
+both interpreter and native failure paths; hidden catch-anything exceptions are not part of the
+core language.
 The implementation
 remains under active development and should not
 yet be treated as a stable production language.
+
+DISP's first flagship validation project is **Outernet**, an independently implemented network
+ecosystem built from protocol and runtime foundations upward. The planned showcase portfolio also
+includes a DISP AI runtime/model, robotics platform, authentication system, office suite,
+development platform, and operating system. Their scope, dependency order, and proof gates are
+tracked in [`docs/SHOWCASE_PROJECTS.md`](docs/SHOWCASE_PROJECTS.md); planned products are not claimed
+as implemented until their executable gates pass.
+
+Pass 021 also contains direct runtime-free machine-image generators for x86 BIOS, x86 protected
+mode, x86-64 long mode, and the versioned QEMU AArch64 virt target with checked exact scalar
+computation, guarded recursive functions, checked compact fixed arrays, direct scalar output, and
+structured control flow with current-level exception containment, sparse W^X page protection, and
+bounded FDT boot discovery that validates RAM and finds PL011 without embedding a fixed UART address.
+Its `DeviceIo`-gated `Mmio.*` operations are exact-width, page-relative, alignment checked, and ordered.
+These paths emit machine
+instructions themselves rather than routing through the hosted C backend.
 
 The compiler and its tests are the authority for currently implemented
 behavior. See the [documentation index](docs/README.md) for verified compiler
@@ -94,6 +152,42 @@ which makes later passes faster and prevents build-output clutter:
 .\tools\dev.ps1 test
 .\tools\dev.ps1 verify
 .\tools\dev.ps1 example -Example examples/hello.disp
+```
+
+Format one source file or every `.disp` file under a project's `src` directory:
+
+```powershell
+cd compiler
+cargo run -- fmt examples/hello.disp
+cargo run -- fmt --check examples/package
+```
+
+The formatter validates syntax before writing, is idempotent, skips directory symlinks,
+and never rewrites a file in `--check` mode.
+
+Request stable machine-readable diagnostics for editors and build systems:
+
+```powershell
+cargo run -- --diagnostic-format=json check examples/hello.disp
+```
+
+JSON diagnostics are emitted on stderr using the versioned `disp.diagnostic.v1` envelope;
+human diagnostics remain the default.
+
+Inspect the statically inferred and explicitly declared authority of every function:
+
+```powershell
+cargo run -- check --dump-effects examples/async_io.disp
+```
+
+Functions may lock their maximum authority with contracts such as
+`uses FileSystem, Network`; explicit pure functions use `uses Pure`.
+
+Inspect evaluated constants and structured generation traces:
+
+```powershell
+cargo run -- check --dump-constants examples/control_flow.disp
+cargo run -- check --dump-expansions examples/control_flow.disp
 ```
 
 The compiler is also a normal Rust crate in `compiler/`:

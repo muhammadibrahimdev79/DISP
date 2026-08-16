@@ -1,0 +1,12 @@
+fn timer_ticks() -> u32 uses Timer {
+    return Time.ticks()
+}
+
+fn main() {
+    var first: u32 = timer_ticks()
+    var current: u32 = first
+    while current == first {
+        current = timer_ticks()
+    }
+    print("DISP x86-64 capability timer active")
+}

@@ -12,11 +12,10 @@ use std::{
 
 pub const LOCKFILE_NAME: &str = "DISP.lock";
 pub const LOCK_VERSION: &str = "1";
-pub const MAX_PACKAGES: usize = 512;
-pub const MAX_DEPENDENCY_DEPTH: usize = 128;
-pub const MAX_PACKAGE_FILES: usize = 16_384;
-pub const MAX_PACKAGE_SOURCE_BYTES: usize = 256 * 1024 * 1024;
-pub const MAX_LOCKFILE_BYTES: usize = 4 * 1024 * 1024;
+pub use crate::limits::{
+    MAX_DEPENDENCY_DEPTH, MAX_LOCKFILE_BYTES, MAX_PACKAGE_FILES, MAX_PACKAGE_SOURCE_BYTES,
+    MAX_PACKAGES,
+};
 
 #[derive(Debug, Clone)]
 pub struct ResolvedPackage {

@@ -1,0 +1,36 @@
+fn add(left: u32, right: u32) -> u32 {
+    return left + right
+}
+
+fn nested(value: u32) -> u32 {
+    return add(value, add(2, 3))
+}
+
+fn factorial(value: u16) -> u16 {
+    if value <= 1 { return 1 }
+    var previous: u16 = value - 1
+    var partial: u16 = factorial(previous)
+    return value * partial
+}
+
+fn even(value: u8) -> bool {
+    if value == 0 { return true }
+    return odd(value - 1)
+}
+
+fn odd(value: u8) -> bool {
+    if value == 0 { return false }
+    return even(value - 1)
+}
+
+fn signed_half(value: i32) -> i32 {
+    return value / -2
+}
+
+fn main() {
+    print("DISP x86-64 guarded functions")
+    print(nested(10))
+    print(factorial(6))
+    print(even(10))
+    print(signed_half(-84))
+}

@@ -1,0 +1,4 @@
+fn main() {
+    let store = data guess
+    print(store)
+}

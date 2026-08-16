@@ -1,0 +1,8 @@
+struct Left { value: int }
+struct Right { value: int }
+
+fn read(value: Left) -> int = value.value
+
+fn main() {
+    print(read(Right { value: 42 }))
+}

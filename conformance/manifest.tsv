@@ -1,0 +1,39 @@
+rule	case	mode	stage	expected	source
+DISP-CORE-0001	ordered-pipeline	run	-	42	cases/0001_ordered_pipeline.disp
+DISP-CORE-0002	unicode-nfc	check	-	-	cases/0002_unicode_nfc.disp
+DISP-CORE-0003	unterminated-string	reject	lexer	unterminated string literal	cases/0003_unterminated_string.disp
+DISP-CORE-0004	reserved-page	reject	parser	expected binding name	cases/0004_reserved_page.disp
+DISP-CORE-0005	bounded-nesting	reject	parser	expression nesting exceeds the limit	cases/0005_bounded_nesting.disp
+DISP-CORE-0006	unknown-name	reject	resolver	unknown name `missing`	cases/0006_unknown_name.disp
+DISP-CORE-0007	nominal-types	reject	type	function argument	cases/0007_nominal_types.disp
+DISP-CORE-0008	checked-range	reject	type	binding initializer expected i8	cases/0008_checked_range.disp
+DISP-CORE-0009	immutable-mutation	reject	resolver	immutable	cases/0009_immutable_mutation.disp
+DISP-CORE-0010	structured-control	run	-	4	cases/0010_structured_control.disp
+DISP-CORE-0011	closure-capture	run	-	42	cases/0011_closure_capture.disp
+DISP-CORE-0012	exhaustive-match	reject	type	non-exhaustive match	cases/0012_exhaustive_match.disp
+DISP-CORE-0013	generic-constraint	reject	type	does not satisfy constraint	cases/0013_generic_constraint.disp
+DISP-CORE-0014	borrow-conflict	reject	type	borrow	cases/0014_borrow_conflict.disp
+DISP-CORE-0015	unsafe-boundary	reject	type	requires an `unsafe` block	cases/0015_unsafe_boundary.disp
+DISP-CORE-0016	structured-async	run	-	42	cases/0016_structured_async.disp
+DISP-CORE-0017	typed-data-plan	run	-	true	cases/0017_typed_data_plan.disp
+DISP-CORE-0018	unknown-data-operation	reject	parser	unknown DISP Data operation	cases/0018_fail_closed.disp
+DISP-CORE-0019	stable-diagnostic	diagnostic	resolver	DISP-RESOLVE-0001	cases/0019_stable_diagnostic.disp
+DISP-CORE-0020	visible-authority	reject	type	requires capability `FileSystem`	cases/0020_visible_authority.disp
+DISP-CORE-0021	bounded-structured-generation	run	-	4	cases/0021_bounded_structured_generation.disp
+DISP-CORE-0022	exact-trait-contract	run	-	8	cases/0022_exact_trait_contract.disp
+DISP-CORE-0023	recursive-patterns	run	-	2	cases/0023_recursive_patterns.disp
+DISP-CORE-0024	typed-errors	run	-	42	cases/0024_typed_errors.disp
+DISP-CORE-0025	propagation-cleanup	run	-	6	cases/0025_propagation_cleanup.disp
+DISP-CORE-0026	edition-one	project-check	-	-	projects/0026_edition_one
+DISP-CORE-0027	feature-gate	project-reject	resolver	unsupported DISP feature `page-preview`	projects/0027_feature_gate
+DISP-CORE-0028	generic-borrow-origin	run	-	11	cases/0028_generic_borrow_origin.disp
+DISP-CORE-0029	tagged-safe-union	run	-	7	cases/0029_tagged_safe_union.disp
+DISP-CORE-0030	bounded-unsafe-region	reject	type	does not allow capability `RawMemory`	cases/0030_bounded_unsafe_region.disp
+DISP-CORE-0030	bounded-unsafe-foreign	run	-	7	cases/0030_bounded_unsafe_foreign.disp
+DISP-CORE-0031	checked-memory-pointer	run	-	7\n0	cases/0031_checked_memory_pointer.disp
+DISP-CORE-0031	checked-pointer-escape	reject	type	cannot return	cases/0031_checked_pointer_escape.disp
+DISP-CORE-0032	structured-channel	run	-	7\ntrue\n0	cases/0032_structured_channel.disp
+DISP-CORE-0032	invalid-atomic-order	reject	type	load_release	cases/0032_invalid_atomic_order.disp
+DISP-CORE-0033	deterministic-task-cancel	run	-	false\ncancelled	cases/0033_deterministic_task_cancel.disp
+DISP-CORE-0033	cancelled-task-moved	reject	type	moved	cases/0033_cancelled_task_moved.disp
+DISP-CORE-0034	bounded-runtime	run	-	10	cases/0034_bounded_runtime.disp

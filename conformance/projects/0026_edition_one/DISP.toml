@@ -1,0 +1,6 @@
+[package]
+name = "edition-one"
+version = "1.0.0"
+edition = "1"
+features = []
+entry = "src/main.disp"

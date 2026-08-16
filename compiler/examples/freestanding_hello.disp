@@ -1,0 +1,10 @@
+fn main() {
+    print("Hello from freestanding DISP")
+    var total: u16 = 0
+    var next: u16 = 1
+    while next <= 10 {
+        total += next
+        next += 1
+    }
+    print(total)
+}

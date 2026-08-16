@@ -1,0 +1,20 @@
+fn main() {
+    var value: u32 = 6
+    value *= 7
+    while value > 40 {
+        value -= 1
+    }
+
+    let quotient: u32 = value / 5
+    let remainder: u32 = value % 3
+    let ready: bool = quotient == 8 && remainder == 1
+
+    loop {
+        if ready {
+            print("AArch64 checked scalar control")
+            break
+        }
+        print("unreachable")
+        break
+    }
+}

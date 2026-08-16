@@ -1,0 +1,18 @@
+fn main() {
+    print("DISP x86-64 checked scalar profile")
+    var total: u32 = 0
+    var next: u32 = 1
+    while next <= 10 {
+        total += next
+        next += 1
+    }
+    var exact: bool = total == 55 && next == 11
+    var signed: i32 = -84
+    signed /= 2
+    var byte: u8 = 250
+    byte += 5
+    print(total)
+    print(exact)
+    print(signed)
+    print(byte)
+}

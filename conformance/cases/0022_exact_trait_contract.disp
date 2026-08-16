@@ -1,0 +1,15 @@
+struct Item { value: int }
+
+trait Source {
+    type Output
+    fn get(self: Self) -> Self.Output uses Pure
+}
+
+impl Source for Item {
+    type Output = int
+    fn get(self: Self) -> int uses Pure { return self.value }
+}
+
+fn main() uses Pure {
+    print(Item { value: 8 }.get())
+}

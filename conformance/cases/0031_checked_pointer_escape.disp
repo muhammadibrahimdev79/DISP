@@ -1,0 +1,6 @@
+fn leak() -> Result<MemoryPtr<u8>, String> {
+    memory = Memory.allocate(1, 8)?
+    return Ok(memory.as_ptr())
+}
+
+fn main() {}

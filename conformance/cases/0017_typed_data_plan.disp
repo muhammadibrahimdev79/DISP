@@ -1,0 +1,19 @@
+data Scientist {
+    id: int primary
+    name: String
+    active: bool
+}
+
+fn verify() -> Result<bool, DataError> {
+    var store = data memory?
+    data add Scientist { id: 1, name: "Ada", active: true } in store?
+    rows = data find Scientist in store where active limit 10?
+    return Ok(rows.len() == 1)
+}
+
+fn main() {
+    match verify() {
+        Ok(value) => print(value),
+        Err(error) => print(error),
+    }
+}

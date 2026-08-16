@@ -1,0 +1,15 @@
+enum Failure { Message(String) }
+
+fn source(ok: bool) -> Result<int, Failure> {
+    if ok { return Ok(21) }
+    return Err(Failure.Message("failed"))
+}
+
+fn double(ok: bool) -> Result<int, Failure> {
+    let value = source(ok)?
+    return Ok(value * 2)
+}
+
+fn main() {
+    print(match double(true) { Ok(value) => value Err(_) => 0 })
+}

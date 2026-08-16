@@ -1,0 +1,5 @@
+fn main() {
+    var byte: u8 = 255
+    byte += 1
+    print(byte)
+}

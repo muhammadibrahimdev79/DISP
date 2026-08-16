@@ -35,6 +35,7 @@ pub enum TokenKind {
     Mut,
     Unsafe,
     Extern,
+    Export,
     Data,
     Transaction,
     Page,
@@ -250,6 +251,7 @@ impl Lexer {
             "mut" => TokenKind::Mut,
             "unsafe" => TokenKind::Unsafe,
             "extern" => TokenKind::Extern,
+            "export" => TokenKind::Export,
             "data" => TokenKind::Data,
             "transaction" => TokenKind::Transaction,
             "page" => TokenKind::Page,
@@ -504,12 +506,13 @@ mod tests {
 
     #[test]
     fn lexes_keywords_identifiers_and_unicode() {
-        let tokens = kinds("fn main let nombre 東京").expect("lexer should succeed");
+        let tokens = kinds("fn main let export nombre 東京").expect("lexer should succeed");
         assert_eq!(tokens[0], TokenKind::Fn);
         assert_eq!(tokens[1], TokenKind::Identifier("main".into()));
         assert_eq!(tokens[2], TokenKind::Let);
-        assert_eq!(tokens[3], TokenKind::Identifier("nombre".into()));
-        assert_eq!(tokens[4], TokenKind::Identifier("東京".into()));
+        assert_eq!(tokens[3], TokenKind::Export);
+        assert_eq!(tokens[4], TokenKind::Identifier("nombre".into()));
+        assert_eq!(tokens[5], TokenKind::Identifier("東京".into()));
     }
 
     #[test]

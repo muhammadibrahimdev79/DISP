@@ -62,6 +62,64 @@ fn differential(name: &str, source: &str) {
 }
 
 #[test]
+fn hosted_backend_rejects_privileged_port_io_before_codegen() {
+    let source = r#"
+fn main() {
+    unsafe uses DeviceIo { Port.write_u8(u16(233), u8(80)) }
+}
+"#;
+    let path = temp_source("hosted-port-io", source);
+    let (hir, mir) = lower_source(source).unwrap();
+    let interpreter_error = run_source(source).unwrap_err();
+    assert!(
+        interpreter_error
+            .message
+            .contains("cannot execute in the hosted interpreter")
+    );
+    let error = backend::build(&hir, &mir, &path, BuildOptions::default()).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("unavailable in hosted native processes")
+    );
+    assert!(
+        error
+            .help
+            .as_deref()
+            .is_some_and(|help| help.contains("--freestanding32"))
+    );
+}
+
+#[test]
+fn hosted_engines_reject_privileged_mmio_before_execution_or_codegen() {
+    let source = r#"
+fn main() {
+    unsafe uses DeviceIo { Mmio.write_u32(u16(0), u32(80)) }
+}
+"#;
+    let path = temp_source("hosted-mmio", source);
+    let (hir, mir) = lower_source(source).unwrap();
+    let interpreter_error = run_source(source).unwrap_err();
+    assert!(
+        interpreter_error
+            .message
+            .contains("cannot execute in the hosted interpreter")
+    );
+    let error = backend::build(&hir, &mir, &path, BuildOptions::default()).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("unavailable in hosted native processes")
+    );
+    assert!(
+        error
+            .help
+            .as_deref()
+            .is_some_and(|help| help.contains("--freestanding-aarch64"))
+    );
+}
+
+#[test]
 fn target_layouts_and_abi_are_concrete() {
     let source = "struct Mixed { byte: u8, wide: u64 } enum Maybe { None, Some(i32) } fn main() { let mixed = Mixed { byte: 1, wide: 2 } let maybe = Maybe.Some(3) print(mixed.wide) print(match maybe { Some(value) => value None => 0 }) }";
     let (hir, _) = lower_source(source).unwrap();
@@ -213,9 +271,10 @@ fn representative_types_have_concrete_codegen_representations() {
     let target = Target::host().unwrap();
     let declarations = disp::backend::native_types::generate(&hir, &instances, target).unwrap();
     let abi = abi::lower(&hir, &mir, &instances, target).unwrap();
-    let generated = disp::backend::typed_codegen::generate(&mir, &instances, &abi, &declarations)
-        .unwrap()
-        .expect("all representative types should use concrete codegen");
+    let generated =
+        disp::backend::typed_codegen::generate(&mir, &instances, &abi, &declarations, false)
+            .unwrap()
+            .expect("all representative types should use concrete codegen");
     assert!(generated.contains("static disp_t_Ri8_GConversionError disp_f1_narrow(int64_t a1)"));
     assert!(!generated.contains("DV l["));
 }
@@ -292,6 +351,58 @@ fn main() {
 }
 
 #[test]
+fn native_nested_patterns_preserve_order_and_payload_tests() {
+    let source = r#"
+enum Pair { Values(bool, bool) Empty }
+enum Choice { Left(int) Right(int) Empty }
+struct Point { x: int, y: int }
+fn classify(value: Pair) -> int {
+    return match value {
+        Pair.Values(true, true) => 1 + 0
+        Pair.Values(true, false) => 2 + 0
+        Pair.Values(false, _) => 3 + 0
+        Pair.Empty => 0 + 0
+    }
+}
+fn label(value: Option<int>) -> String {
+    return match value { Some(0) => "zero" Some(_) => "number" None => "none" }
+}
+fn guarded(value: Option<String>) -> String {
+    return match value {
+        Some(text) if text.starts_with("A") => text
+        Some(text) => text
+        None => "none"
+    }
+}
+fn alternative(value: Choice) -> String {
+    return match value {
+        Choice.Left(number) | Choice.Right(number) if number > 10 => "large"
+        Choice.Left(0 | 1) | Choice.Right(0 | 1) => "small"
+        Choice.Left(_) | Choice.Right(_) => "other"
+        Choice.Empty => "empty"
+    }
+}
+fn signed_pattern(value: int) -> String {
+    return match value { -2 | -1 => "negative" 0 => "zero" _ => "positive" }
+}
+fn main() {
+    print(classify(Pair.Values(true, false)))
+    print(classify(Pair.Values(false, true)))
+    print(label(Some(0)))
+    print(label(Some(9)))
+    let point = Point { x: 4, y: 5 }
+    print(match point { Point { x, y: _ } => x })
+    print(guarded(Some("Beta")))
+    print(guarded(Some("Ada")))
+    print(alternative(Choice.Left(20)))
+    print(alternative(Choice.Right(1)))
+    print(signed_pattern(-1))
+}
+"#;
+    differential("nested-patterns", source);
+}
+
+#[test]
 fn native_generics_traits_references_and_moves_match_interpreter() {
     differential(
         "generic_trait",
@@ -342,7 +453,7 @@ fn native_checked_overflow_has_controlled_failure() {
 #[test]
 fn native_match_payload_moves_drop_remaining_fields_exactly_once() {
     let source = r#"
-enum Pair<T> { Both(T, T) }
+enum Pair<T> { Both(T, T) One(T) }
 enum Wrapped<T> { Value(Pair<T>, T) }
 fn take(value: Wrapped<String>) -> String {
     return match value {

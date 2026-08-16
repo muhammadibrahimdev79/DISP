@@ -1,0 +1,14 @@
+struct Resource { name: String }
+
+fn source() -> Result<int, String> { return Err("failed") }
+
+fn work() -> Result<int, String> {
+    let outer = Resource { name: "outer" }
+    let inner = Resource { name: "inner" }
+    let value = source()?
+    return Ok(value)
+}
+
+fn main() {
+    print(match work() { Ok(value) => value Err(_) => 6 })
+}

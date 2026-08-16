@@ -7,21 +7,21 @@ use crate::{
     parser::Parser,
 };
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
 
-pub const MAX_PROJECT_MODULES: usize = 1_024;
-pub const MAX_PROJECT_BYTES: usize = 64 * 1024 * 1024;
-pub const MAX_MODULE_DEPTH: usize = 128;
-pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
+pub use crate::limits::{
+    MAX_MANIFEST_BYTES, MAX_MODULE_DEPTH, MAX_PROJECT_BYTES, MAX_PROJECT_MODULES,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageManifest {
     pub name: String,
     pub version: String,
     pub edition: String,
+    pub features: BTreeSet<String>,
     pub entry: PathBuf,
     pub dependencies: BTreeMap<String, DependencySpec>,
 }
@@ -38,6 +38,13 @@ pub struct Project {
     pub sources: SourceMap,
     pub entry: PathBuf,
     pub package: Option<PackageManifest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationReport {
+    pub manifest: PathBuf,
+    pub edition: String,
+    pub changed: bool,
 }
 
 pub fn load(input: &Path) -> Result<Project, Diagnostic> {
@@ -177,7 +184,7 @@ pub fn create(path: &Path) -> Result<(), Diagnostic> {
         )
     })?;
     let manifest = format!(
-        "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"1\"\nentry = \"src/main.disp\"\n"
+        "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"1\"\nfeatures = []\nentry = \"src/main.disp\"\n"
     );
     let write_result = fs::write(path.join("DISP.toml"), manifest)
         .and_then(|_| {
@@ -202,6 +209,96 @@ pub fn create(path: &Path) -> Result<(), Diagnostic> {
     Ok(())
 }
 
+pub fn migrate(path: &Path, check: bool) -> Result<MigrationReport, Diagnostic> {
+    let metadata = fs::metadata(path).map_err(|cause| {
+        project_error(
+            format!("could not inspect project `{}`: {cause}", path.display()),
+            Span::point(1, 1),
+        )
+        .with_file(path.display().to_string())
+    })?;
+    if !metadata.is_dir() {
+        return Err(project_error(
+            "`disp migrate` requires a project directory",
+            Span::point(1, 1),
+        )
+        .with_file(path.display().to_string()));
+    }
+    let manifest_path = path.join("DISP.toml");
+    let manifest = parse_manifest(&manifest_path)?;
+    let source = fs::read_to_string(&manifest_path).map_err(|cause| {
+        manifest_error(
+            &manifest_path,
+            1,
+            format!("could not read package manifest for migration: {cause}"),
+        )
+    })?;
+    let mut section = None::<&str>;
+    let mut explicit_edition = false;
+    let mut explicit_features = false;
+    let mut version_line = None;
+    let mut edition_line = None;
+    let lines = source.lines().collect::<Vec<_>>();
+    for (index, raw) in lines.iter().enumerate() {
+        let line = raw.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            section = Some(line[1..line.len() - 1].trim());
+            continue;
+        }
+        if section == Some("package")
+            && let Some((key, _)) = line.split_once('=')
+        {
+            match key.trim() {
+                "edition" => {
+                    explicit_edition = true;
+                    edition_line = Some(index);
+                }
+                "features" => explicit_features = true,
+                "version" => version_line = Some(index),
+                _ => {}
+            }
+        }
+    }
+    if explicit_edition && explicit_features {
+        return Ok(MigrationReport {
+            manifest: manifest_path,
+            edition: manifest.edition,
+            changed: false,
+        });
+    }
+    let version_line = version_line.expect("validated manifests always contain a version");
+    let mut migrated = lines
+        .iter()
+        .map(|line| (*line).to_owned())
+        .collect::<Vec<_>>();
+    if !explicit_edition {
+        migrated.insert(
+            version_line + 1,
+            format!("edition = \"{}\"", manifest.edition),
+        );
+        edition_line = Some(version_line + 1);
+    }
+    if !explicit_features {
+        let edition_line = edition_line.expect("migration always has an explicit edition");
+        migrated.insert(edition_line + 1, "features = []".to_owned());
+    }
+    let migrated = migrated.join("\n") + "\n";
+    if !check {
+        fs::write(&manifest_path, migrated).map_err(|cause| {
+            manifest_error(
+                &manifest_path,
+                version_line + 2,
+                format!("could not write migrated package manifest: {cause}"),
+            )
+        })?;
+    }
+    Ok(MigrationReport {
+        manifest: manifest_path,
+        edition: manifest.edition,
+        changed: true,
+    })
+}
+
 pub(crate) fn parse_manifest(path: &Path) -> Result<PackageManifest, Diagnostic> {
     let metadata = fs::metadata(path).map_err(|cause| {
         manifest_error(
@@ -224,6 +321,7 @@ pub(crate) fn parse_manifest(path: &Path) -> Result<PackageManifest, Diagnostic>
     let mut saw_package_section = false;
     let mut saw_dependencies_section = false;
     let mut values = BTreeMap::<String, (String, usize)>::new();
+    let mut features = None::<(BTreeSet<String>, usize)>;
     let mut dependencies = BTreeMap::<String, DependencySpec>::new();
     for (index, raw) in source.lines().enumerate() {
         let line_number = index + 1;
@@ -244,6 +342,9 @@ pub(crate) fn parse_manifest(path: &Path) -> Result<PackageManifest, Diagnostic>
             }
             let name = line[1..line.len() - 1].trim();
             if !matches!(name, "package" | "dependencies") {
+                if is_extension_manifest_name(name) {
+                    return Err(extension_manifest_error(path, line_number, name));
+                }
                 return Err(manifest_error(
                     path,
                     line_number,
@@ -317,19 +418,33 @@ pub(crate) fn parse_manifest(path: &Path) -> Result<PackageManifest, Diagnostic>
                 "manifest values must appear under `[package]` or `[dependencies]`",
             ));
         }
-        if !matches!(key, "name" | "version" | "edition" | "entry") {
+        if !matches!(key, "name" | "version" | "edition" | "features" | "entry") {
+            if is_extension_manifest_name(key) {
+                return Err(extension_manifest_error(path, line_number, key));
+            }
             return Err(manifest_error(
                 path,
                 line_number,
                 format!("unknown package field `{key}`"),
             ));
         }
-        if values.contains_key(key) {
+        if values.contains_key(key) || (key == "features" && features.is_some()) {
             return Err(manifest_error(
                 path,
                 line_number,
                 format!("duplicate package field `{key}`"),
             ));
+        }
+        if key == "features" {
+            let parsed = parse_manifest_features(raw_value.trim()).ok_or_else(|| {
+                manifest_error(
+                    path,
+                    line_number,
+                    "package features must be a bounded array of unique quoted names",
+                )
+            })?;
+            features = Some((parsed, line_number));
+            continue;
         }
         let value = parse_manifest_string(raw_value.trim()).ok_or_else(|| {
             manifest_error(
@@ -356,6 +471,16 @@ pub(crate) fn parse_manifest(path: &Path) -> Result<PackageManifest, Diagnostic>
             format!("unsupported DISP edition `{edition}`; this compiler supports edition `1`"),
         ));
     }
+    let (features, features_line) = features.unwrap_or_else(|| (BTreeSet::new(), 1));
+    if let Some(feature) = features.first() {
+        return Err(manifest_error(
+            path,
+            features_line,
+            format!(
+                "unsupported DISP feature `{feature}`; edition `1` currently has no unstable opt-in features"
+            ),
+        ));
+    }
     let entry = values
         .get("entry")
         .map(|(value, _)| value.as_str())
@@ -380,9 +505,35 @@ pub(crate) fn parse_manifest(path: &Path) -> Result<PackageManifest, Diagnostic>
         name,
         version,
         edition,
+        features,
         entry: entry_path,
         dependencies,
     })
+}
+
+fn parse_manifest_features(value: &str) -> Option<BTreeSet<String>> {
+    let inner = value.strip_prefix('[')?.strip_suffix(']')?.trim();
+    if inner.is_empty() {
+        return Some(BTreeSet::new());
+    }
+    let mut features = BTreeSet::new();
+    for raw in inner.split(',') {
+        if features.len() >= 64 {
+            return None;
+        }
+        let feature = parse_manifest_string(raw.trim())?;
+        if feature.is_empty()
+            || feature.len() > 64
+            || !feature.as_bytes()[0].is_ascii_lowercase()
+            || !feature
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            || !features.insert(feature)
+        {
+            return None;
+        }
+    }
+    Some(features)
 }
 
 fn parse_path_dependency(value: &str) -> Option<PathBuf> {
@@ -488,6 +639,33 @@ fn validate_version(version: &str) -> Result<(), &'static str> {
 fn manifest_error(path: &Path, line: usize, message: impl Into<String>) -> Diagnostic {
     Diagnostic::new(DiagnosticKind::Resolve, message, Span::point(line, 1))
         .with_file(path.display().to_string())
+}
+
+fn is_extension_manifest_name(name: &str) -> bool {
+    matches!(
+        name,
+        "build"
+            | "build-script"
+            | "build-scripts"
+            | "macro"
+            | "macros"
+            | "plugin"
+            | "plugins"
+            | "proc-macro"
+            | "procedural-macro"
+            | "procedural-macros"
+    )
+}
+
+fn extension_manifest_error(path: &Path, line: usize, name: &str) -> Diagnostic {
+    manifest_error(
+        path,
+        line,
+        format!("compiler extension `{name}` is disabled in DISP edition 1"),
+    )
+    .with_help(
+        "build scripts, procedural macros, and compiler plugins never execute in the compiler process; use ordinary DISP source or an explicitly sandboxed out-of-process tool",
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -1499,7 +1677,7 @@ impl<'a> Renamer<'a> {
                 self.rename_expr(iterable);
                 self.rename_block_with(body, name.clone());
             }
-            Statement::Loop(body) | Statement::Unsafe(body) => self.rename_block(body),
+            Statement::Loop(body) | Statement::Unsafe { body, .. } => self.rename_block(body),
             Statement::Break | Statement::Continue => {}
         }
     }
@@ -1621,6 +1799,9 @@ impl<'a> Renamer<'a> {
                     let mut bindings = HashSet::new();
                     self.rename_pattern(&mut arm.pattern.node, &mut bindings);
                     self.scopes.push(bindings);
+                    if let Some(guard) = &mut arm.guard {
+                        self.rename_expr(guard);
+                    }
                     self.rename_expr(&mut arm.value);
                     self.scopes.pop();
                 }
@@ -1655,6 +1836,21 @@ impl<'a> Renamer<'a> {
             Pattern::Binding(name) => {
                 bindings.insert(name.clone());
             }
+            Pattern::Or(alternatives) => {
+                for alternative in alternatives {
+                    self.rename_pattern(&mut alternative.node, bindings);
+                }
+            }
+            Pattern::Struct {
+                type_name, fields, ..
+            } => {
+                if let Some(definition) = self.namespace.get(type_name) {
+                    *type_name = definition.canonical.clone();
+                }
+                for field in fields {
+                    self.rename_pattern(&mut field.pattern.node, bindings);
+                }
+            }
             Pattern::Variant {
                 type_name,
                 variant,
@@ -1682,6 +1878,7 @@ impl<'a> Renamer<'a> {
             }
             Pattern::Wildcard
             | Pattern::Integer(_)
+            | Pattern::NegativeInteger(_)
             | Pattern::String(_)
             | Pattern::Character(_)
             | Pattern::Bool(_) => {}
