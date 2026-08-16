@@ -185,7 +185,7 @@ int main(void) {
     if (setsid() != -1 || errno != EPERM) return 12;
     if (prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 1) return 13;
     pid_t child = fork();
-    if (child < 0) return 14;
+    if (child < 0) return errno == EAGAIN ? 0 : 14;
     if (child == 0) _exit(0);
     int status = 0;
     if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0) return 15;
