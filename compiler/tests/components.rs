@@ -10,7 +10,13 @@ fn component_probe() -> &'static PathBuf {
         let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join("component-tests")
-            .join("native-probe");
+            // Isolated child tests run this test binary while the parent test
+            // process is still invoking its probe.  A process-local OnceLock
+            // cannot serialize compilation across those processes, and
+            // rewriting an executable that another process is launching fails
+            // with ETXTBSY on Linux.  Give every process its own immutable
+            // probe artifact instead.
+            .join(format!("native-probe-{}", std::process::id()));
         fs::create_dir_all(&directory).unwrap();
         let source = directory.join("component.c");
         #[cfg(windows)]
@@ -250,7 +256,8 @@ fn invoke_probe_with_arguments(
     #[cfg(windows)]
     let launch_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
-        .join("component-tests");
+        .join("component-tests")
+        .join(format!("launch-{}", std::process::id()));
     #[cfg(windows)]
     fs::create_dir_all(&launch_root).unwrap();
     let mut blocked = None;
