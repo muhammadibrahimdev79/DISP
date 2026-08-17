@@ -23,6 +23,12 @@ Cancellation is cooperative between scheduler polls. A cancellation request prev
 the future drop function releases operation state and any owned inputs exactly once. Cancellation
 does not roll back external side effects that completed before the cancellation boundary.
 
+For a native operation that the operating system has already started and cannot safely cancel,
+cleanup-before-return means the task and future release their ownership and discard the result; it
+does not mean blocking the cooperative executor until the system call finishes. The runtime keeps
+only the worker-owned state needed to finish that operation and drains all such workers before
+process exit.
+
 ## Deadlines
 
 Timeout-bearing operations accept `Duration`. Their deadline starts on the first poll, preserving

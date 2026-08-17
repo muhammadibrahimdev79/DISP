@@ -375,4 +375,8 @@ fn main() {}"#;
     assert!(generated.contains("disp_tls_stream_drop"));
     assert!(generated.contains("DeleteSecurityContext"));
     assert!(generated.contains("FreeCredentialsHandle"));
+    assert!(generated.contains("SSL_CTX_set_min_proto_version"));
+    assert!(generated.contains("SSL_CTX_set_default_verify_paths"));
+    assert!(generated.contains("X509_VERIFY_PARAM_set1_host"));
+    assert!(generated.contains("MSG_NOSIGNAL"));
 }

@@ -9773,13 +9773,19 @@ impl Interpreter {
                                 let result = if already {
                                     Ok(Value::Unit)
                                 } else if let Some(socket) = guard.socket.as_mut() {
-                                    let result = socket
-                                        .shutdown(if reading {
-                                            Shutdown::Read
-                                        } else {
-                                            Shutdown::Write
-                                        })
-                                        .map(|()| Value::Unit);
+                                    let result = match socket.shutdown(if reading {
+                                        Shutdown::Read
+                                    } else {
+                                        Shutdown::Write
+                                    }) {
+                                        Ok(()) => Ok(Value::Unit),
+                                        Err(error)
+                                            if error.kind() == std::io::ErrorKind::NotConnected =>
+                                        {
+                                            Ok(Value::Unit)
+                                        }
+                                        Err(error) => Err(error),
+                                    };
                                     if result.is_ok() {
                                         if reading {
                                             guard.read_shutdown = true;

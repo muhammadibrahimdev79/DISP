@@ -132,7 +132,19 @@ pub fn build(
                 )
             })
     });
-    let networking = http || mir.functions.iter().any(|function| {
+    let tls = mir.functions.iter().any(|function| {
+        function.locals.iter().any(|local| type_uses_tls(&local.ty))
+            || function.blocks.iter().any(|block| {
+                matches!(
+                    &block.terminator,
+                    mir::Terminator::Call {
+                        target: hir::CallTarget::Intrinsic(name),
+                        ..
+                    } if name.starts_with("Tls.") || name.starts_with("TlsStream.")
+                )
+            })
+    });
+    let networking = http || tls || mir.functions.iter().any(|function| {
         function
             .locals
             .iter()
@@ -207,6 +219,7 @@ pub fn build(
         options.sanitizers,
         linker::RuntimeFeatures {
             networking,
+            tls,
             http,
             database,
             data,
@@ -475,6 +488,36 @@ fn type_uses_http(ty: &hir::Type) -> bool {
         }
         hir::Type::Function(arguments, result) | hir::Type::CFunction(arguments, result) => {
             arguments.iter().any(type_uses_http) || type_uses_http(result)
+        }
+        _ => false,
+    }
+}
+
+fn type_uses_tls(ty: &hir::Type) -> bool {
+    match ty {
+        hir::Type::TlsStream => true,
+        hir::Type::Array(inner, _)
+        | hir::Type::Slice(inner)
+        | hir::Type::List(inner)
+        | hir::Type::Set(inner)
+        | hir::Type::Thread(inner)
+        | hir::Type::Future(inner)
+        | hir::Type::Task(inner)
+        | hir::Type::Mutex(inner)
+        | hir::Type::MutexGuard(inner)
+        | hir::Type::Channel(inner)
+        | hir::Type::Option(inner)
+        | hir::Type::Reference { inner, .. }
+        | hir::Type::RawPointer { inner, .. }
+        | hir::Type::MemoryPointer { inner, .. } => type_uses_tls(inner),
+        hir::Type::Map(key, value) | hir::Type::Result(key, value) => {
+            type_uses_tls(key) || type_uses_tls(value)
+        }
+        hir::Type::Struct(_, arguments) | hir::Type::Enum(_, arguments) => {
+            arguments.iter().any(type_uses_tls)
+        }
+        hir::Type::Function(arguments, result) | hir::Type::CFunction(arguments, result) => {
+            arguments.iter().any(type_uses_tls) || type_uses_tls(result)
         }
         _ => false,
     }

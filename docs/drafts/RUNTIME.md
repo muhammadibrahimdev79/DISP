@@ -812,8 +812,10 @@ bounded to 16 MiB per operation. Async writes own a copy of their input so later
 alter pending output. Per-direction operations are serialized, bounds and timeout failures are
 typed, and zero-duration operations fail without emitting network data. `close` sends authenticated
 TLS shutdown where possible; explicit close, cancellation, failure, and drop release both TLS and
-socket resources deterministically. The current native implementation uses Windows Schannel, while
-the interpreter provides the same language-level contract through the host TLS implementation.
+socket resources deterministically. Native Windows targets use Schannel. Native POSIX targets use
+OpenSSL with its system default trust paths, nonblocking socket BIO, certificate-chain and host-name
+verification, and SIGPIPE-safe writes. The interpreter provides the same language-level contract
+through the host TLS implementation.
 
 ---
 

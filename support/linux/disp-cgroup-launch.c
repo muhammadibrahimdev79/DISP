@@ -70,6 +70,48 @@ static int parse_positive(const char *text, unsigned long long *value) {
     return 0;
 }
 
+static int parse_exec_error_fd(const char *text, int *value) {
+    if (!text || !*text) return -1;
+    unsigned int parsed = 0;
+    for (const unsigned char *cursor = (const unsigned char *)text; *cursor; cursor++) {
+        if (*cursor < '0' || *cursor > '9') return -1;
+        unsigned int digit = (unsigned int)(*cursor - '0');
+        if (parsed > ((unsigned int)INT_MAX - digit) / 10U) return -1;
+        parsed = parsed * 10U + digit;
+    }
+    if (parsed < 3U || fcntl((int)parsed, F_GETFD) < 0) return -1;
+    int status = fcntl((int)parsed, F_GETFL);
+    if (status < 0 || (status & O_ACCMODE) == O_RDONLY) return -1;
+    *value = (int)parsed;
+    return 0;
+}
+
+static void write_exec_error(int fd, int code) {
+    if (fd < 0) return;
+    int saved = errno;
+    int32_t wire_code = (int32_t)(code > 0 ? code : EIO);
+    const unsigned char *bytes = (const unsigned char *)&wire_code;
+    size_t written = 0;
+    while (written < sizeof(wire_code)) {
+        ssize_t count = write(fd, bytes + written, sizeof(wire_code) - written);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (!count) break;
+        written += (size_t)count;
+    }
+    errno = saved;
+}
+
+static void report_launch_error(int fd, const char *operation) {
+    int code = errno ? errno : EIO;
+    write_exec_error(fd, code);
+    errno = code;
+    report(operation);
+    errno = code;
+}
+
 static int write_all(int fd, const char *text) {
     size_t length = strlen(text), written = 0;
     while (written < length) {
@@ -244,14 +286,24 @@ static int install_network_deny_filter(void) {
     return prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program);
 }
 
-static int close_private_fds(void) {
+static int close_private_fds(int preserved_fd) {
 #ifdef __NR_close_range
-    if (syscall(__NR_close_range, 3U, ~0U, 0U) == 0) return 0;
-    if (errno != ENOSYS && errno != EINVAL) return -1;
+    if (preserved_fd < 3) {
+        if (syscall(__NR_close_range, 3U, ~0U, 0U) == 0) return 0;
+        if (errno != ENOSYS && errno != EINVAL) return -1;
+    } else {
+        if (preserved_fd > 3 &&
+            syscall(__NR_close_range, 3U, (unsigned int)preserved_fd - 1U, 0U) != 0 &&
+            errno != ENOSYS && errno != EINVAL) return -1;
+        if (syscall(__NR_close_range, (unsigned int)preserved_fd + 1U, ~0U, 0U) == 0) return 0;
+        if (errno != ENOSYS && errno != EINVAL) return -1;
+    }
 #endif
     long maximum = sysconf(_SC_OPEN_MAX);
     if (maximum < 0) maximum = 65536;
-    for (int fd = 3; fd < maximum && fd < INT_MAX; fd++) close(fd);
+    for (int fd = 3; fd < maximum && fd < INT_MAX; fd++) {
+        if (fd != preserved_fd) close(fd);
+    }
     return 0;
 }
 
@@ -262,12 +314,16 @@ static int configure_worker(
     gid_t group,
     unsigned long long memory,
     unsigned long long cpu_millis,
-    int deny_network
+    int deny_network,
+    int exec_error_fd
 ) {
     char pid_text[32];
     int pid_length = snprintf(pid_text, sizeof(pid_text), "%ld", (long)getpid());
-    if (pid_length <= 0 || (size_t)pid_length >= sizeof(pid_text) ||
-        write_control(job, "cgroup.procs", pid_text) != 0) return -1;
+    if (pid_length <= 0 || (size_t)pid_length >= sizeof(pid_text)) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    if (write_control(job, "cgroup.procs", pid_text) != 0) return -1;
 
     rlim_t memory_limit = (rlim_t)memory;
     rlim_t cpu_seconds = (rlim_t)(cpu_millis / 1000 + (cpu_millis % 1000 != 0));
@@ -285,8 +341,8 @@ static int configure_worker(
     uid_t real, effective, saved;
     gid_t real_group, effective_group, saved_group;
     if (getresuid(&real, &effective, &saved) != 0 ||
-        getresgid(&real_group, &effective_group, &saved_group) != 0 ||
-        real != user || effective != user || saved != user ||
+        getresgid(&real_group, &effective_group, &saved_group) != 0) return -1;
+    if (real != user || effective != user || saved != user ||
         real_group != group || effective_group != group || saved_group != group) {
         errno = EPERM;
         return -1;
@@ -298,7 +354,7 @@ static int configure_worker(
     }
     if (install_escape_filter() != 0 ||
         (deny_network && install_network_deny_filter() != 0) ||
-        close_private_fds() != 0) return -1;
+        close_private_fds(exec_error_fd) != 0) return -1;
     return 0;
 }
 
@@ -313,7 +369,11 @@ static int read_cpu_usage(int job, unsigned long long *usage) {
     int saved = errno;
     close(fd);
     errno = saved;
-    if (count <= 0) return -1;
+    if (count < 0) return -1;
+    if (!count) {
+        errno = EPROTO;
+        return -1;
+    }
     buffer[count] = 0;
     const char *line = buffer;
     while (*line) {
@@ -333,7 +393,10 @@ static int read_cpu_usage(int job, unsigned long long *usage) {
 static unsigned long long monotonic_millis(void) {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return ULLONG_MAX;
-    if ((unsigned long long)now.tv_sec > ULLONG_MAX / 1000ULL) return ULLONG_MAX;
+    if ((unsigned long long)now.tv_sec > ULLONG_MAX / 1000ULL) {
+        errno = EOVERFLOW;
+        return ULLONG_MAX;
+    }
     return (unsigned long long)now.tv_sec * 1000ULL +
         (unsigned long long)now.tv_nsec / 1000000ULL;
 }
@@ -355,18 +418,42 @@ static int cleanup_job(int base, int job, const char *name) {
 int main(int argc, char **argv) {
     if (argc < 6) {
         dprintf(STDERR_FILENO,
-            "usage: disp-cgroup-launch MEMORY_BYTES CPU_MILLIS PROCESSES WALL_MILLIS [--component-networkless] /absolute/program [args...]\n");
+            "usage: disp-cgroup-launch MEMORY_BYTES CPU_MILLIS PROCESSES WALL_MILLIS [--exec-error-fd FD] [--component-networkless] /absolute/program [args...]\n");
         return 125;
     }
     int target_index = 5;
     int deny_network = 0;
-    if (!strcmp(argv[5], "--component-networkless")) {
-        if (argc < 7) {
-            dprintf(STDERR_FILENO, "disp-cgroup-launch: component target is missing\n");
-            return 125;
+    int exec_error_fd = -1;
+    while (target_index < argc) {
+        if (!strcmp(argv[target_index], "--exec-error-fd")) {
+            if (exec_error_fd >= 0 || target_index + 1 >= argc ||
+                parse_exec_error_fd(argv[target_index + 1], &exec_error_fd) != 0) {
+                errno = EINVAL;
+                write_exec_error(exec_error_fd, errno);
+                dprintf(STDERR_FILENO, "disp-cgroup-launch: invalid exec-error file descriptor\n");
+                return 125;
+            }
+            target_index += 2;
+            continue;
         }
-        target_index = 6;
-        deny_network = 1;
+        if (!strcmp(argv[target_index], "--component-networkless")) {
+            if (deny_network) {
+                errno = EINVAL;
+                write_exec_error(exec_error_fd, errno);
+                dprintf(STDERR_FILENO, "disp-cgroup-launch: duplicate component network policy\n");
+                return 125;
+            }
+            deny_network = 1;
+            target_index++;
+            continue;
+        }
+        break;
+    }
+    if (target_index >= argc) {
+        errno = EINVAL;
+        write_exec_error(exec_error_fd, errno);
+        dprintf(STDERR_FILENO, "disp-cgroup-launch: target is missing\n");
+        return 125;
     }
     unsigned long long memory, cpu_millis, processes, wall_millis;
     if (parse_positive(argv[1], &memory) != 0 ||
@@ -375,45 +462,58 @@ int main(int argc, char **argv) {
         parse_positive(argv[4], &wall_millis) != 0 || processes > 1048576ULL ||
         cpu_millis > ULLONG_MAX / 1000ULL ||
         argv[target_index][0] != '/') {
+        errno = EINVAL;
+        write_exec_error(exec_error_fd, errno);
         dprintf(STDERR_FILENO, "disp-cgroup-launch: invalid limits or non-absolute target\n");
         return 125;
     }
     uid_t user = getuid();
     gid_t group = getgid();
     if (geteuid() != 0 || getegid() != 0) {
+        errno = EPERM;
+        write_exec_error(exec_error_fd, errno);
         dprintf(STDERR_FILENO, "disp-cgroup-launch: helper is not running with root ownership\n");
         return 125;
     }
 
     char target[PATH_MAX];
     if (!realpath(argv[target_index], target)) {
-        report("realpath target");
+        report_launch_error(exec_error_fd, "realpath target");
         return 125;
     }
     struct stat target_info;
-    if (stat(target, &target_info) != 0 || !S_ISREG(target_info.st_mode)) {
-        report("validate target");
+    if (stat(target, &target_info) != 0) {
+        report_launch_error(exec_error_fd, "validate target");
+        return 125;
+    }
+    if (!S_ISREG(target_info.st_mode)) {
+        errno = EACCES;
+        report_launch_error(exec_error_fd, "validate target");
         return 125;
     }
     argv[target_index] = target;
 
     int base = open(DISP_CGROUP_ROOT, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (base < 0) {
-        report("open trusted cgroup root");
+        report_launch_error(exec_error_fd, "open trusted cgroup root");
         return 125;
     }
     struct stat base_info;
-    if (fstat(base, &base_info) != 0 || base_info.st_uid != 0 ||
-        (base_info.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+    if (fstat(base, &base_info) != 0) {
+        report_launch_error(exec_error_fd, "validate trusted cgroup root ownership");
+        close(base);
+        return 125;
+    }
+    if (base_info.st_uid != 0 || (base_info.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
         errno = EPERM;
-        report("validate trusted cgroup root ownership");
+        report_launch_error(exec_error_fd, "validate trusted cgroup root ownership");
         close(base);
         return 125;
     }
 
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
-        report("read monotonic clock");
+        report_launch_error(exec_error_fd, "read monotonic clock");
         close(base);
         return 125;
     }
@@ -421,15 +521,20 @@ int main(int argc, char **argv) {
     int name_length = snprintf(name, sizeof(name), "uid-%lu-pid-%ld-%lld",
         (unsigned long)user, (long)getpid(),
         (long long)now.tv_sec * 1000000000LL + now.tv_nsec);
-    if (name_length <= 0 || (size_t)name_length >= sizeof(name) ||
-        mkdirat(base, name, 0755) != 0) {
-        report("create job cgroup");
+    if (name_length <= 0 || (size_t)name_length >= sizeof(name)) {
+        errno = EOVERFLOW;
+        report_launch_error(exec_error_fd, "create job cgroup");
+        close(base);
+        return 125;
+    }
+    if (mkdirat(base, name, 0755) != 0) {
+        report_launch_error(exec_error_fd, "create job cgroup");
         close(base);
         return 125;
     }
     int job = openat(base, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (job < 0) {
-        report("open job cgroup");
+        report_launch_error(exec_error_fd, "open job cgroup");
         unlinkat(base, name, AT_REMOVEDIR);
         close(base);
         return 125;
@@ -441,14 +546,21 @@ int main(int argc, char **argv) {
     if (write_control(job, "memory.max", memory_text) != 0 ||
         write_control(job, "memory.oom.group", "1") != 0 ||
         write_control(job, "pids.max", process_text) != 0) {
-        report("configure cgroup limits");
+        report_launch_error(exec_error_fd, "configure cgroup limits");
         cleanup_job(base, job, name);
         close(base);
         return 125;
     }
     unsigned long long initial_cpu;
-    if (read_cpu_usage(job, &initial_cpu) != 0 || initial_cpu != 0) {
-        report("validate cgroup CPU accounting");
+    if (read_cpu_usage(job, &initial_cpu) != 0) {
+        report_launch_error(exec_error_fd, "validate cgroup CPU accounting");
+        cleanup_job(base, job, name);
+        close(base);
+        return 125;
+    }
+    if (initial_cpu != 0) {
+        errno = EBUSY;
+        report_launch_error(exec_error_fd, "validate cgroup CPU accounting");
         cleanup_job(base, job, name);
         close(base);
         return 125;
@@ -456,7 +568,7 @@ int main(int argc, char **argv) {
 
     unsigned long long started = monotonic_millis();
     if (started == ULLONG_MAX) {
-        report("read launch clock");
+        report_launch_error(exec_error_fd, "read launch clock");
         cleanup_job(base, job, name);
         close(base);
         return 125;
@@ -464,25 +576,38 @@ int main(int argc, char **argv) {
     pid_t supervisor = getpid();
     pid_t child = fork();
     if (child < 0) {
-        report("fork worker");
+        report_launch_error(exec_error_fd, "fork worker");
         cleanup_job(base, job, name);
         close(base);
         return 125;
     }
     if (child == 0) {
+        if (exec_error_fd >= 0) {
+            int descriptor_flags = fcntl(exec_error_fd, F_GETFD);
+            if (descriptor_flags < 0 ||
+                fcntl(exec_error_fd, F_SETFD, descriptor_flags | FD_CLOEXEC) != 0) {
+                report_launch_error(exec_error_fd, "protect exec-error file descriptor");
+                _exit(126);
+            }
+        }
         if (configure_worker(job, supervisor, user, group, memory, cpu_millis,
-            deny_network) != 0) {
-            report("configure worker boundary");
+            deny_network, exec_error_fd) != 0) {
+            report_launch_error(exec_error_fd, "configure worker boundary");
             _exit(126);
         }
         execv(target, &argv[target_index]);
-        report("execute target");
+        report_launch_error(exec_error_fd, "execute target");
         _exit(127);
+    }
+    if (exec_error_fd >= 0) {
+        close(exec_error_fd);
+        exec_error_fd = -1;
     }
 
     int status = 0;
     pid_t waited = 0;
     int boundary_exit = 0;
+    const char *boundary_message = NULL;
     struct timespec pause = { .tv_sec = 0, .tv_nsec = 2000000 };
     while (!waited) {
         waited = waitpid(child, &status, WNOHANG);
@@ -495,11 +620,15 @@ int main(int argc, char **argv) {
         if (read_cpu_usage(job, &usage) != 0 || now == ULLONG_MAX) {
             report("monitor cgroup boundary");
             boundary_exit = 125;
-        } else if (usage >= cpu_millis * 1000ULL ||
-            now - started >= wall_millis) {
+        } else if (usage >= cpu_millis * 1000ULL) {
             boundary_exit = 124;
+            boundary_message = "sandbox process tree exceeded its CPU limit\n";
+        } else if (now - started >= wall_millis) {
+            boundary_exit = 124;
+            boundary_message = "sandbox process tree exceeded its wall deadline\n";
         }
         if (boundary_exit) {
+            if (boundary_message) dprintf(STDERR_FILENO, "%s", boundary_message);
             if (write_control(job, "cgroup.kill", "1") != 0) report("terminate cgroup");
             do {
                 waited = waitpid(child, &status, 0);

@@ -362,21 +362,27 @@ fn main() {
 
 #[test]
 fn native_child_process_launch_attempts_share_one_quota() {
+    #[cfg(windows)]
+    let missing = "Z:/definitely/missing/disp-quota.exe";
+    #[cfg(not(windows))]
+    let missing = "/definitely/missing/disp-quota";
     let output = native(
         "process-starts",
-        r#"
-fn attempt() -> bool {
+        &format!(
+            r#"
+fn attempt() -> bool {{
     var arguments: List<String> = List.new()
-    return match Process.run(Path("Z:/definitely/missing/disp-quota.exe"), arguments) {
+    return match Process.run(Path("{missing}"), arguments) {{
         Ok(_) => true,
         Err(_) => false,
-    }
-}
-fn main() {
+    }}
+}}
+fn main() {{
     print(attempt())
     print(attempt())
-}
-"#,
+}}
+"#
+        ),
         &[("DISP_MAX_PROCESS_STARTS", "1")],
     );
     assert_eq!(output.status.code(), Some(101));

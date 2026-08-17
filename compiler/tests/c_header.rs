@@ -168,17 +168,21 @@ fn generated_header_compiles_as_c_and_cpp_and_is_written_transactionally() {
     let i686 = fs::read_to_string(root.join("provider-i686.s")).unwrap();
     assert!(x86_64.contains("fixture_shift:"));
     assert!(i686.contains("fixture_shift:"));
-    let x86_64_shift = x86_64.split_once("fixture_shift:").unwrap().1;
-    let i686_shift = i686.split_once("_fixture_shift:").unwrap().1;
-    assert!(
-        x86_64_shift.contains("movq\t%rcx, 16(%rbp)")
-            && x86_64_shift.contains("movq\t16(%rbp), %rax"),
-        "Windows x86-64 must pass and return the eight-byte record in its integer registers"
-    );
-    assert!(
-        i686_shift.contains("movl\t8(%ebp), %eax") && i686_shift.contains("movl\t12(%ebp), %edx"),
-        "Windows i686 must pass the record on its stack and return it through EDX:EAX"
-    );
+    #[cfg(windows)]
+    {
+        let x86_64_shift = x86_64.split_once("fixture_shift:").unwrap().1;
+        let i686_shift = i686.split_once("_fixture_shift:").unwrap().1;
+        assert!(
+            x86_64_shift.contains("movq\t%rcx, 16(%rbp)")
+                && x86_64_shift.contains("movq\t16(%rbp), %rax"),
+            "Windows x86-64 must pass and return the eight-byte record in its integer registers"
+        );
+        assert!(
+            i686_shift.contains("movl\t8(%ebp), %eax")
+                && i686_shift.contains("movl\t12(%ebp), %edx"),
+            "Windows i686 must pass the record on its stack and return it through EDX:EAX"
+        );
+    }
     fs::remove_dir_all(root).unwrap();
 }
 

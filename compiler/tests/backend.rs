@@ -241,10 +241,17 @@ fn scalar_codegen_uses_concrete_locals_and_function_abi() {
     .unwrap();
     let generated = fs::read_to_string(artifact.backend_ir.unwrap()).unwrap();
     let object = fs::read(artifact.object.unwrap()).unwrap();
+    #[cfg(windows)]
     assert_eq!(
         &object[..2],
         &[0x64, 0x86],
         "expected an x86-64 COFF object"
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        &object[..4],
+        &[0x7f, b'E', b'L', b'F'],
+        "expected an ELF object"
     );
     assert!(generated.contains("static int32_t disp_f0_double(int32_t a1)"));
     assert!(generated.contains("int32_t l0=(int32_t){0}"));

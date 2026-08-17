@@ -40,6 +40,11 @@ pub const C_RUNTIME: &str = r#"
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
+#ifdef DISP_TLS
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
+#endif
 #include <sys/socket.h>
 #endif
 #ifdef DISP_HTTP
@@ -474,6 +479,7 @@ if(prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0)!=0)return -1;
 return prctl(PR_SET_SECCOMP,SECCOMP_MODE_FILTER,&program);
 }
 #endif
+static int disp_process_exec_error_fd=-1;
 static int disp_process_close_on_exec(void){
 #ifdef __linux__
 #ifndef CLOSE_RANGE_CLOEXEC
@@ -496,7 +502,22 @@ static int disp_process_sandbox_child(void){size_t memory=disp_runtime_limit("DI
 if(disp_process_linux_escape_filter()!=0)return -1;
 #endif
 return 0;}
-static int disp_process_sandbox_exec(const char *path,char *const argv[],char *const environment[],bool custom_environment){int mode=disp_process_hard_mode();if(mode<0)return -1;bool trusted=disp_process_helper_trusted();if(mode==2&&!trusted){errno=EPERM;return -1;}if(mode>0&&trusted){size_t memory=disp_runtime_limit("DISP_CHILD_MAX_MEMORY_BYTES",(size_t)DISP_DEFAULT_CHILD_MEMORY_BYTES),cpu=disp_runtime_limit("DISP_CHILD_MAX_CPU_MILLIS",(size_t)DISP_DEFAULT_CHILD_CPU_MILLIS),processes=disp_runtime_limit("DISP_CHILD_MAX_PROCESSES",(size_t)DISP_DEFAULT_CHILD_PROCESSES),wall=disp_runtime_limit("DISP_CHILD_MAX_WALL_MILLIS",(size_t)DISP_DEFAULT_CHILD_WALL_MILLIS);size_t count=0;while(argv[count]){if(count>=DISP_PROCESS_MAX_ARGUMENTS+1){errno=E2BIG;return -1;}count++;}char memory_text[32],cpu_text[32],process_text[32],wall_text[32];snprintf(memory_text,sizeof(memory_text),"%zu",memory);snprintf(cpu_text,sizeof(cpu_text),"%zu",cpu);snprintf(process_text,sizeof(process_text),"%zu",processes);snprintf(wall_text,sizeof(wall_text),"%zu",wall);char *helper_argv[count+6];helper_argv[0]=(char*)disp_process_cgroup_helper;helper_argv[1]=memory_text;helper_argv[2]=cpu_text;helper_argv[3]=process_text;helper_argv[4]=wall_text;helper_argv[5]=(char*)path;for(size_t i=1;i<count;i++)helper_argv[i+5]=argv[i];helper_argv[count+5]=NULL;if(setpgid(0,0)!=0||disp_process_close_on_exec()!=0)return -1;return custom_environment?execve(disp_process_cgroup_helper,helper_argv,environment):execv(disp_process_cgroup_helper,helper_argv);}if(disp_process_sandbox_child()<0)return -1;return custom_environment?execve(path,argv,environment):execv(path,argv);}
+static int disp_process_sandbox_exec(const char *path,char *const argv[],char *const environment[],bool custom_environment){
+int mode=disp_process_hard_mode();if(mode<0)return -1;bool trusted=disp_process_helper_trusted();if(mode==2&&!trusted){errno=EPERM;return -1;}
+if(mode>0&&trusted){
+size_t memory=disp_runtime_limit("DISP_CHILD_MAX_MEMORY_BYTES",(size_t)DISP_DEFAULT_CHILD_MEMORY_BYTES),cpu=disp_runtime_limit("DISP_CHILD_MAX_CPU_MILLIS",(size_t)DISP_DEFAULT_CHILD_CPU_MILLIS),processes=disp_runtime_limit("DISP_CHILD_MAX_PROCESSES",(size_t)DISP_DEFAULT_CHILD_PROCESSES),wall=disp_runtime_limit("DISP_CHILD_MAX_WALL_MILLIS",(size_t)DISP_DEFAULT_CHILD_WALL_MILLIS);size_t count=0;
+while(argv[count]){if(count>=DISP_PROCESS_MAX_ARGUMENTS+1){errno=E2BIG;return -1;}count++;}
+char memory_text[32],cpu_text[32],process_text[32],wall_text[32],exec_error_text[32];
+snprintf(memory_text,sizeof(memory_text),"%zu",memory);snprintf(cpu_text,sizeof(cpu_text),"%zu",cpu);snprintf(process_text,sizeof(process_text),"%zu",processes);snprintf(wall_text,sizeof(wall_text),"%zu",wall);
+char *helper_argv[count+8];size_t at=0;helper_argv[at++]=(char*)disp_process_cgroup_helper;helper_argv[at++]=memory_text;helper_argv[at++]=cpu_text;helper_argv[at++]=process_text;helper_argv[at++]=wall_text;
+if(disp_process_exec_error_fd>=3){snprintf(exec_error_text,sizeof(exec_error_text),"%d",disp_process_exec_error_fd);helper_argv[at++]=(char*)"--exec-error-fd";helper_argv[at++]=exec_error_text;}
+helper_argv[at++]=(char*)path;for(size_t i=1;i<count;i++)helper_argv[at++]=argv[i];helper_argv[at]=NULL;
+if(setpgid(0,0)!=0||disp_process_close_on_exec()!=0)return -1;
+if(disp_process_exec_error_fd>=3){int flags=fcntl(disp_process_exec_error_fd,F_GETFD);if(flags<0||fcntl(disp_process_exec_error_fd,F_SETFD,flags&~FD_CLOEXEC)!=0)return -1;}
+return custom_environment?execve(disp_process_cgroup_helper,helper_argv,environment):execv(disp_process_cgroup_helper,helper_argv);
+}
+if(disp_process_sandbox_child()<0)return -1;return custom_environment?execve(path,argv,environment):execv(path,argv);
+}
 static pid_t disp_process_sandbox_fork(void){pid_t pid=fork();if(pid>0&&setpgid(pid,pid)!=0&&errno!=EACCES&&errno!=ESRCH){int code=errno;kill(pid,SIGKILL);while(waitpid(pid,NULL,0)<0&&errno==EINTR){}errno=code;return -1;}return pid;}
 static int disp_process_tree_kill(pid_t pid,int signal){if(pid<=0){errno=EINVAL;return -1;}return kill(-pid,signal);}
 static pid_t disp_process_sandbox_waitpid(pid_t pid,int *status,int options){pid_t result=waitpid(pid,status,options);if(result>0){int saved=errno;kill(-result,SIGKILL);errno=saved;}return result;}
@@ -639,13 +660,15 @@ extern char **environ;
 static bool disp_process_env_match(const char *entry,const disp_native_string *key){const char *equal=strchr(entry,'=');return equal&&(size_t)(equal-entry)==key->len&&!memcmp(entry,key->data,key->len);}
 static char **disp_process_environment(const disp_native_process_command *command,size_t *owned_start){size_t parent_count=0;if(!command->clear_environment)for(char **at=environ;at&&*at;at++){bool replaced=false;for(size_t i=0;i<command->environment_len;i++)if(disp_process_env_match(*at,&command->environment_keys[i])){replaced=true;break;}if(!replaced)parent_count++;}char **environment=(char**)disp_alloc_zeroed(parent_count+command->environment_len+1,sizeof(char*),_Alignof(char*));size_t index=0;if(!command->clear_environment)for(char **at=environ;at&&*at;at++){bool replaced=false;for(size_t i=0;i<command->environment_len;i++)if(disp_process_env_match(*at,&command->environment_keys[i])){replaced=true;break;}if(!replaced)environment[index++]=*at;}*owned_start=index;for(size_t i=0;i<command->environment_len;i++){size_t size=command->environment_keys[i].len+command->environment_values[i].len+2;environment[index]=(char*)disp_alloc(size,1);memcpy(environment[index],command->environment_keys[i].data,command->environment_keys[i].len);environment[index][command->environment_keys[i].len]='=';memcpy(environment[index]+command->environment_keys[i].len+1,command->environment_values[i].data,command->environment_values[i].len);environment[index][size-1]=0;index++;}return environment;}
 static bool disp_process_open_pipes(int out_pipe[2],int err_pipe[2],int in_pipe[2],int exec_pipe[2],disp_native_string *error){out_pipe[0]=out_pipe[1]=err_pipe[0]=err_pipe[1]=in_pipe[0]=in_pipe[1]=exec_pipe[0]=exec_pipe[1]=-1;if(pipe(out_pipe)==0&&pipe(err_pipe)==0&&pipe(in_pipe)==0&&pipe(exec_pipe)==0)return true;int saved=errno;int *pipes[4]={out_pipe,err_pipe,in_pipe,exec_pipe};for(size_t i=0;i<4;i++)for(size_t j=0;j<2;j++)if(pipes[i][j]>=0)close(pipes[i][j]);*error=disp_process_error_text(strerror(saved));return false;}
+static void disp_process_write_exec_error(int fd,int code){int32_t wire=(int32_t)(code>0?code:EIO);const unsigned char *bytes=(const unsigned char*)&wire;size_t written=0;while(written<sizeof(wire)){ssize_t count=write(fd,bytes+written,sizeof(wire)-written);if(count<0){if(errno==EINTR)continue;return;}if(!count)return;written+=(size_t)count;}}
+static ssize_t disp_process_read_exec_error(int fd,int32_t *error){size_t received=0;while(received<sizeof(*error)){ssize_t count=read(fd,(unsigned char*)error+received,sizeof(*error)-received);if(count<0){if(errno==EINTR)continue;*error=(int32_t)(errno?errno:EIO);return -1;}if(!count){if(!received)return 0;*error=EPROTO;return -1;}received+=(size_t)count;}if(*error<=0)*error=EIO;return (ssize_t)received;}
 static bool disp_child_update(disp_child_state *state,bool block,disp_native_string *error){if(state->complete)return true;for(;;){int status=0;pid_t waited=waitpid(state->process,&status,block&&!state->has_deadline?0:WNOHANG);if(waited==state->process){state->status=WIFEXITED(status)?WEXITSTATUS(status):(WIFSIGNALED(status)?128+WTERMSIG(status):-1);state->complete=true;disp_child_close_input(state);return true;}if(waited<0&&errno!=EINTR){*error=disp_process_error_text(strerror(errno));return false;}if(state->has_deadline&&disp_time_now_nanos()>=state->deadline){kill(state->process,SIGKILL);while(waitpid(state->process,&status,0)<0&&errno==EINTR){}state->status=124;state->complete=true;disp_child_close_input(state);*error=disp_process_error_text("process exceeded its configured timeout");return false;}if(!block)return true;disp_time_sleep(1000000ULL);}}
 static bool disp_child_kill(disp_child_state *state,disp_native_string *error){if(state->complete)return true;if(kill(state->process,SIGKILL)!=0&&errno!=ESRCH){*error=disp_process_error_text(strerror(errno));return false;}int status=0;while(waitpid(state->process,&status,0)<0){if(errno==EINTR)continue;*error=disp_process_error_text(strerror(errno));return false;}state->status=WIFEXITED(status)?WEXITSTATUS(status):(WIFSIGNALED(status)?128+WTERMSIG(status):-1);state->complete=true;disp_child_close_input(state);return true;}
-static bool disp_process_start_command(const disp_native_process_command *command,disp_native_child_process *child_out,disp_native_string *error){*child_out=(disp_native_child_process){0};*error=(disp_native_string){0};if(!disp_process_command_valid(command,error))return false;int out_pipe[2],err_pipe[2],in_pipe[2],exec_pipe[2];if(!disp_process_open_pipes(out_pipe,err_pipe,in_pipe,exec_pipe,error))return false;fcntl(exec_pipe[1],F_SETFD,FD_CLOEXEC);char *application=(char*)disp_alloc(command->program.len+1,1);memcpy(application,command->program.data,command->program.len);application[command->program.len]=0;char **argv=(char**)disp_alloc_zeroed(command->args_len+2,sizeof(char*),_Alignof(char*));argv[0]=application;for(size_t i=0;i<command->args_len;i++){argv[i+1]=(char*)disp_alloc(command->args[i].len+1,1);memcpy(argv[i+1],command->args[i].data,command->args[i].len);}char *directory=NULL;if(command->has_directory){directory=(char*)disp_alloc(command->directory.len+1,1);memcpy(directory,command->directory.data,command->directory.len);directory[command->directory.len]=0;}size_t owned_start=0;char **environment=disp_process_environment(command,&owned_start);pid_t pid=fork();int fork_error=pid<0?errno:0;if(pid==0){close(exec_pipe[0]);dup2(in_pipe[0],STDIN_FILENO);dup2(out_pipe[1],STDOUT_FILENO);dup2(err_pipe[1],STDERR_FILENO);close(in_pipe[0]);close(in_pipe[1]);close(out_pipe[0]);close(out_pipe[1]);close(err_pipe[0]);close(err_pipe[1]);if(directory&&chdir(directory)){int code=errno;write(exec_pipe[1],&code,sizeof(code));_exit(126);}execve(application,argv,environment);int code=errno;write(exec_pipe[1],&code,sizeof(code));_exit(127);}close(exec_pipe[1]);close(in_pipe[0]);close(out_pipe[1]);close(err_pipe[1]);int start_error=0;ssize_t start_read;do{start_read=read(exec_pipe[0],&start_error,sizeof(start_error));}while(start_read<0&&errno==EINTR);close(exec_pipe[0]);if(pid<0||start_read>0){if(pid>=0){int ignored=0;waitpid(pid,&ignored,0);}close(in_pipe[1]);close(out_pipe[0]);close(err_pipe[0]);*error=disp_process_error_text(strerror(pid<0?fork_error:start_error));goto cleanup;}disp_child_state *state=(disp_child_state*)disp_alloc_zeroed(1,sizeof(disp_child_state),_Alignof(disp_child_state));state->process=pid;state->input=in_pipe[1];state->out.source=out_pipe[0];state->err.source=err_pipe[0];disp_child_pipe_init(&state->out);disp_child_pipe_init(&state->err);state->has_deadline=command->has_timeout;if(command->has_timeout){uint64_t now=disp_time_now_nanos();state->deadline=UINT64_MAX-now<command->timeout_nanos?UINT64_MAX:now+command->timeout_nanos;}state->out_thread.handle=disp_thread_start(disp_child_pipe_entry,&state->out,0,0);state->err_thread.handle=disp_thread_start(disp_child_pipe_entry,&state->err,0,0);child_out->state=state;if(command->input_len&&!disp_child_write(state,command->input,command->input_len,error)){disp_child_drop(child_out);goto cleanup;}for(size_t i=0;i<command->args_len;i++)disp_dealloc(argv[i+1]);disp_dealloc(argv);disp_dealloc(application);disp_dealloc(directory);for(size_t i=owned_start;environment[i];i++)disp_dealloc(environment[i]);disp_dealloc(environment);return true;cleanup:for(size_t i=0;i<command->args_len;i++)disp_dealloc(argv[i+1]);disp_dealloc(argv);disp_dealloc(application);disp_dealloc(directory);for(size_t i=owned_start;environment[i];i++)disp_dealloc(environment[i]);disp_dealloc(environment);return false;}
+static bool disp_process_start_command(const disp_native_process_command *command,disp_native_child_process *child_out,disp_native_string *error){*child_out=(disp_native_child_process){0};*error=(disp_native_string){0};if(!disp_process_command_valid(command,error))return false;int out_pipe[2],err_pipe[2],in_pipe[2],exec_pipe[2];if(!disp_process_open_pipes(out_pipe,err_pipe,in_pipe,exec_pipe,error))return false;fcntl(exec_pipe[1],F_SETFD,FD_CLOEXEC);char *application=(char*)disp_alloc(command->program.len+1,1);memcpy(application,command->program.data,command->program.len);application[command->program.len]=0;char **argv=(char**)disp_alloc_zeroed(command->args_len+2,sizeof(char*),_Alignof(char*));argv[0]=application;for(size_t i=0;i<command->args_len;i++){argv[i+1]=(char*)disp_alloc(command->args[i].len+1,1);memcpy(argv[i+1],command->args[i].data,command->args[i].len);}char *directory=NULL;if(command->has_directory){directory=(char*)disp_alloc(command->directory.len+1,1);memcpy(directory,command->directory.data,command->directory.len);directory[command->directory.len]=0;}size_t owned_start=0;char **environment=disp_process_environment(command,&owned_start);pid_t pid=fork();int fork_error=pid<0?errno:0;if(pid==0){disp_process_exec_error_fd=exec_pipe[1];close(exec_pipe[0]);dup2(in_pipe[0],STDIN_FILENO);dup2(out_pipe[1],STDOUT_FILENO);dup2(err_pipe[1],STDERR_FILENO);close(in_pipe[0]);close(in_pipe[1]);close(out_pipe[0]);close(out_pipe[1]);close(err_pipe[0]);close(err_pipe[1]);if(directory&&chdir(directory)){disp_process_write_exec_error(exec_pipe[1],errno);_exit(126);}execve(application,argv,environment);disp_process_write_exec_error(exec_pipe[1],errno);_exit(127);}close(exec_pipe[1]);close(in_pipe[0]);close(out_pipe[1]);close(err_pipe[1]);int32_t start_error=0;ssize_t start_read=disp_process_read_exec_error(exec_pipe[0],&start_error);close(exec_pipe[0]);if(pid<0||start_read!=0){if(pid>=0){int ignored=0;waitpid(pid,&ignored,0);}close(in_pipe[1]);close(out_pipe[0]);close(err_pipe[0]);*error=disp_process_error_text(strerror(pid<0?fork_error:(int)start_error));goto cleanup;}disp_child_state *state=(disp_child_state*)disp_alloc_zeroed(1,sizeof(disp_child_state),_Alignof(disp_child_state));state->process=pid;state->input=in_pipe[1];state->out.source=out_pipe[0];state->err.source=err_pipe[0];disp_child_pipe_init(&state->out);disp_child_pipe_init(&state->err);state->has_deadline=command->has_timeout;if(command->has_timeout){uint64_t now=disp_time_now_nanos();state->deadline=UINT64_MAX-now<command->timeout_nanos?UINT64_MAX:now+command->timeout_nanos;}state->out_thread.handle=disp_thread_start(disp_child_pipe_entry,&state->out,0,0);state->err_thread.handle=disp_thread_start(disp_child_pipe_entry,&state->err,0,0);child_out->state=state;if(command->input_len&&!disp_child_write(state,command->input,command->input_len,error)){disp_child_drop(child_out);goto cleanup;}for(size_t i=0;i<command->args_len;i++)disp_dealloc(argv[i+1]);disp_dealloc(argv);disp_dealloc(application);disp_dealloc(directory);for(size_t i=owned_start;environment[i];i++)disp_dealloc(environment[i]);disp_dealloc(environment);return true;cleanup:for(size_t i=0;i<command->args_len;i++)disp_dealloc(argv[i+1]);disp_dealloc(argv);disp_dealloc(application);disp_dealloc(directory);for(size_t i=owned_start;environment[i];i++)disp_dealloc(environment[i]);disp_dealloc(environment);return false;}
 static bool disp_process_run_command(const disp_native_process_command *command,disp_native_process_output *output,disp_native_string *error){
 *output=(disp_native_process_output){0};*error=(disp_native_string){0};if(!disp_process_command_valid(command,error))return false;
 int out_pipe[2],err_pipe[2],in_pipe[2],exec_pipe[2];if(!disp_process_open_pipes(out_pipe,err_pipe,in_pipe,exec_pipe,error))return false;
-fcntl(exec_pipe[1],F_SETFD,FD_CLOEXEC);char *application=(char*)disp_alloc(command->program.len+1,1);memcpy(application,command->program.data,command->program.len);application[command->program.len]=0;char **argv=(char**)disp_alloc_zeroed(command->args_len+2,sizeof(char*),_Alignof(char*));argv[0]=application;for(size_t i=0;i<command->args_len;i++){argv[i+1]=(char*)disp_alloc(command->args[i].len+1,1);memcpy(argv[i+1],command->args[i].data,command->args[i].len);}char *directory=NULL;if(command->has_directory){directory=(char*)disp_alloc(command->directory.len+1,1);memcpy(directory,command->directory.data,command->directory.len);directory[command->directory.len]=0;}size_t owned_start=0;char **environment=disp_process_environment(command,&owned_start);pid_t pid=fork();if(pid==0){close(exec_pipe[0]);dup2(in_pipe[0],STDIN_FILENO);dup2(out_pipe[1],STDOUT_FILENO);dup2(err_pipe[1],STDERR_FILENO);close(in_pipe[0]);close(in_pipe[1]);close(out_pipe[0]);close(out_pipe[1]);close(err_pipe[0]);close(err_pipe[1]);if(directory&&chdir(directory)){int code=errno;write(exec_pipe[1],&code,sizeof(code));_exit(126);}execve(application,argv,environment);int code=errno;write(exec_pipe[1],&code,sizeof(code));_exit(127);}close(exec_pipe[1]);close(in_pipe[0]);close(out_pipe[1]);close(err_pipe[1]);if(pid<0){close(exec_pipe[0]);close(in_pipe[1]);close(out_pipe[0]);close(err_pipe[0]);*error=disp_process_error_text(strerror(errno));goto cleanup;}int start_error=0;ssize_t start_read;do{start_read=read(exec_pipe[0],&start_error,sizeof(start_error));}while(start_read<0&&errno==EINTR);close(exec_pipe[0]);disp_process_capture out={.source=out_pipe[0]},err={.source=err_pipe[0]};disp_process_input input={.target=in_pipe[1],.data=command->input,.len=command->input_len};disp_native_thread out_thread={.handle=disp_thread_start(disp_process_capture_entry,&out,0,0)},err_thread={.handle=disp_thread_start(disp_process_capture_entry,&err,0,0)},input_thread={.handle=disp_thread_start(disp_process_input_entry,&input,0,0)};int status=0;bool timed_out=false;uint64_t started=disp_time_now_nanos();for(;;){pid_t waited=waitpid(pid,&status,WNOHANG);if(waited==pid)break;if(waited<0&&errno!=EINTR){start_error=errno;break;}if(command->has_timeout&&disp_time_now_nanos()-started>=command->timeout_nanos){timed_out=true;kill(pid,SIGKILL);while(waitpid(pid,&status,0)<0&&errno==EINTR){}break;}disp_time_sleep(1000000ULL);}disp_thread_wait(&input_thread);disp_thread_wait(&out_thread);disp_thread_wait(&err_thread);close(out_pipe[0]);close(err_pipe[0]);if(start_read>0||start_error||timed_out||input.failed||out.failed||err.failed||out.overflow||err.overflow){disp_dealloc(out.data);disp_dealloc(err.data);*error=disp_process_error_text(timed_out?"process exceeded its configured timeout":(start_error?strerror(start_error):(out.overflow||err.overflow?"process output exceeds the 16 MiB capture limit":"could not transfer process data")));goto cleanup;}output->status=WIFEXITED(status)?WEXITSTATUS(status):(WIFSIGNALED(status)?128+WTERMSIG(status):-1);output->stdout_data=out.data;output->stdout_len=out.len;output->stderr_data=err.data;output->stderr_len=err.len;for(size_t i=0;i<command->args_len;i++)disp_dealloc(argv[i+1]);disp_dealloc(argv);disp_dealloc(application);disp_dealloc(directory);for(size_t i=owned_start;environment[i];i++)disp_dealloc(environment[i]);disp_dealloc(environment);return true;cleanup:for(size_t i=0;i<command->args_len;i++)disp_dealloc(argv[i+1]);disp_dealloc(argv);disp_dealloc(application);disp_dealloc(directory);for(size_t i=owned_start;environment[i];i++)disp_dealloc(environment[i]);disp_dealloc(environment);return false;}
+fcntl(exec_pipe[1],F_SETFD,FD_CLOEXEC);char *application=(char*)disp_alloc(command->program.len+1,1);memcpy(application,command->program.data,command->program.len);application[command->program.len]=0;char **argv=(char**)disp_alloc_zeroed(command->args_len+2,sizeof(char*),_Alignof(char*));argv[0]=application;for(size_t i=0;i<command->args_len;i++){argv[i+1]=(char*)disp_alloc(command->args[i].len+1,1);memcpy(argv[i+1],command->args[i].data,command->args[i].len);}char *directory=NULL;if(command->has_directory){directory=(char*)disp_alloc(command->directory.len+1,1);memcpy(directory,command->directory.data,command->directory.len);directory[command->directory.len]=0;}size_t owned_start=0;char **environment=disp_process_environment(command,&owned_start);pid_t pid=fork();if(pid==0){disp_process_exec_error_fd=exec_pipe[1];close(exec_pipe[0]);dup2(in_pipe[0],STDIN_FILENO);dup2(out_pipe[1],STDOUT_FILENO);dup2(err_pipe[1],STDERR_FILENO);close(in_pipe[0]);close(in_pipe[1]);close(out_pipe[0]);close(out_pipe[1]);close(err_pipe[0]);close(err_pipe[1]);if(directory&&chdir(directory)){disp_process_write_exec_error(exec_pipe[1],errno);_exit(126);}execve(application,argv,environment);disp_process_write_exec_error(exec_pipe[1],errno);_exit(127);}close(exec_pipe[1]);close(in_pipe[0]);close(out_pipe[1]);close(err_pipe[1]);if(pid<0){close(exec_pipe[0]);close(in_pipe[1]);close(out_pipe[0]);close(err_pipe[0]);*error=disp_process_error_text(strerror(errno));goto cleanup;}int32_t start_error=0;ssize_t start_read=disp_process_read_exec_error(exec_pipe[0],&start_error);close(exec_pipe[0]);disp_process_capture out={.source=out_pipe[0]},err={.source=err_pipe[0]};disp_process_input input={.target=in_pipe[1],.data=command->input,.len=command->input_len};disp_native_thread out_thread={.handle=disp_thread_start(disp_process_capture_entry,&out,0,0)},err_thread={.handle=disp_thread_start(disp_process_capture_entry,&err,0,0)},input_thread={.handle=disp_thread_start(disp_process_input_entry,&input,0,0)};int status=0;bool timed_out=false;uint64_t started=disp_time_now_nanos();for(;;){pid_t waited=waitpid(pid,&status,WNOHANG);if(waited==pid)break;if(waited<0&&errno!=EINTR){start_error=(int32_t)errno;break;}if(command->has_timeout&&disp_time_now_nanos()-started>=command->timeout_nanos){timed_out=true;kill(pid,SIGKILL);while(waitpid(pid,&status,0)<0&&errno==EINTR){}break;}disp_time_sleep(1000000ULL);}disp_thread_wait(&input_thread);disp_thread_wait(&out_thread);disp_thread_wait(&err_thread);close(out_pipe[0]);close(err_pipe[0]);if(start_read!=0||start_error||timed_out||input.failed||out.failed||err.failed||out.overflow||err.overflow){disp_dealloc(out.data);disp_dealloc(err.data);*error=disp_process_error_text(timed_out?"process exceeded its configured timeout":(start_error?strerror((int)start_error):(out.overflow||err.overflow?"process output exceeds the 16 MiB capture limit":"could not transfer process data")));goto cleanup;}output->status=WIFEXITED(status)?WEXITSTATUS(status):(WIFSIGNALED(status)?128+WTERMSIG(status):-1);output->stdout_data=out.data;output->stdout_len=out.len;output->stderr_data=err.data;output->stderr_len=err.len;for(size_t i=0;i<command->args_len;i++)disp_dealloc(argv[i+1]);disp_dealloc(argv);disp_dealloc(application);disp_dealloc(directory);for(size_t i=owned_start;environment[i];i++)disp_dealloc(environment[i]);disp_dealloc(environment);return true;cleanup:for(size_t i=0;i<command->args_len;i++)disp_dealloc(argv[i+1]);disp_dealloc(argv);disp_dealloc(application);disp_dealloc(directory);for(size_t i=owned_start;environment[i];i++)disp_dealloc(environment[i]);disp_dealloc(environment);return false;}
 #endif
 
 static void disp_string_drop(disp_native_string *value){if(value->cap)disp_dealloc(value->data);value->data=NULL;value->len=0;value->cap=0;}
@@ -993,6 +1016,7 @@ static void disp_socket_close(disp_socket_handle socket){if(socket!=DISP_INVALID
 static int disp_socket_error_code(void){return WSAGetLastError();}
 static bool disp_socket_would_block(int code){return code==WSAEWOULDBLOCK;}
 static bool disp_socket_connect_pending(int code){return code==WSAEWOULDBLOCK||code==WSAEINPROGRESS||code==WSAEALREADY||code==WSAEINVAL;}
+static bool disp_socket_not_connected(int code){return code==WSAENOTCONN;}
 static bool disp_socket_set_blocking(disp_socket_handle socket,bool blocking){u_long mode=blocking?0:1;return ioctlsocket(socket,FIONBIO,&mode)==0;}
 static int disp_socket_shutdown_handle(disp_socket_handle socket,int direction){return shutdown(socket,direction==0?SD_RECEIVE:direction==1?SD_SEND:SD_BOTH);}
 #else
@@ -1003,6 +1027,7 @@ static void disp_socket_close(disp_socket_handle socket){if(socket!=DISP_INVALID
 static int disp_socket_error_code(void){return errno;}
 static bool disp_socket_would_block(int code){return code==EAGAIN||code==EWOULDBLOCK;}
 static bool disp_socket_connect_pending(int code){return code==EINPROGRESS||code==EALREADY||code==EAGAIN||code==EWOULDBLOCK;}
+static bool disp_socket_not_connected(int code){return code==ENOTCONN;}
 static bool disp_socket_set_blocking(disp_socket_handle socket,bool blocking){int flags=fcntl(socket,F_GETFL,0);return flags>=0&&fcntl(socket,F_SETFL,blocking?(flags&~O_NONBLOCK):(flags|O_NONBLOCK))==0;}
 static int disp_socket_shutdown_handle(disp_socket_handle socket,int direction){return shutdown(socket,direction==0?SHUT_RD:direction==1?SHUT_WR:SHUT_RDWR);}
 #endif
@@ -1032,7 +1057,7 @@ static void disp_tcp_state_close(disp_tcp_state *state){if(!state)return;if(!ato
 static void disp_tcp_state_release(disp_tcp_state *state){if(atomic_fetch_sub_explicit(&state->refs,1,memory_order_acq_rel)!=1)return;atomic_thread_fence(memory_order_acquire);disp_tcp_state_close(state);disp_dealloc(state);}
 static void disp_tcp_stream_drop(disp_native_tcp_stream *stream){if(!stream->state)return;disp_tcp_state_close(stream->state);disp_tcp_state_release(stream->state);stream->state=NULL;}
 static void disp_tcp_stream_close(disp_native_tcp_stream *stream){if(stream&&stream->state)disp_tcp_state_close(stream->state);}
-static bool disp_tcp_stream_shutdown(disp_native_tcp_stream *stream,bool reading,disp_native_string *error){if(!stream->state||atomic_load_explicit(&stream->state->closed,memory_order_acquire)){*error=disp_owned_bytes("TCP stream is closed",strlen("TCP stream is closed"));return false;}atomic_bool *flag=reading?&stream->state->read_shutdown:&stream->state->write_shutdown;if(atomic_exchange_explicit(flag,true,memory_order_acq_rel))return true;if(disp_socket_shutdown_handle(stream->state->socket,reading?0:1)!=0){*error=disp_network_error_code(reading?"TCP shutdown read":"TCP shutdown write",disp_socket_error_code());return false;}return true;}
+static bool disp_tcp_stream_shutdown(disp_native_tcp_stream *stream,bool reading,disp_native_string *error){if(!stream->state||atomic_load_explicit(&stream->state->closed,memory_order_acquire)){*error=disp_owned_bytes("TCP stream is closed",strlen("TCP stream is closed"));return false;}atomic_bool *flag=reading?&stream->state->read_shutdown:&stream->state->write_shutdown;if(atomic_exchange_explicit(flag,true,memory_order_acq_rel))return true;if(disp_socket_shutdown_handle(stream->state->socket,reading?0:1)!=0){int code=disp_socket_error_code();if(!disp_socket_not_connected(code)){*error=disp_network_error_code(reading?"TCP shutdown read":"TCP shutdown write",code);return false;}}return true;}
 static bool disp_tcp_claim(atomic_bool *busy){bool expected=false;return atomic_compare_exchange_strong_explicit(busy,&expected,true,memory_order_acq_rel,memory_order_acquire);}
 static bool disp_tcp_stream_read(disp_native_tcp_stream *stream,size_t limit,disp_native_string *bytes,disp_native_string *error,int line,int column){if(!stream->state||atomic_load_explicit(&stream->state->closed,memory_order_acquire)){*error=disp_owned_bytes("TCP stream is closed",strlen("TCP stream is closed"));return false;}if(atomic_load_explicit(&stream->state->read_shutdown,memory_order_acquire)){*error=disp_owned_bytes("TCP read side is shut down",strlen("TCP read side is shut down"));return false;}if(!disp_tcp_claim(&stream->state->read_busy)){*error=disp_owned_bytes("TCP read is already in progress",strlen("TCP read is already in progress"));return false;}if(limit>DISP_TCP_READ_LIMIT)dv_panic("TCP read limit exceeds the 16 MiB safety limit",line,column);if(!limit){atomic_store_explicit(&stream->state->read_busy,false,memory_order_release);return true;}char *data=(char*)disp_alloc(limit,1);for(;;){
 #ifdef _WIN32
@@ -1054,6 +1079,8 @@ MSG_NOSIGNAL
 );
 #endif
 if(count<0){int code=disp_socket_error_code();if(disp_socket_would_block(code)){disp_time_sleep(1000000ULL);continue;}atomic_store_explicit(&stream->state->write_busy,false,memory_order_release);*error=disp_network_error_code("TCP write",code);return false;}if(!count){atomic_store_explicit(&stream->state->write_busy,false,memory_order_release);*error=disp_owned_bytes("TCP write made no progress",strlen("TCP write made no progress"));return false;}*written+=(size_t)count;}atomic_store_explicit(&stream->state->write_busy,false,memory_order_release);return true;}
+static bool disp_tcp_take_socket(disp_tcp_state *state,disp_socket_handle *socket){if(!state||atomic_exchange_explicit(&state->closed,true,memory_order_acq_rel))return false;*socket=state->socket;return true;}
+#ifdef DISP_TLS
 #ifdef _WIN32
 struct disp_tls_state {
     atomic_size_t refs;
@@ -1116,7 +1143,6 @@ typedef struct {
 static disp_native_string disp_tls_status_error(const char *operation,SECURITY_STATUS status){char message[160];int length=snprintf(message,sizeof(message),"%s failed with TLS security status 0x%08lx",operation,(unsigned long)status);if(length<0)length=0;return disp_owned_bytes(message,(size_t)length);}
 static bool disp_tls_reserve(unsigned char **data,size_t *capacity,size_t needed){if(needed>*capacity){size_t next=*capacity?*capacity:16384;while(next<needed){if(next>1048576ULL/2)return false;next*=2;}unsigned char *grown=(unsigned char*)disp_alloc(next,1);if(*data)memcpy(grown,*data,*capacity);disp_dealloc(*data);*data=grown;*capacity=next;}return true;}
 static bool disp_tls_server_name(const char *text,size_t length,wchar_t **wide){if(!length||memchr(text,0,length)||length>INT_MAX)return false;int count=MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,text,(int)length,NULL,0);if(count<=0)return false;wchar_t *value=(wchar_t*)disp_alloc(((size_t)count+1)*sizeof(wchar_t),_Alignof(wchar_t));if(MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,text,(int)length,value,count)!=count){disp_dealloc(value);return false;}value[count]=0;*wide=value;return true;}
-static bool disp_tcp_take_socket(disp_tcp_state *state,disp_socket_handle *socket){if(!state||atomic_exchange_explicit(&state->closed,true,memory_order_acq_rel))return false;*socket=state->socket;return true;}
 static bool disp_tls_flush_handshake(disp_tls_handshake_state *state){while(state->output_pos<state->output_len){size_t remaining=state->output_len-state->output_pos;int chunk=(int)(remaining>INT_MAX?INT_MAX:remaining);int count=send(state->socket,(const char*)state->output+state->output_pos,chunk,0);if(count<0){int code=disp_socket_error_code();if(disp_socket_would_block(code)){disp_reactor_offer(1000000ULL);return false;}state->error=disp_network_error_code("TLS handshake write",code);state->done=true;return true;}if(!count){state->error=disp_owned_bytes("TLS handshake write made no progress",strlen("TLS handshake write made no progress"));state->done=true;return true;}state->output_pos+=(size_t)count;}disp_dealloc(state->output);state->output=NULL;state->output_len=0;state->output_pos=0;return true;}
 static bool disp_tls_receive_handshake(disp_tls_handshake_state *state){if(!disp_tls_reserve(&state->input,&state->input_cap,state->input_len+16384)){state->error=disp_owned_bytes("TLS handshake exceeded the 1 MiB safety limit",strlen("TLS handshake exceeded the 1 MiB safety limit"));state->done=true;return true;}int count=recv(state->socket,(char*)state->input+state->input_len,(int)(state->input_cap-state->input_len),0);if(count<0){int code=disp_socket_error_code();if(disp_socket_would_block(code)){disp_reactor_offer(1000000ULL);return false;}state->error=disp_network_error_code("TLS handshake read",code);state->done=true;return true;}if(!count){state->error=disp_owned_bytes("TLS peer closed during handshake",strlen("TLS peer closed during handshake"));state->done=true;return true;}state->input_len+=(size_t)count;state->need_input=false;return true;}
 static bool disp_tls_acquire(disp_tls_handshake_state *state){TLS_PARAMETERS parameters={0};parameters.grbitDisabledProtocols=~(SP_PROT_TLS1_2_CLIENT|SP_PROT_TLS1_3_CLIENT);SCH_CREDENTIALS modern={0};modern.dwVersion=SCH_CREDENTIALS_VERSION;modern.dwFlags=SCH_USE_STRONG_CRYPTO|SCH_CRED_NO_DEFAULT_CREDS|SCH_CRED_AUTO_CRED_VALIDATION|SCH_CRED_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT;modern.cTlsParameters=1;modern.pTlsParameters=&parameters;TimeStamp expiry={0};SECURITY_STATUS status=AcquireCredentialsHandleW(NULL,UNISP_NAME_W,SECPKG_CRED_OUTBOUND,NULL,&modern,NULL,NULL,&state->credential,&expiry);if(status!=SEC_E_OK){SCHANNEL_CRED compatible={0};compatible.dwVersion=SCHANNEL_CRED_VERSION;compatible.grbitEnabledProtocols=SP_PROT_TLS1_2_CLIENT;compatible.dwFlags=SCH_USE_STRONG_CRYPTO|SCH_CRED_NO_DEFAULT_CREDS|SCH_CRED_AUTO_CRED_VALIDATION|SCH_CRED_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT;status=AcquireCredentialsHandleW(NULL,UNISP_NAME_W,SECPKG_CRED_OUTBOUND,NULL,&compatible,NULL,NULL,&state->credential,&expiry);}if(status!=SEC_E_OK){state->error=disp_tls_status_error("TLS credential acquisition",status);state->done=true;return false;}state->credential_valid=true;return true;}
@@ -1126,11 +1152,11 @@ static disp_tls_handshake_state *disp_tls_handshake_create(disp_tcp_state *tcp,c
 static bool disp_tls_handshake_poll(disp_tls_handshake_state *state){if(!state||state->taken)dv_panic("TLS handshake future has already completed",0,0);if(state->done)return true;if(!state->started){state->started=true;uint64_t now=disp_time_now_nanos();state->deadline=UINT64_MAX-now<state->timeout?UINT64_MAX:now+state->timeout;if(state->has_deadline&&!state->timeout){state->error=disp_owned_bytes("TLS handshake timed out",strlen("TLS handshake timed out"));state->done=true;return true;}if(!disp_tcp_take_socket(state->tcp,&state->socket)){state->error=disp_owned_bytes("TCP stream is closed",strlen("TCP stream is closed"));state->done=true;return true;}state->socket_valid=true;if(!disp_tls_acquire(state))return true;}for(unsigned steps=0;steps<16&&!state->done;steps++){if(state->output_pos<state->output_len){if(!disp_tls_flush_handshake(state))break;if(state->done)break;}if(state->handshake_complete){disp_tls_state *stream=disp_tls_state_finish(state);if(stream){state->stream=(disp_native_tls_stream){.state=stream};state->ok=true;state->done=true;}break;}if(state->need_input){if(!disp_tls_receive_handshake(state))break;if(state->done)break;}if(!state->need_input&&!disp_tls_handshake_call(state))break;}if(!state->done&&state->has_deadline&&disp_time_now_nanos()>=state->deadline){state->error=disp_owned_bytes("TLS handshake timed out",strlen("TLS handshake timed out"));state->done=true;}if(!state->done)disp_reactor_offer(1000000ULL);return state->done;}
 static void disp_tls_handshake_take(disp_tls_handshake_state *state,bool *ok,disp_native_tls_stream *stream,disp_native_string *error){if(!state->done||state->taken)dv_panic("TLS handshake result is not ready",0,0);state->taken=true;*ok=state->ok;*stream=state->stream;state->stream=(disp_native_tls_stream){0};*error=state->error;state->error=(disp_native_string){0};}
 static void disp_tls_state_retain(disp_tls_state *state){if(!state)dv_panic("TLS stream is unavailable",0,0);size_t previous=atomic_fetch_add_explicit(&state->refs,1,memory_order_relaxed);if(previous==SIZE_MAX)dv_panic("TLS stream reference count overflow",0,0);}
-static void disp_tls_state_close(disp_tls_state *state){if(!state||atomic_exchange_explicit(&state->closed,true,memory_order_acq_rel))return;if(state->context_valid){unsigned long shutdown=SCHANNEL_SHUTDOWN;SecBuffer control={.cbBuffer=sizeof(shutdown),.BufferType=SECBUFFER_TOKEN,.pvBuffer=&shutdown};SecBufferDesc control_desc={.ulVersion=SECBUFFER_VERSION,.cBuffers=1,.pBuffers=&control};if(ApplyControlToken(&state->context,&control_desc)==SEC_E_OK){SecBuffer output={.BufferType=SECBUFFER_TOKEN};SecBufferDesc output_desc={.ulVersion=SECBUFFER_VERSION,.cBuffers=1,.pBuffers=&output};unsigned long attributes=0;TimeStamp expiry={0};SECURITY_STATUS status=InitializeSecurityContextW(&state->credential,&state->context,NULL,ISC_REQ_SEQUENCE_DETECT|ISC_REQ_REPLAY_DETECT|ISC_REQ_CONFIDENTIALITY|ISC_REQ_INTEGRITY|ISC_REQ_ALLOCATE_MEMORY|ISC_REQ_STREAM,0,SECURITY_NATIVE_DREP,NULL,0,&state->context,&output_desc,&attributes,&expiry);if((status==SEC_E_OK||status==SEC_I_CONTEXT_EXPIRED)&&output.pvBuffer&&output.cbBuffer)send(state->socket,(const char*)output.pvBuffer,(int)output.cbBuffer,0);if(output.pvBuffer)FreeContextBuffer(output.pvBuffer);}}disp_socket_shutdown_handle(state->socket,2);disp_socket_close(state->socket);}
+static void disp_tls_state_close(disp_tls_state *state){if(!state||atomic_exchange_explicit(&state->closed,true,memory_order_acq_rel))return;if(state->context_valid){unsigned long shutdown=SCHANNEL_SHUTDOWN;SecBuffer control={.cbBuffer=sizeof(shutdown),.BufferType=SECBUFFER_TOKEN,.pvBuffer=&shutdown};SecBufferDesc control_desc={.ulVersion=SECBUFFER_VERSION,.cBuffers=1,.pBuffers=&control};if(ApplyControlToken(&state->context,&control_desc)==SEC_E_OK){SecBuffer output={.BufferType=SECBUFFER_TOKEN};SecBufferDesc output_desc={.ulVersion=SECBUFFER_VERSION,.cBuffers=1,.pBuffers=&output};unsigned long attributes=0;TimeStamp expiry={0};SECURITY_STATUS status=InitializeSecurityContextW(&state->credential,&state->context,NULL,ISC_REQ_SEQUENCE_DETECT|ISC_REQ_REPLAY_DETECT|ISC_REQ_CONFIDENTIALITY|ISC_REQ_INTEGRITY|ISC_REQ_ALLOCATE_MEMORY|ISC_REQ_STREAM,0,SECURITY_NATIVE_DREP,NULL,0,&state->context,&output_desc,&attributes,&expiry);if((status==SEC_E_OK||status==SEC_I_CONTEXT_EXPIRED)&&output.pvBuffer&&output.cbBuffer)send(state->socket,(const char*)output.pvBuffer,(int)output.cbBuffer,0);if(output.pvBuffer)FreeContextBuffer(output.pvBuffer);}}disp_socket_shutdown_handle(state->socket,2);disp_socket_close(state->socket);disp_runtime_release_handle();}
 static void disp_tls_state_release(disp_tls_state *state){if(!state||atomic_fetch_sub_explicit(&state->refs,1,memory_order_acq_rel)!=1)return;atomic_thread_fence(memory_order_acquire);disp_tls_state_close(state);if(state->context_valid)DeleteSecurityContext(&state->context);if(state->credential_valid)FreeCredentialsHandle(&state->credential);disp_dealloc(state->server_name);disp_dealloc(state->encrypted);disp_dealloc(state->plain);disp_dealloc(state->post_output);disp_dealloc(state);}
 static void disp_tls_stream_close(disp_native_tls_stream *stream){if(stream&&stream->state)disp_tls_state_close(stream->state);}
 static void disp_tls_stream_drop(disp_native_tls_stream *stream){if(!stream||!stream->state)return;disp_tls_state_close(stream->state);disp_tls_state_release(stream->state);stream->state=NULL;}
-static void disp_tls_handshake_drop(void *raw){disp_tls_handshake_state *state=(disp_tls_handshake_state*)raw;if(!state)return;if(state->stream.state)disp_tls_stream_drop(&state->stream);if(state->context_valid)DeleteSecurityContext(&state->context);if(state->credential_valid)FreeCredentialsHandle(&state->credential);if(state->socket_valid){disp_socket_shutdown_handle(state->socket,2);disp_socket_close(state->socket);}disp_tcp_state_release(state->tcp);disp_dealloc(state->server_name);disp_dealloc(state->input);disp_dealloc(state->output);disp_string_drop(&state->error);disp_dealloc(state);}
+static void disp_tls_handshake_drop(void *raw){disp_tls_handshake_state *state=(disp_tls_handshake_state*)raw;if(!state)return;if(state->stream.state)disp_tls_stream_drop(&state->stream);if(state->context_valid)DeleteSecurityContext(&state->context);if(state->credential_valid)FreeCredentialsHandle(&state->credential);if(state->socket_valid){disp_socket_shutdown_handle(state->socket,2);disp_socket_close(state->socket);disp_runtime_release_handle();}disp_tcp_state_release(state->tcp);disp_dealloc(state->server_name);disp_dealloc(state->input);disp_dealloc(state->output);disp_string_drop(&state->error);disp_dealloc(state);}
 typedef enum { DISP_TLS_READ,DISP_TLS_WRITE } disp_tls_io_operation;
 typedef struct {
     disp_tls_state *stream;
@@ -1165,6 +1191,445 @@ static void disp_tls_io_take(disp_tls_io_state *state,bool *ok,disp_native_strin
 static void disp_tls_io_drop(void *raw){disp_tls_io_state *state=(disp_tls_io_state*)raw;if(!state)return;if(state->operation==DISP_TLS_WRITE&&!state->done&&(state->offset||state->cipher))disp_tls_state_close(state->stream);if(state->claimed)atomic_store_explicit(state->operation==DISP_TLS_READ?&state->stream->read_busy:&state->stream->write_busy,false,memory_order_release);disp_string_drop(&state->buffer);disp_dealloc(state->cipher);disp_string_drop(&state->error);disp_tls_state_release(state->stream);disp_dealloc(state);}
 static bool disp_tls_stream_read(disp_native_tls_stream *stream,size_t limit,disp_native_string *bytes,disp_native_string *error,int line,int column){disp_tls_io_state *state=disp_tls_io_create(stream->state,DISP_TLS_READ,NULL,limit,false,0,line,column);while(!disp_tls_io_poll(state))disp_time_sleep(1000000ULL);bool ok=false;size_t ignored=0;disp_tls_io_take(state,&ok,bytes,&ignored,error);disp_tls_io_drop(state);return ok;}
 static bool disp_tls_stream_write(disp_native_tls_stream *stream,const char *bytes,size_t length,size_t *written,disp_native_string *error,int line,int column){disp_tls_io_state *state=disp_tls_io_create(stream->state,DISP_TLS_WRITE,bytes,length,false,0,line,column);while(!disp_tls_io_poll(state))disp_time_sleep(1000000ULL);bool ok=false;disp_native_string ignored={0};disp_tls_io_take(state,&ok,&ignored,written,error);disp_tls_io_drop(state);return ok;}
+#else
+struct disp_tls_state {
+    atomic_size_t refs;
+    atomic_bool closed;
+    atomic_bool read_busy;
+    atomic_bool write_busy;
+    disp_socket_handle socket;
+    SSL_CTX *context;
+    SSL *session;
+};
+typedef struct {
+    disp_tcp_state *tcp;
+    disp_socket_handle socket;
+    bool socket_valid;
+    bool started;
+    bool done;
+    bool taken;
+    bool ok;
+    bool has_deadline;
+    uint64_t timeout;
+    uint64_t deadline;
+    int line;
+    int column;
+    char *server_name;
+    size_t server_name_len;
+    SSL_CTX *context;
+    SSL *session;
+    disp_native_tls_stream stream;
+    disp_native_string error;
+} disp_tls_handshake_state;
+typedef enum { DISP_TLS_READ,DISP_TLS_WRITE } disp_tls_io_operation;
+typedef struct {
+    disp_tls_state *stream;
+    disp_tls_io_operation operation;
+    bool started;
+    bool done;
+    bool taken;
+    bool ok;
+    bool claimed;
+    bool write_attempted;
+    bool has_deadline;
+    uint64_t timeout;
+    uint64_t deadline;
+    size_t limit;
+    size_t offset;
+    disp_native_string buffer;
+    disp_native_string error;
+} disp_tls_io_state;
+static int disp_tls_bio_create(BIO *bio){BIO_set_init(bio,1);BIO_set_data(bio,NULL);BIO_set_shutdown(bio,BIO_NOCLOSE);return 1;}
+static int disp_tls_bio_destroy(BIO *bio){if(!bio)return 0;BIO_set_init(bio,0);BIO_set_data(bio,NULL);return 1;}
+static int disp_tls_bio_read(BIO *bio,char *bytes,int length){
+    BIO_clear_retry_flags(bio);
+    if(!bytes||length<=0)return 0;
+    disp_socket_handle socket=(disp_socket_handle)(intptr_t)BIO_get_data(bio);
+    ssize_t count=recv(socket,bytes,(size_t)length,0);
+    if(count>=0)return (int)count;
+    int code=disp_socket_error_code();
+    if(code==EINTR||disp_socket_would_block(code))BIO_set_retry_read(bio);
+    return -1;
+}
+static int disp_tls_bio_write(BIO *bio,const char *bytes,int length){
+    BIO_clear_retry_flags(bio);
+    if(!bytes||length<=0)return 0;
+    disp_socket_handle socket=(disp_socket_handle)(intptr_t)BIO_get_data(bio);
+    ssize_t count=send(socket,bytes,(size_t)length,
+#ifdef MSG_NOSIGNAL
+        MSG_NOSIGNAL
+#else
+        0
+#endif
+    );
+    if(count>=0)return (int)count;
+    int code=disp_socket_error_code();
+    if(code==EINTR||disp_socket_would_block(code))BIO_set_retry_write(bio);
+    return -1;
+}
+static long disp_tls_bio_control(BIO *bio,int command,long argument,void *pointer){
+    (void)pointer;
+    switch(command){
+        case BIO_CTRL_FLUSH:return 1;
+        case BIO_CTRL_DUP:return 1;
+        case BIO_CTRL_GET_CLOSE:return BIO_get_shutdown(bio);
+        case BIO_CTRL_SET_CLOSE:BIO_set_shutdown(bio,(int)argument);return 1;
+        case BIO_CTRL_PENDING:
+        case BIO_CTRL_WPENDING:return 0;
+        default:return 0;
+    }
+}
+static int disp_tls_bio_puts(BIO *bio,const char *text){return disp_tls_bio_write(bio,text,(int)strlen(text));}
+static pthread_once_t disp_tls_bio_once=PTHREAD_ONCE_INIT;
+static BIO_METHOD *disp_tls_bio_shared_method=NULL;
+static void disp_tls_bio_initialize(void){
+    BIO_METHOD *method=BIO_meth_new(BIO_get_new_index()|BIO_TYPE_SOURCE_SINK,"DISP nonblocking socket");
+    if(!method)return;
+    if(BIO_meth_set_create(method,disp_tls_bio_create)!=1||
+       BIO_meth_set_destroy(method,disp_tls_bio_destroy)!=1||
+       BIO_meth_set_read(method,disp_tls_bio_read)!=1||
+       BIO_meth_set_write(method,disp_tls_bio_write)!=1||
+       BIO_meth_set_ctrl(method,disp_tls_bio_control)!=1||
+       BIO_meth_set_puts(method,disp_tls_bio_puts)!=1){
+        BIO_meth_free(method);
+        return;
+    }
+    disp_tls_bio_shared_method=method;
+}
+static BIO_METHOD *disp_tls_bio_method(void){pthread_once(&disp_tls_bio_once,disp_tls_bio_initialize);return disp_tls_bio_shared_method;}
+static disp_native_string disp_tls_openssl_error(const char *operation,int ssl_error,int os_error){
+    char detail[256]={0};
+    unsigned long code=ERR_get_error();
+    if(code)ERR_error_string_n(code,detail,sizeof(detail));
+    else if(ssl_error==SSL_ERROR_SYSCALL&&os_error)snprintf(detail,sizeof(detail),"%s",strerror(os_error));
+    else snprintf(detail,sizeof(detail),"TLS provider error %d",ssl_error);
+    char message[448];
+    int length=snprintf(message,sizeof(message),"%s failed: %s",operation,detail);
+    if(length<0)length=0;
+    if((size_t)length>=sizeof(message))length=(int)sizeof(message)-1;
+    return disp_owned_bytes(message,(size_t)length);
+}
+static bool disp_tls_server_name(const char *text,size_t length,char **name){
+    if(!length||length>INT_MAX||memchr(text,0,length)||!disp_utf8_valid(text,length))return false;
+    char *copy=(char*)disp_alloc(length+1,1);
+    memcpy(copy,text,length);
+    copy[length]=0;
+    *name=copy;
+    return true;
+}
+static bool disp_tls_configure_name(SSL *session,const char *server_name,size_t server_name_len){
+    unsigned char address[sizeof(struct in6_addr)];
+    X509_VERIFY_PARAM *parameters=SSL_get0_param(session);
+    if(!parameters)return false;
+    X509_VERIFY_PARAM_set_hostflags(parameters,X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+    if(inet_pton(AF_INET,server_name,address)==1||inet_pton(AF_INET6,server_name,address)==1)
+        return X509_VERIFY_PARAM_set1_ip_asc(parameters,server_name)==1;
+    return SSL_set_tlsext_host_name(session,server_name)==1&&
+           X509_VERIFY_PARAM_set1_host(parameters,server_name,server_name_len)==1;
+}
+static bool disp_tls_handshake_initialize(disp_tls_handshake_state *state){
+    BIO_METHOD *method=disp_tls_bio_method();
+    if(!method){
+        state->error=disp_owned_bytes("TLS socket provider initialization failed",strlen("TLS socket provider initialization failed"));
+        state->done=true;
+        return false;
+    }
+    ERR_clear_error();
+    state->context=SSL_CTX_new(TLS_client_method());
+    if(!state->context){
+        state->error=disp_tls_openssl_error("TLS context creation",SSL_ERROR_SSL,0);
+        state->done=true;
+        return false;
+    }
+    SSL_CTX_set_verify(state->context,SSL_VERIFY_PEER,NULL);
+    SSL_CTX_set_options(state->context,SSL_OP_NO_COMPRESSION);
+#ifdef SSL_OP_NO_RENEGOTIATION
+    SSL_CTX_set_options(state->context,SSL_OP_NO_RENEGOTIATION);
+#endif
+    if(SSL_CTX_set_min_proto_version(state->context,TLS1_2_VERSION)!=1||
+       SSL_CTX_set_default_verify_paths(state->context)!=1){
+        state->error=disp_tls_openssl_error("TLS trust configuration",SSL_ERROR_SSL,0);
+        state->done=true;
+        return false;
+    }
+    state->session=SSL_new(state->context);
+    if(!state->session){
+        state->error=disp_tls_openssl_error("TLS session creation",SSL_ERROR_SSL,0);
+        state->done=true;
+        return false;
+    }
+    SSL_set_mode(state->session,SSL_MODE_ENABLE_PARTIAL_WRITE|SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+    if(!disp_tls_configure_name(state->session,state->server_name,state->server_name_len)){
+        state->error=disp_tls_openssl_error("TLS server-name verification setup",SSL_ERROR_SSL,0);
+        state->done=true;
+        return false;
+    }
+    BIO *bio=BIO_new(method);
+    if(!bio){
+        state->error=disp_tls_openssl_error("TLS socket allocation",SSL_ERROR_SSL,0);
+        state->done=true;
+        return false;
+    }
+    BIO_set_data(bio,(void*)(intptr_t)state->socket);
+    BIO_set_init(bio,1);
+    BIO_set_shutdown(bio,BIO_NOCLOSE);
+    SSL_set_bio(state->session,bio,bio);
+    SSL_set_connect_state(state->session);
+    return true;
+}
+static disp_tls_state *disp_tls_state_finish(disp_tls_handshake_state *handshake){
+    disp_tls_state *state=(disp_tls_state*)disp_alloc_zeroed(1,sizeof(disp_tls_state),_Alignof(disp_tls_state));
+    atomic_init(&state->refs,1);
+    atomic_init(&state->closed,false);
+    atomic_init(&state->read_busy,false);
+    atomic_init(&state->write_busy,false);
+    state->socket=handshake->socket;
+    state->context=handshake->context;
+    state->session=handshake->session;
+    handshake->socket_valid=false;
+    handshake->context=NULL;
+    handshake->session=NULL;
+    return state;
+}
+static disp_tls_handshake_state *disp_tls_handshake_create(disp_tcp_state *tcp,const char *server_name,size_t server_name_len,bool has_timeout,uint64_t timeout,int line,int column){
+    if(!tcp)dv_panic("TCP stream is unavailable",line,column);
+    disp_tls_handshake_state *state=(disp_tls_handshake_state*)disp_alloc_zeroed(1,sizeof(disp_tls_handshake_state),_Alignof(disp_tls_handshake_state));
+    state->tcp=tcp;
+    state->socket=DISP_INVALID_SOCKET;
+    state->has_deadline=has_timeout;
+    state->timeout=timeout;
+    state->line=line;
+    state->column=column;
+    state->server_name_len=server_name_len;
+    if(!disp_tls_server_name(server_name,server_name_len,&state->server_name)){
+        state->error=disp_owned_bytes("TLS server name must be non-empty valid UTF-8 without NUL",strlen("TLS server name must be non-empty valid UTF-8 without NUL"));
+        state->done=true;
+    }
+    return state;
+}
+static bool disp_tls_handshake_poll(disp_tls_handshake_state *state){
+    if(!state||state->taken)dv_panic("TLS handshake future has already completed",0,0);
+    if(state->done)return true;
+    if(!state->started){
+        state->started=true;
+        uint64_t now=disp_time_now_nanos();
+        state->deadline=UINT64_MAX-now<state->timeout?UINT64_MAX:now+state->timeout;
+        if(state->has_deadline&&!state->timeout){
+            state->error=disp_owned_bytes("TLS handshake timed out",strlen("TLS handshake timed out"));
+            state->done=true;
+            return true;
+        }
+        if(!disp_tcp_take_socket(state->tcp,&state->socket)){
+            state->error=disp_owned_bytes("TCP stream is closed",strlen("TCP stream is closed"));
+            state->done=true;
+            return true;
+        }
+        state->socket_valid=true;
+        if(!disp_tls_handshake_initialize(state))return true;
+    }
+    if(state->has_deadline&&disp_time_now_nanos()>=state->deadline){
+        state->error=disp_owned_bytes("TLS handshake timed out",strlen("TLS handshake timed out"));
+        state->done=true;
+        return true;
+    }
+    ERR_clear_error();
+    int result=SSL_connect(state->session);
+    int os_error=errno;
+    if(result==1){
+        if(SSL_get_verify_result(state->session)!=X509_V_OK||!SSL_get0_peer_certificate(state->session)){
+            state->error=disp_owned_bytes("TLS certificate verification failed",strlen("TLS certificate verification failed"));
+            state->done=true;
+            return true;
+        }
+        disp_tls_state *stream=disp_tls_state_finish(state);
+        state->stream=(disp_native_tls_stream){.state=stream};
+        state->ok=true;
+        state->done=true;
+        return true;
+    }
+    int ssl_error=SSL_get_error(state->session,result);
+    if(ssl_error!=SSL_ERROR_WANT_READ&&ssl_error!=SSL_ERROR_WANT_WRITE){
+        state->error=disp_tls_openssl_error("TLS handshake",ssl_error,os_error);
+        state->done=true;
+        return true;
+    }
+    if(state->has_deadline&&disp_time_now_nanos()>=state->deadline){
+        state->error=disp_owned_bytes("TLS handshake timed out",strlen("TLS handshake timed out"));
+        state->done=true;
+        return true;
+    }
+    disp_reactor_offer(1000000ULL);
+    return false;
+}
+static void disp_tls_handshake_take(disp_tls_handshake_state *state,bool *ok,disp_native_tls_stream *stream,disp_native_string *error){
+    if(!state->done||state->taken)dv_panic("TLS handshake result is not ready",0,0);
+    state->taken=true;
+    *ok=state->ok;
+    *stream=state->stream;
+    state->stream=(disp_native_tls_stream){0};
+    *error=state->error;
+    state->error=(disp_native_string){0};
+}
+static void disp_tls_state_retain(disp_tls_state *state){
+    if(!state)dv_panic("TLS stream is unavailable",0,0);
+    size_t previous=atomic_fetch_add_explicit(&state->refs,1,memory_order_relaxed);
+    if(previous==SIZE_MAX)dv_panic("TLS stream reference count overflow",0,0);
+}
+static void disp_tls_state_close(disp_tls_state *state){
+    if(!state||atomic_exchange_explicit(&state->closed,true,memory_order_acq_rel))return;
+    if(state->session){ERR_clear_error();SSL_shutdown(state->session);}
+    disp_socket_shutdown_handle(state->socket,2);
+    disp_socket_close(state->socket);
+    disp_runtime_release_handle();
+}
+static void disp_tls_state_release(disp_tls_state *state){
+    if(!state||atomic_fetch_sub_explicit(&state->refs,1,memory_order_acq_rel)!=1)return;
+    atomic_thread_fence(memory_order_acquire);
+    disp_tls_state_close(state);
+    SSL_free(state->session);
+    SSL_CTX_free(state->context);
+    disp_dealloc(state);
+}
+static void disp_tls_stream_close(disp_native_tls_stream *stream){if(stream&&stream->state)disp_tls_state_close(stream->state);}
+static void disp_tls_stream_drop(disp_native_tls_stream *stream){if(!stream||!stream->state)return;disp_tls_state_close(stream->state);disp_tls_state_release(stream->state);stream->state=NULL;}
+static void disp_tls_handshake_drop(void *raw){
+    disp_tls_handshake_state *state=(disp_tls_handshake_state*)raw;
+    if(!state)return;
+    if(state->stream.state)disp_tls_stream_drop(&state->stream);
+    SSL_free(state->session);
+    SSL_CTX_free(state->context);
+    if(state->socket_valid){
+        disp_socket_shutdown_handle(state->socket,2);
+        disp_socket_close(state->socket);
+        disp_runtime_release_handle();
+    }
+    disp_tcp_state_release(state->tcp);
+    disp_dealloc(state->server_name);
+    disp_string_drop(&state->error);
+    disp_dealloc(state);
+}
+static void disp_tls_io_finish(disp_tls_io_state *state,bool ok){
+    state->ok=ok;
+    state->done=true;
+    if(state->claimed){
+        atomic_store_explicit(state->operation==DISP_TLS_READ?&state->stream->read_busy:&state->stream->write_busy,false,memory_order_release);
+        state->claimed=false;
+    }
+}
+static void disp_tls_io_fail(disp_tls_io_state *state,disp_native_string error,bool corrupts_stream){
+    if(state->operation==DISP_TLS_READ)disp_string_drop(&state->buffer);
+    state->error=error;
+    if(corrupts_stream)disp_tls_state_close(state->stream);
+    disp_tls_io_finish(state,false);
+}
+static disp_tls_io_state *disp_tls_io_create(disp_tls_state *stream,disp_tls_io_operation operation,const char *bytes,size_t length,bool has_timeout,uint64_t timeout,int line,int column){
+    if(!stream)dv_panic("TLS stream is unavailable",line,column);
+    if(operation==DISP_TLS_READ&&length>DISP_TCP_READ_LIMIT)dv_panic("TLS read limit exceeds the 16 MiB safety limit",line,column);
+    disp_tls_io_state *state=(disp_tls_io_state*)disp_alloc_zeroed(1,sizeof(disp_tls_io_state),_Alignof(disp_tls_io_state));
+    state->stream=stream;
+    disp_tls_state_retain(stream);
+    state->operation=operation;
+    state->has_deadline=has_timeout;
+    state->timeout=timeout;
+    state->limit=length;
+    if(operation==DISP_TLS_WRITE&&length)state->buffer=disp_owned_bytes(bytes,length);
+    return state;
+}
+static bool disp_tls_io_poll(disp_tls_io_state *state){
+    if(!state||state->taken)dv_panic("TLS I/O future has already completed",0,0);
+    if(state->done)return true;
+    if(!state->started){
+        state->started=true;
+        uint64_t now=disp_time_now_nanos();
+        state->deadline=UINT64_MAX-now<state->timeout?UINT64_MAX:now+state->timeout;
+        if(state->has_deadline&&!state->timeout){
+            disp_tls_io_fail(state,disp_owned_bytes(state->operation==DISP_TLS_READ?"TLS read timed out":"TLS write timed out",state->operation==DISP_TLS_READ?strlen("TLS read timed out"):strlen("TLS write timed out")),false);
+            return true;
+        }
+    }
+    if(atomic_load_explicit(&state->stream->closed,memory_order_acquire)){
+        disp_tls_io_fail(state,disp_owned_bytes("TLS stream is closed",strlen("TLS stream is closed")),false);
+        return true;
+    }
+    atomic_bool *busy=state->operation==DISP_TLS_READ?&state->stream->read_busy:&state->stream->write_busy;
+    if(!state->claimed){
+        if(!disp_tcp_claim(busy)){
+            if(state->has_deadline&&disp_time_now_nanos()>=state->deadline){
+                disp_tls_io_fail(state,disp_owned_bytes("TLS operation timed out",strlen("TLS operation timed out")),false);
+                return true;
+            }
+            disp_reactor_offer(1000000ULL);
+            return false;
+        }
+        state->claimed=true;
+    }
+    if(!state->limit){disp_tls_io_finish(state,true);return true;}
+    for(unsigned steps=0;steps<16&&!state->done;steps++){
+        ERR_clear_error();
+        int result=0;
+        if(state->operation==DISP_TLS_READ){
+            if(!state->buffer.data){
+                state->buffer.data=(char*)disp_alloc(state->limit,1);
+                state->buffer.cap=state->limit;
+            }
+            result=SSL_read(state->stream->session,state->buffer.data,(int)state->limit);
+        }else{
+            size_t remaining=state->limit-state->offset;
+            int chunk=(int)(remaining>INT_MAX?INT_MAX:remaining);
+            state->write_attempted=true;
+            result=SSL_write(state->stream->session,state->buffer.data+state->offset,chunk);
+        }
+        int os_error=errno;
+        if(result>0){
+            if(state->operation==DISP_TLS_READ){
+                state->buffer.len=(size_t)result;
+                disp_tls_io_finish(state,true);
+            }else{
+                state->offset+=(size_t)result;
+                if(state->offset==state->limit)disp_tls_io_finish(state,true);
+            }
+            continue;
+        }
+        int ssl_error=SSL_get_error(state->stream->session,result);
+        if(state->operation==DISP_TLS_READ&&ssl_error==SSL_ERROR_ZERO_RETURN){
+            disp_string_drop(&state->buffer);
+            disp_tls_io_finish(state,true);
+            break;
+        }
+        if(ssl_error==SSL_ERROR_WANT_READ||ssl_error==SSL_ERROR_WANT_WRITE)break;
+        disp_tls_io_fail(state,disp_tls_openssl_error(state->operation==DISP_TLS_READ?"TLS read":"TLS write",ssl_error,os_error),true);
+    }
+    if(!state->done&&state->has_deadline&&disp_time_now_nanos()>=state->deadline){
+        bool corrupts=state->operation==DISP_TLS_WRITE&&state->write_attempted;
+        disp_tls_io_fail(state,disp_owned_bytes(state->operation==DISP_TLS_READ?"TLS read timed out":"TLS write timed out",state->operation==DISP_TLS_READ?strlen("TLS read timed out"):strlen("TLS write timed out")),corrupts);
+    }
+    if(!state->done)disp_reactor_offer(1000000ULL);
+    return state->done;
+}
+static void disp_tls_io_take(disp_tls_io_state *state,bool *ok,disp_native_string *bytes,size_t *written,disp_native_string *error){
+    if(!state->done||state->taken)dv_panic("TLS I/O result is not ready",0,0);
+    state->taken=true;
+    *ok=state->ok;
+    if(state->operation==DISP_TLS_READ){
+        *bytes=state->buffer;
+        state->buffer=(disp_native_string){0};
+    }else *written=state->offset;
+    *error=state->error;
+    state->error=(disp_native_string){0};
+}
+static void disp_tls_io_drop(void *raw){
+    disp_tls_io_state *state=(disp_tls_io_state*)raw;
+    if(!state)return;
+    if(state->operation==DISP_TLS_WRITE&&!state->done&&state->write_attempted)disp_tls_state_close(state->stream);
+    if(state->claimed)atomic_store_explicit(state->operation==DISP_TLS_READ?&state->stream->read_busy:&state->stream->write_busy,false,memory_order_release);
+    disp_string_drop(&state->buffer);
+    disp_string_drop(&state->error);
+    disp_tls_state_release(state->stream);
+    disp_dealloc(state);
+}
+static bool disp_tls_stream_read(disp_native_tls_stream *stream,size_t limit,disp_native_string *bytes,disp_native_string *error,int line,int column){disp_tls_io_state *state=disp_tls_io_create(stream->state,DISP_TLS_READ,NULL,limit,false,0,line,column);while(!disp_tls_io_poll(state))disp_time_sleep(1000000ULL);bool ok=false;size_t ignored=0;disp_tls_io_take(state,&ok,bytes,&ignored,error);disp_tls_io_drop(state);return ok;}
+static bool disp_tls_stream_write(disp_native_tls_stream *stream,const char *bytes,size_t length,size_t *written,disp_native_string *error,int line,int column){disp_tls_io_state *state=disp_tls_io_create(stream->state,DISP_TLS_WRITE,bytes,length,false,0,line,column);while(!disp_tls_io_poll(state))disp_time_sleep(1000000ULL);bool ok=false;disp_native_string ignored={0};disp_tls_io_take(state,&ok,&ignored,written,error);disp_tls_io_drop(state);return ok;}
+#endif
 #endif
 #ifdef DISP_HTTP
 struct disp_http_response_state {

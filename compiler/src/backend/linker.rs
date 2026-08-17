@@ -12,6 +12,7 @@ use std::{
 #[derive(Clone)]
 pub struct RuntimeFeatures {
     pub networking: bool,
+    pub tls: bool,
     pub http: bool,
     pub database: bool,
     pub data: bool,
@@ -49,6 +50,9 @@ pub fn compile_and_link(
     if features.networking {
         compile.push("-DDISP_NETWORKING".into());
     }
+    if features.tls {
+        compile.push("-DDISP_TLS".into());
+    }
     if features.http {
         compile.push("-DDISP_HTTP".into());
     }
@@ -82,6 +86,10 @@ pub fn compile_and_link(
     }
     if !cfg!(windows) {
         link.push("-pthread".into());
+        if features.tls {
+            link.push("-lssl".into());
+            link.push("-lcrypto".into());
+        }
         if features.http {
             link.push("-lcurl".into());
         }
@@ -90,11 +98,13 @@ pub fn compile_and_link(
         link.push("-lbcrypt".into());
         if features.networking {
             link.push("-lws2_32".into());
+        }
+        if features.tls {
             link.push("-lsecur32".into());
             link.push("-lcrypt32".into());
-            if features.http {
-                link.push("-lwinhttp".into());
-            }
+        }
+        if features.http {
+            link.push("-lwinhttp".into());
         }
         if features.database {
             link.push(windows_sqlite_library()?);

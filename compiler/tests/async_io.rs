@@ -150,7 +150,7 @@ async fn main() {{
 }
 
 #[test]
-fn cancellation_releases_started_io_but_does_not_undo_completed_side_effects() {
+fn cancellation_drains_started_io_without_undoing_completed_side_effects() {
     let path = unique_path("started-cancel.txt");
     let source = format!(
         r#"
@@ -163,18 +163,21 @@ async fn main() {{
         task = Async.spawn(background(Path("{}")))
         await Async.yield()
     }}
-    await Async.sleep(Duration.from_millis(2))
-    print(File.exists(Path("{}")))
-    print(File.remove(Path("{}")))
+    print("cancelled")
 }}
 "#,
         source_path(&path),
-        source_path(&path),
-        source_path(&path),
     );
-    assert_eq!(run_source(&source).unwrap(), ["true", "Result.Ok(())"]);
-    differential("started-cancel", &source);
-    assert!(!path.exists());
+    assert_eq!(run_source(&source).unwrap(), ["cancelled"]);
+    assert_eq!(fs::read_to_string(&path).unwrap(), "started");
+    fs::remove_file(&path).unwrap();
+
+    let Some((actual, _)) = native("started-cancel", &source, false) else {
+        return;
+    };
+    assert_eq!(actual, "cancelled\n");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "started");
+    fs::remove_file(&path).unwrap();
 }
 
 #[test]

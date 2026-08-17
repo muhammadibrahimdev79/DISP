@@ -50,8 +50,8 @@ cleanup. `UdpSocket` adds owned datagram sockets with synchronous or lazy deadli
 send/receive operations, sender-address metadata, explicit truncation errors, zero-length
 datagrams, and cancellation-safe reference-counted native state. `Tls.connect` and
 `Tls.connect_timeout` consume a `TcpStream` into a lazy handshake future and produce an owned
-`TlsStream` using the operating-system trust store, verified host names, SNI, certificate
-revocation checks, strong cryptography, and TLS 1.2 or newer. TLS streams provide synchronous and
+`TlsStream` using native Schannel/OpenSSL providers, system trust, verified host names, SNI,
+platform revocation policy, strong cryptography, and TLS 1.2 or newer. TLS streams provide synchronous and
 lazy deadline-aware encrypted reads and writes, explicit close, and deterministic authenticated
 shutdown/drop cleanup. Safe lazy HTTP/HTTPS GET/POST/PUT/PATCH/DELETE operations and linear owned
 custom requests provide typed responses, snapshotted headers and bodies, safe TLS defaults,
