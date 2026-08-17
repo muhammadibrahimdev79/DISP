@@ -7,7 +7,7 @@ use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     path::PathBuf,
-    process::Command,
+    process::{Command, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
     thread,
     time::{Duration, Instant},
@@ -23,7 +23,12 @@ fn unique_path(label: &str) -> PathBuf {
     ))
 }
 
-fn native(name: &str, source: &str, emit_c: bool) -> Option<(String, Option<String>)> {
+fn native_with_setup<T>(
+    name: &str,
+    source: &str,
+    emit_c: bool,
+    after_spawn: impl FnOnce() -> T,
+) -> Option<(String, Option<String>, T)> {
     let path = unique_path(&format!("{name}.disp"));
     fs::write(&path, source).unwrap();
     let (hir, mir) = lower_source(source).unwrap();
@@ -40,9 +45,34 @@ fn native(name: &str, source: &str, emit_c: bool) -> Option<(String, Option<Stri
     let generated = artifacts
         .backend_ir
         .map(|path| fs::read_to_string(path).unwrap());
+    let mut after_spawn = Some(after_spawn);
     for _ in 0..4 {
-        match Command::new(&artifacts.executable).output() {
-            Ok(output) => {
+        match Command::new(&artifacts.executable)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(mut child) => {
+                let setup = after_spawn.take().unwrap()();
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => break,
+                        Ok(None) if Instant::now() < deadline => {
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Ok(None) => {
+                            let _ = child.kill();
+                            let output = child.wait_with_output().unwrap();
+                            panic!(
+                                "native TCP server exceeded its 30-second test deadline\nstderr:\n{}",
+                                String::from_utf8_lossy(&output.stderr)
+                            );
+                        }
+                        Err(error) => panic!("could not query native TCP server: {error}"),
+                    }
+                }
+                let output = child.wait_with_output().unwrap();
                 assert!(
                     output.status.success(),
                     "{}",
@@ -53,6 +83,7 @@ fn native(name: &str, source: &str, emit_c: bool) -> Option<(String, Option<Stri
                         .unwrap()
                         .replace("\r\n", "\n"),
                     generated,
+                    setup,
                 ));
             }
             Err(error) if error.raw_os_error() == Some(4551) => {}
@@ -60,6 +91,11 @@ fn native(name: &str, source: &str, emit_c: bool) -> Option<(String, Option<Stri
         }
     }
     None
+}
+
+fn native(name: &str, source: &str, emit_c: bool) -> Option<(String, Option<String>)> {
+    let (output, generated, ()) = native_with_setup(name, source, emit_c, || ())?;
+    Some((output, generated))
 }
 
 fn available_port() -> u16 {
@@ -86,6 +122,12 @@ fn client(port: u16) -> thread::JoinHandle<()> {
                 Err(error) => panic!("test client could not connect: {error}"),
             }
         };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
         stream.write_all(&[1, 2, 3]).unwrap();
         let mut response = [0; 3];
         stream.read_exact(&mut response).unwrap();
@@ -125,8 +167,9 @@ fn listener_bind_accept_timeout_and_exchange_are_differential() {
     assert_eq!(run_source(&source).unwrap(), ["true", "Result.Ok(1)"]);
     interpreted_client.join().unwrap();
 
-    let native_client = client(port);
-    let Some((actual, generated)) = native("exchange", &source, true) else {
+    let Some((actual, generated, native_client)) =
+        native_with_setup("exchange", &source, true, || client(port))
+    else {
         return;
     };
     native_client.join().unwrap();
