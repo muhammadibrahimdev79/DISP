@@ -3657,6 +3657,7 @@ struct NativeDataTable {
     fields: Vec<NativeDataField>,
     primary: usize,
     rows: Vec<Value>,
+    indexes: Vec<HashMap<String, usize>>,
 }
 
 #[derive(Clone, Default)]
@@ -4366,6 +4367,37 @@ fn mutate_native_data<T>(
     Ok(value)
 }
 
+fn native_data_indexes(
+    program: &Program,
+    fields: &[NativeDataField],
+    rows: &[Value],
+) -> io::Result<Vec<HashMap<String, usize>>> {
+    let mut indexes = vec![HashMap::new(); fields.len()];
+    for (row_index, row) in rows.iter().enumerate() {
+        let Value::Struct { fields: values, .. } = row else {
+            return Err(io::Error::other(
+                "stored row does not match its DISP Data schema",
+            ));
+        };
+        for (field_index, field) in fields.iter().enumerate() {
+            if !field.primary && !field.unique {
+                continue;
+            }
+            let value = values.get(&field.name).ok_or_else(|| {
+                io::Error::other(format!("stored row is missing `{}`", field.name))
+            })?;
+            let key = encode_json_value(program, value)?.text;
+            if indexes[field_index].insert(key, row_index).is_some() {
+                return Err(io::Error::other(format!(
+                    "stored table contains a duplicate indexed value for `{}`",
+                    field.name
+                )));
+            }
+        }
+    }
+    Ok(indexes)
+}
+
 fn data_ensure_schema(
     program: &Program,
     database: &RuntimeDatabase,
@@ -4415,6 +4447,7 @@ fn data_ensure_schema(
                     .iter()
                     .position(|field| field.primary)
                     .expect("validated data schema has one primary field");
+                let indexes = native_data_indexes(program, &fields, &rows)?;
                 store.pending.remove(&schema.name);
                 store.tables.insert(
                     schema.name.clone(),
@@ -4422,6 +4455,7 @@ fn data_ensure_schema(
                         fields,
                         primary,
                         rows,
+                        indexes,
                     },
                 );
                 return Ok(());
@@ -4430,6 +4464,7 @@ fn data_ensure_schema(
                 .iter()
                 .position(|field| field.primary)
                 .expect("validated data schema has one primary field");
+            let indexes = native_data_indexes(program, &fields, &[])?;
             mutate_native_data(program, store, |store| {
                 store.tables.insert(
                     schema.name.clone(),
@@ -4437,6 +4472,7 @@ fn data_ensure_schema(
                         fields,
                         primary,
                         rows: Vec::new(),
+                        indexes,
                     },
                 );
                 Ok(())
@@ -4503,17 +4539,22 @@ fn native_data_write(
             let key = fields
                 .get(primary_name)
                 .ok_or_else(|| io::Error::other("data value is missing its primary field"))?;
-            let existing = table.rows.iter().position(|row| {
-                matches!(row, Value::Struct { fields, .. } if fields.get(primary_name) == Some(key))
-            });
-            for field in table.fields.iter().filter(|field| field.unique) {
+            let primary_key = encode_json_value(program, key)?.text;
+            let existing = table.indexes[table.primary].get(&primary_key).copied();
+            for (field_index, field) in table
+                .fields
+                .iter()
+                .enumerate()
+                .filter(|(_, field)| field.unique)
+            {
                 let candidate = fields.get(&field.name).ok_or_else(|| {
                     io::Error::other(format!("data value is missing `{}`", field.name))
                 })?;
-                if table.rows.iter().enumerate().any(|(index, row)| {
-                    Some(index) != existing
-                        && matches!(row, Value::Struct { fields, .. } if fields.get(&field.name) == Some(candidate))
-                }) {
+                let candidate = encode_json_value(program, candidate)?.text;
+                if table.indexes[field_index]
+                    .get(&candidate)
+                    .is_some_and(|index| Some(*index) != existing)
+                {
                     return Err(io::Error::other(format!(
                         "duplicate unique value for `{}.{}`",
                         schema.name, field.name
@@ -4528,12 +4569,14 @@ fn native_data_write(
                     )));
                 }
                 table.rows[index] = value;
+                table.indexes = native_data_indexes(program, &table.fields, &table.rows)?;
                 return Ok(1);
             }
             if table.rows.len() >= DATABASE_ROW_LIMIT {
                 return Err(io::Error::other("data table exceeds the 100000-row limit"));
             }
             table.rows.push(value);
+            table.indexes = native_data_indexes(program, &table.fields, &table.rows)?;
             Ok(1)
         })
     })
@@ -4552,6 +4595,50 @@ fn native_data_rows(
     })
 }
 
+fn native_data_indexed_rows(
+    program: &Program,
+    database: &RuntimeDatabase,
+    schema: &crate::ast::StructDeclaration,
+    predicate: &Expr,
+    parameters: &HashMap<Span, Value>,
+) -> io::Result<Option<Vec<Value>>> {
+    let Expression::Binary {
+        left,
+        operator: BinaryOperator::Equal,
+        right,
+    } = &predicate.node
+    else {
+        return native_data_rows(database, schema);
+    };
+    let indexed = |field_name: &str, parameter: &Expr| {
+        let field = schema
+            .fields
+            .iter()
+            .enumerate()
+            .find(|(_, field)| field.name == field_name && (field.primary || field.unique));
+        field.and_then(|(index, _)| parameters.get(&parameter.span).map(|value| (index, value)))
+    };
+    let lookup = match (&left.node, &right.node) {
+        (Expression::Identifier(field), _) => indexed(field, right),
+        (_, Expression::Identifier(field)) => indexed(field, left),
+        _ => None,
+    };
+    let Some((field, value)) = lookup else {
+        return native_data_rows(database, schema);
+    };
+    let key = encode_json_value(program, value)?.text;
+    database.with_native(|store| {
+        let table = store
+            .tables
+            .get(&schema.name)
+            .ok_or_else(|| io::Error::other("DISP Data schema was not registered"))?;
+        Ok(table.indexes[field]
+            .get(&key)
+            .map(|row| vec![table.rows[*row].clone()])
+            .unwrap_or_default())
+    })
+}
+
 fn native_data_replace_rows(
     program: &Program,
     database: &RuntimeDatabase,
@@ -4565,6 +4652,7 @@ fn native_data_replace_rows(
                 .get_mut(&schema.name)
                 .ok_or_else(|| io::Error::other("DISP Data schema was not registered"))?;
             table.rows = rows;
+            table.indexes = native_data_indexes(program, &table.fields, &table.rows)?;
             Ok(())
         })
     })
@@ -6893,7 +6981,12 @@ impl Interpreter {
             if let Some(order) = order {
                 self.capture_data_parameters(program, schema, &order.key, &mut parameters)?;
             }
-            let mut values = match native_data_rows(&database, schema) {
+            let rows = if let Some(predicate) = predicate {
+                native_data_indexed_rows(program, &database, schema, predicate, &parameters)
+            } else {
+                native_data_rows(&database, schema)
+            };
+            let mut values = match rows {
                 Ok(Some(rows)) => rows,
                 Ok(None) => {
                     return Ok(runtime_result(Err(io::Error::other(

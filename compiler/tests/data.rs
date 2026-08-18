@@ -562,9 +562,15 @@ fn verify() -> Result<bool, DataError> {{
     data add Account {{ id: 2, email: "grace@disp.dev" }} in store?
     collision = data save Account {{ id: 2, email: "ada@disp.dev" }} in store
     rows = data find Account in store order id ascending?
+    wanted = "grace@disp.dev"
+    indexed = data find Account in store where email == wanted?
+    removed = data remove Account in store where id == 1?
+    data add Account {{ id: 3, email: "ada@disp.dev" }} in store?
+    reused = data find Account in store where email == "ada@disp.dev"?
     return Ok(match duplicate {{ Err(_) => true, Ok(_) => false }}
         && match collision {{ Err(_) => true, Ok(_) => false }}
-        && rows.len() == 2)
+        && rows.len() == 2 && indexed.len() == 1
+        && removed == 1 && reused.len() == 1)
 }}
 
 fn main() {{ print(match verify() {{ Ok(value) => value, Err(_) => false }}) }}
@@ -576,6 +582,26 @@ fn main() {{ print(match verify() {{ Ok(value) => value, Err(_) => false }}) }}
     if let Some(output) = native_output("unique-constraints", &source) {
         assert_eq!(output, "true\n");
     }
+    let native_source = std::env::temp_dir().join(format!(
+        "disp-data-index-structure-{}.disp",
+        std::process::id()
+    ));
+    fs::write(&native_source, &source).unwrap();
+    let (hir, mir) = lower_source(&source).unwrap();
+    let artifacts = backend::build(
+        &hir,
+        &mir,
+        &native_source,
+        BuildOptions {
+            emit_c: true,
+            ..BuildOptions::default()
+        },
+    )
+    .unwrap();
+    let generated = fs::read_to_string(artifacts.backend_ir.unwrap()).unwrap();
+    assert!(generated.contains("disp_data_indexes_rebuild"));
+    assert!(generated.contains("disp_data_index_find"));
+    assert!(generated.matches("disp_data_native_lookup(").count() >= 2);
 
     let optional =
         check_source("data Account { id: int primary email: Option<String> unique } fn main() {}")

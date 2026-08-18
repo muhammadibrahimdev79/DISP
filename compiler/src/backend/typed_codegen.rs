@@ -5144,6 +5144,32 @@ fn data_parameters(expression: &hir::DataExpr, output: &mut Vec<usize>) {
     }
 }
 
+fn data_index_lookup(
+    expression: &hir::DataExpr,
+    schema: &hir::Struct,
+    parameters: &[usize],
+) -> Option<(usize, usize)> {
+    let hir::DataExprKind::Binary(ast::BinaryOperator::Equal, left, right) = &expression.kind
+    else {
+        return None;
+    };
+    let (field, parameter) = match (&left.kind, &right.kind) {
+        (hir::DataExprKind::Field(field), hir::DataExprKind::Parameter(parameter))
+        | (hir::DataExprKind::Parameter(parameter), hir::DataExprKind::Field(field)) => {
+            (*field, *parameter)
+        }
+        _ => return None,
+    };
+    let field = schema.fields.get(field)?;
+    if !field.primary && !field.unique {
+        return None;
+    }
+    parameters
+        .iter()
+        .position(|candidate| *candidate == parameter)
+        .map(|slot| (field.index, slot))
+}
+
 fn data_constant_native(constant: &hir::Constant) -> String {
     match constant {
         hir::Constant::Signed(value, width) => {
@@ -5562,11 +5588,28 @@ fn data_call(
                 .collect::<String>();
             let drop_element = drop_value(program, "_values.data[_i]", &schema_ty);
             let drop_target = drop_value(program, "_values.data[_target]", &schema_ty);
+            let native_rows = predicate
+                .as_ref()
+                .and_then(|predicate| data_index_lookup(predicate, schema, &indices))
+                .map_or_else(
+                    || {
+                        format!(
+                            "disp_data_native_snapshot(({database})->state,\"{}\",{},&_rows,&_rows_len,&_rows_cap,&_error)",
+                            escape(&schema.name),
+                            schema.name.len()
+                        )
+                    },
+                    |(field, parameter)| {
+                        format!(
+                            "disp_data_native_lookup(({database})->state,\"{}\",{},{field},&_params[{parameter}],&_rows,&_rows_len,&_rows_cap,&_error)",
+                            escape(&schema.name),
+                            schema.name.len()
+                        )
+                    },
+                );
             format!(
-                "({{{result_c} _r={{0}};disp_native_string _error={{0}};bool _ok={guard};bool _native=_ok&&({database})->state->native;disp_native_json _params[{}]={{{{0}}}};size_t _encoded=0;{limit_check}{native_limit}{encoders}disp_native_json *_rows=NULL;size_t _rows_len=0,_rows_cap=0;if(_ok){{if(_native)_ok=disp_data_native_snapshot(({database})->state,\"{}\",{},&_rows,&_rows_len,&_rows_cap,&_error);else _ok=disp_database_query(({database})->state,\"{}\",{},_params,{parameter_count},&_rows,&_rows_len,&_rows_cap,&_error);}}{list_c} _values={{0}};if(_ok&&_rows_len){{_values.data=({element_c}*)disp_alloc_zeroed(_rows_len,sizeof({element_c}),_Alignof({element_c}));_values.cap=_rows_len;}}if(_ok){{for(size_t _i=0;_i<_rows_len;_i++){{size_t _target=_values.len,_field_done=0;{decoders}if(!_ok){{{partial_drops}break;}}{element_c} *_row=&_values.data[_target];if(_native&&!dv_truth({native_predicate})){{{drop_target}continue;}}_values.len++;}}}}{native_order}if(_ok&&_native&&_values.len>_native_limit){{for(size_t _i=_native_limit;_i<_values.len;_i++){{{drop_element}}}_values.len=_native_limit;}}disp_database_rows_drop(_rows,_rows_len);for(size_t _i=0;_i<_encoded;_i++)disp_json_drop(&_params[_i]);if(_ok){{_r.tag=0;_r.payload.v0.f0=_values;}}else{{for(size_t _i=0;_i<_values.len;_i++){{{drop_element}}}disp_dealloc(_values.data);_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})",
+                "({{{result_c} _r={{0}};disp_native_string _error={{0}};bool _ok={guard};bool _native=_ok&&({database})->state->native;disp_native_json _params[{}]={{{{0}}}};size_t _encoded=0;{limit_check}{native_limit}{encoders}disp_native_json *_rows=NULL;size_t _rows_len=0,_rows_cap=0;if(_ok){{if(_native)_ok={native_rows};else _ok=disp_database_query(({database})->state,\"{}\",{},_params,{parameter_count},&_rows,&_rows_len,&_rows_cap,&_error);}}{list_c} _values={{0}};if(_ok&&_rows_len){{_values.data=({element_c}*)disp_alloc_zeroed(_rows_len,sizeof({element_c}),_Alignof({element_c}));_values.cap=_rows_len;}}if(_ok){{for(size_t _i=0;_i<_rows_len;_i++){{size_t _target=_values.len,_field_done=0;{decoders}if(!_ok){{{partial_drops}break;}}{element_c} *_row=&_values.data[_target];if(_native&&!dv_truth({native_predicate})){{{drop_target}continue;}}_values.len++;}}}}{native_order}if(_ok&&_native&&_values.len>_native_limit){{for(size_t _i=_native_limit;_i<_values.len;_i++){{{drop_element}}}_values.len=_native_limit;}}disp_database_rows_drop(_rows,_rows_len);for(size_t _i=0;_i<_encoded;_i++)disp_json_drop(&_params[_i]);if(_ok){{_r.tag=0;_r.payload.v0.f0=_values;}}else{{for(size_t _i=0;_i<_values.len;_i++){{{drop_element}}}disp_dealloc(_values.data);_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})",
                 parameter_count.max(1),
-                escape(&schema.name),
-                schema.name.len(),
                 escape(&sql),
                 sql.len()
             )
