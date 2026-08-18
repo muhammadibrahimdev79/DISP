@@ -358,11 +358,36 @@ fn collect_terminator_types(
             ..
         } => operand(condition)?,
         mir::Terminator::Call {
+            target,
             arguments,
             destination,
             ..
+        } => {
+            for argument in arguments {
+                operand(argument)?;
+            }
+            collect_place_type(
+                program,
+                function,
+                destination,
+                substitutions,
+                types,
+                generic_names,
+            )?;
+            if let hir::CallTarget::Data(plan) = target {
+                let plan = program
+                    .data_plans
+                    .get(plan.0)
+                    .ok_or_else(|| error("monomorphization found an invalid DISP Data plan"))?;
+                collect_type(
+                    program,
+                    &hir::Type::Struct(plan.schema, vec![]),
+                    types,
+                    generic_names,
+                )?;
+            }
         }
-        | mir::Terminator::Spawn {
+        mir::Terminator::Spawn {
             arguments,
             destination,
             ..

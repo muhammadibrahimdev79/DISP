@@ -178,6 +178,7 @@ pub enum DataOperation {
     },
     Aggregate {
         kind: ast::DataQueryKind,
+        value: Option<DataExpr>,
         predicate: Option<DataExpr>,
     },
     Remove {
@@ -1482,6 +1483,7 @@ impl FunctionLowering<'_, '_> {
             ast::Expression::DataQuery {
                 kind,
                 schema,
+                aggregate,
                 store,
                 predicate,
                 order,
@@ -1491,6 +1493,10 @@ impl FunctionLowering<'_, '_> {
                 let schema_id = self.root.struct_names[schema];
                 let mut arguments = vec![self.lower_expr(store)?];
                 let predicate = predicate
+                    .as_ref()
+                    .map(|value| self.lower_data_expr(schema_id, value, &mut arguments))
+                    .transpose()?;
+                let aggregate = aggregate
                     .as_ref()
                     .map(|value| self.lower_data_expr(schema_id, value, &mut arguments))
                     .transpose()?;
@@ -1514,10 +1520,16 @@ impl FunctionLowering<'_, '_> {
                         order,
                         limit_argument,
                     },
-                    ast::DataQueryKind::Count | ast::DataQueryKind::Exists => {
+                    ast::DataQueryKind::Count
+                    | ast::DataQueryKind::Exists
+                    | ast::DataQueryKind::Sum
+                    | ast::DataQueryKind::Average
+                    | ast::DataQueryKind::Min
+                    | ast::DataQueryKind::Max => {
                         debug_assert!(order.is_none() && limit_argument.is_none());
                         DataOperation::Aggregate {
                             kind: *kind,
+                            value: aggregate.clone(),
                             predicate,
                         }
                     }
@@ -1545,6 +1557,23 @@ impl FunctionLowering<'_, '_> {
                                 width: None,
                             },
                             ast::DataQueryKind::Exists => Type::Bool,
+                            ast::DataQueryKind::Sum => aggregate
+                                .as_ref()
+                                .expect("value aggregate has a value")
+                                .ty
+                                .clone(),
+                            ast::DataQueryKind::Average => {
+                                Type::Option(Box::new(Type::Float { width: 64 }))
+                            }
+                            ast::DataQueryKind::Min | ast::DataQueryKind::Max => {
+                                Type::Option(Box::new(
+                                    aggregate
+                                        .as_ref()
+                                        .expect("value aggregate has a value")
+                                        .ty
+                                        .clone(),
+                                ))
+                            }
                         }),
                         Box::new(Type::Generic("DataError".into())),
                     ),

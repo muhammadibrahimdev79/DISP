@@ -481,12 +481,16 @@ impl Folder<'_> {
                 self.fold_expr(store);
             }
             Expression::DataQuery {
+                aggregate,
                 store,
                 predicate,
                 order,
                 limit,
                 ..
             } => {
+                if let Some(aggregate) = aggregate {
+                    self.fold_expr(aggregate);
+                }
                 self.fold_expr(store);
                 if let Some(predicate) = predicate {
                     self.fold_expr(predicate);
@@ -720,12 +724,16 @@ impl Evaluator {
                 self.visit_nested_closures(store)?;
             }
             Expression::DataQuery {
+                aggregate,
                 store,
                 predicate,
                 order,
                 limit,
                 ..
             } => {
+                if let Some(aggregate) = aggregate {
+                    self.visit_nested_closures(aggregate)?;
+                }
                 self.visit_nested_closures(store)?;
                 if let Some(predicate) = predicate {
                     self.visit_nested_closures(predicate)?;

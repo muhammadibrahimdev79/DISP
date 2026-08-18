@@ -1,0 +1,30 @@
+data Reading {
+    id: int primary
+    sensor: String index
+    value: int
+}
+
+fn run() -> Result<bool, DataError> {
+    var store = data memory?
+    data add Reading { id: 1, sensor: "temperature", value: 18 } in store?
+    data add Reading { id: 2, sensor: "temperature", value: 22 } in store?
+    data add Reading { id: 3, sensor: "pressure", value: 40 } in store?
+
+    total = data sum Reading.value in store where sensor == "temperature"?
+    average = data average Reading.value in store where sensor == "temperature"?
+    lowest = data min Reading.value in store?
+    highest = data max Reading.value in store?
+
+    print(total)
+    print(match average { Some(value) => value None => 0.0 })
+    print(match lowest { Some(value) => value None => 0 })
+    print(match highest { Some(value) => value None => 0 })
+    return Ok(true)
+}
+
+fn main() {
+    match run() {
+        Ok(value) => print(value)
+        Err(error) => print(error)
+    }
+}

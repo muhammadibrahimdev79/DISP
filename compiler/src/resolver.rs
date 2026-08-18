@@ -453,6 +453,7 @@ impl Resolver {
                 kind: _,
                 schema,
                 schema_span,
+                aggregate,
                 store,
                 predicate,
                 order,
@@ -466,6 +467,9 @@ impl Resolver {
                     )
                 })?;
                 self.resolve_expression(store)?;
+                if let Some(aggregate) = aggregate {
+                    self.resolve_data_expression(aggregate, &fields)?;
+                }
                 if let Some(predicate) = predicate {
                     self.resolve_data_expression(predicate, &fields)?;
                 }

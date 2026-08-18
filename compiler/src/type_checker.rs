@@ -1700,6 +1700,7 @@ impl TypeChecker {
                 kind,
                 schema,
                 schema_span,
+                aggregate,
                 store,
                 predicate,
                 order,
@@ -1710,6 +1711,23 @@ impl TypeChecker {
                 self.require_same(&Type::DataStore, &store_ty, store.span, "DISP Data store")?;
                 let previous = self.data_context.replace(id);
                 let checked = (|| {
+                    let aggregate_ty = if let Some(aggregate) = aggregate {
+                        let ty = materialize_literal(self.check_expression(aggregate)?);
+                        if !is_numeric(&ty) {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Type,
+                                format!(
+                                    "DISP Data `{}` requires a numeric field, found {}",
+                                    kind.name(),
+                                    self.format_type(&ty)
+                                ),
+                                aggregate.span,
+                            ));
+                        }
+                        Some(ty)
+                    } else {
+                        None
+                    };
                     if let Some(predicate) = predicate {
                         let ty = self.check_expression(predicate)?;
                         self.require_same(&Type::Bool, &ty, predicate.span, "DISP Data condition")?;
@@ -1724,10 +1742,10 @@ impl TypeChecker {
                             ));
                         }
                     }
-                    Ok(())
+                    Ok(aggregate_ty)
                 })();
                 self.data_context = previous;
-                checked?;
+                let aggregate_ty = checked?;
                 if let Some(limit) = limit {
                     let ty = self.check_expression(limit)?;
                     if !is_integer(&ty) {
@@ -1742,6 +1760,13 @@ impl TypeChecker {
                     DataQueryKind::Rows => Type::List(Box::new(Type::Struct(id, vec![]))),
                     DataQueryKind::Count => Type::UInt,
                     DataQueryKind::Exists => Type::Bool,
+                    DataQueryKind::Sum => {
+                        aggregate_ty.expect("parser supplies a value for value aggregates")
+                    }
+                    DataQueryKind::Average => Type::Option(Box::new(Type::Float)),
+                    DataQueryKind::Min | DataQueryKind::Max => Type::Option(Box::new(
+                        aggregate_ty.expect("parser supplies a value for value aggregates"),
+                    )),
                 };
                 Ok(Type::Result(Box::new(value), Box::new(Type::DataError)))
             }

@@ -612,6 +612,10 @@ users = data find User in store
 
 active_count = data count User in store where active?
 has_ada = data exists User in store where name == wanted?
+total_score = data sum User.score in store where active?
+average_score = data average User.score in store?
+lowest_score = data min User.score in store?
+highest_score = data max User.score in store?
 
 data save User { id: 1, name: "Ada Lovelace", active: true, note: None } in store?
 data remove User in store where id == 1?
@@ -627,6 +631,12 @@ delete in ordinary syntax. Limits are restricted to 100,000 rows.
 without constructing a `List`. Both accept the same checked `where` expressions as `find`; native
 execution uses eligible field/composite indexes automatically and reads unfiltered cardinality
 directly.
+
+Value aggregates name a numeric schema field after `Schema.field`. `sum` preserves that field's
+type and returns zero for an empty selection. `average` returns `Option<f64>`, while `min` and
+`max` return `Option<T>`; their empty selection is `None`. All four accept the same checked
+`where` expressions and automatic indexes as `find`, but reject `order` and `limit` because those
+clauses cannot change a scalar aggregate.
 
 `data memory` creates an ephemeral `DataStore`. It uses DISP's own native typed row
 catalog and executes checked plans directly, including filtering, ordering, limits,

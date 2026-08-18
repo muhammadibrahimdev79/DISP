@@ -1739,6 +1739,7 @@ impl<'a> Renamer<'a> {
             }
             Expression::DataQuery {
                 schema,
+                aggregate,
                 store,
                 predicate,
                 order,
@@ -1747,6 +1748,9 @@ impl<'a> Renamer<'a> {
             } => {
                 if let Some(definition) = self.namespace.get(schema) {
                     *schema = definition.canonical.clone();
+                }
+                if let Some(aggregate) = aggregate {
+                    self.rename_expr(aggregate);
                 }
                 self.rename_expr(store);
                 if let Some(predicate) = predicate {

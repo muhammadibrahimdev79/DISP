@@ -5902,9 +5902,65 @@ enum Flow {
 struct DataQueryRequest<'a> {
     kind: crate::ast::DataQueryKind,
     schema_name: &'a str,
+    aggregate: Option<&'a Expr>,
     predicate: Option<&'a Expr>,
     order: Option<&'a crate::ast::DataOrder>,
     limit: Option<&'a Expr>,
+}
+
+fn data_option_none() -> Value {
+    Value::Enum {
+        type_name: "Option".into(),
+        variant: "None".into(),
+        payload: vec![],
+    }
+}
+
+fn data_option_some(value: Value) -> Value {
+    Value::Enum {
+        type_name: "Option".into(),
+        variant: "Some".into(),
+        payload: vec![value],
+    }
+}
+
+fn data_numeric_f64(value: &Value) -> Option<f64> {
+    Some(match value {
+        Value::Int(value) => *value as f64,
+        Value::UInt(value) => *value as f64,
+        Value::Signed(value, _) => *value as f64,
+        Value::Unsigned(value, _) => *value as f64,
+        Value::Float(value) => *value,
+        Value::Float32(value) => f64::from(*value),
+        _ => return None,
+    })
+}
+
+fn data_aggregate_zero(schema: &crate::ast::StructDeclaration, aggregate: &Expr) -> Option<Value> {
+    let Expression::Identifier(name) = &aggregate.node else {
+        return None;
+    };
+    let ty = &schema
+        .fields
+        .iter()
+        .find(|field| field.name == *name)?
+        .ty
+        .name;
+    match ty.as_str() {
+        "int" => Some(Value::Int(0)),
+        "uint" => Some(Value::UInt(0)),
+        "f32" => Some(Value::Float32(0.0)),
+        "f64" | "float" => Some(Value::Float(0.0)),
+        _ if ty.starts_with('i') => ty[1..]
+            .parse::<u16>()
+            .ok()
+            .map(|width| Value::Signed(0, width)),
+        _ if ty.starts_with('u') => ty[1..]
+            .parse::<u16>()
+            .ok()
+            .map(|width| Value::Unsigned(0, width)),
+        _ => None,
+    }
 }
 
 pub struct Interpreter {
@@ -7344,6 +7400,76 @@ impl Interpreter {
         Ok(runtime_result(result))
     }
 
+    fn evaluate_data_aggregate(
+        &mut self,
+        program: &Program,
+        schema: &crate::ast::StructDeclaration,
+        rows: &[Value],
+        parameters: &HashMap<Span, Value>,
+        aggregate: Option<&Expr>,
+        kind: crate::ast::DataQueryKind,
+    ) -> RuntimeResult<Value> {
+        use crate::ast::DataQueryKind;
+        if kind == DataQueryKind::Count {
+            return Ok(Value::UInt(rows.len() as u64));
+        }
+        if kind == DataQueryKind::Exists {
+            return Ok(Value::Bool(!rows.is_empty()));
+        }
+        let aggregate = aggregate.expect("parser supplies a value expression for aggregates");
+        let mut values = Vec::with_capacity(rows.len());
+        for row in rows {
+            let Value::Struct { fields, .. } = row else {
+                return Err(self.error(
+                    "stored row does not match its DISP Data schema",
+                    aggregate.span,
+                ));
+            };
+            values.push(
+                self.evaluate_data_expression(program, schema, fields, parameters, aggregate)?,
+            );
+        }
+        if kind == DataQueryKind::Average {
+            if values.is_empty() {
+                return Ok(data_option_none());
+            }
+            let sum = values.iter().try_fold(0.0, |sum, value| {
+                data_numeric_f64(value)
+                    .map(|value| sum + value)
+                    .ok_or_else(|| self.error("invalid numeric DISP Data value", aggregate.span))
+            })?;
+            return Ok(data_option_some(Value::Float(sum / values.len() as f64)));
+        }
+        if kind == DataQueryKind::Sum {
+            let mut values = values.into_iter();
+            let Some(mut total) = values.next() else {
+                return data_aggregate_zero(schema, aggregate)
+                    .ok_or_else(|| self.error("invalid numeric DISP Data field", aggregate.span));
+            };
+            for value in values {
+                total = self.evaluate_binary(BinaryOperator::Add, total, value, aggregate.span)?;
+            }
+            return Ok(total);
+        }
+        let mut values = values.into_iter();
+        let Some(mut selected) = values.next() else {
+            return Ok(data_option_none());
+        };
+        let comparison = if kind == DataQueryKind::Min {
+            BinaryOperator::Less
+        } else {
+            BinaryOperator::Greater
+        };
+        for value in values {
+            if self.evaluate_binary(comparison, value.clone(), selected.clone(), aggregate.span)?
+                == Value::Bool(true)
+            {
+                selected = value;
+            }
+        }
+        Ok(data_option_some(selected))
+    }
+
     fn evaluate_data_query(
         &mut self,
         program: &Program,
@@ -7353,6 +7479,7 @@ impl Interpreter {
         let DataQueryRequest {
             kind,
             schema_name,
+            aggregate,
             predicate,
             order,
             limit,
@@ -7419,11 +7546,14 @@ impl Interpreter {
                 values = retained;
             }
             if kind != crate::ast::DataQueryKind::Rows {
-                let value = match kind {
-                    crate::ast::DataQueryKind::Count => Value::UInt(values.len() as u64),
-                    crate::ast::DataQueryKind::Exists => Value::Bool(!values.is_empty()),
-                    crate::ast::DataQueryKind::Rows => unreachable!(),
-                };
+                let value = self.evaluate_data_aggregate(
+                    program,
+                    schema,
+                    &values,
+                    &parameters,
+                    aggregate,
+                    kind,
+                )?;
                 return Ok(Value::Enum {
                     type_name: "Result".into(),
                     variant: "Ok".into(),
@@ -7537,14 +7667,24 @@ impl Interpreter {
                 sql.push_str(&format!(" LIMIT {amount}"));
             }
             let rows = database.query(&sql, &parameters)?;
-            if kind != crate::ast::DataQueryKind::Rows {
-                return Ok(match kind {
-                    crate::ast::DataQueryKind::Count => Value::UInt(rows.len() as u64),
-                    crate::ast::DataQueryKind::Exists => Value::Bool(!rows.is_empty()),
-                    crate::ast::DataQueryKind::Rows => unreachable!(),
-                });
-            }
             let values = data_decode_rows(program, schema, rows)?;
+            if kind != crate::ast::DataQueryKind::Rows {
+                return self
+                    .evaluate_data_aggregate(
+                        program,
+                        schema,
+                        &values,
+                        &HashMap::new(),
+                        aggregate,
+                        kind,
+                    )
+                    .map_err(|error| match error {
+                        RuntimeFault::Error(diagnostic) => io::Error::other(diagnostic.message),
+                        RuntimeFault::Propagate(_) => {
+                            io::Error::other("aggregate evaluation unexpectedly propagated")
+                        }
+                    });
+            }
             Ok(Value::List {
                 capacity: values.len(),
                 values,
@@ -7665,6 +7805,7 @@ impl Interpreter {
             Expression::DataQuery {
                 kind,
                 schema,
+                aggregate,
                 store,
                 predicate,
                 order,
@@ -7676,6 +7817,7 @@ impl Interpreter {
                 DataQueryRequest {
                     kind: *kind,
                     schema_name: schema,
+                    aggregate: aggregate.as_deref(),
                     predicate: predicate.as_deref(),
                     order: order.as_ref(),
                     limit: limit.as_deref(),

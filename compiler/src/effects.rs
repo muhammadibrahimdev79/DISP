@@ -330,12 +330,16 @@ impl Collector<'_> {
                 self.collect_expr(store, effects, false);
             }
             Expression::DataQuery {
+                aggregate,
                 store,
                 predicate,
                 order,
                 limit,
                 ..
             } => {
+                if let Some(aggregate) = aggregate {
+                    self.collect_expr(aggregate, effects, false);
+                }
                 self.collect_expr(store, effects, false);
                 if let Some(predicate) = predicate {
                     self.collect_expr(predicate, effects, false);

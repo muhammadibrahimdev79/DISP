@@ -375,6 +375,7 @@ pub enum Expression {
         kind: DataQueryKind,
         schema: String,
         schema_span: Span,
+        aggregate: Option<Box<Expr>>,
         store: Box<Expr>,
         predicate: Option<Box<Expr>>,
         order: Option<DataOrder>,
@@ -445,6 +446,24 @@ pub enum DataQueryKind {
     Rows,
     Count,
     Exists,
+    Sum,
+    Average,
+    Min,
+    Max,
+}
+
+impl DataQueryKind {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Rows => "find",
+            Self::Count => "count",
+            Self::Exists => "exists",
+            Self::Sum => "sum",
+            Self::Average => "average",
+            Self::Min => "min",
+            Self::Max => "max",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

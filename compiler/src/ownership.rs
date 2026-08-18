@@ -1109,6 +1109,7 @@ impl<'a> Analyzer<'a> {
             Expression::DataQuery {
                 kind,
                 schema,
+                aggregate,
                 store,
                 predicate,
                 order,
@@ -1116,6 +1117,9 @@ impl<'a> Analyzer<'a> {
                 ..
             } => {
                 self.check_data_store(store)?;
+                if let Some(aggregate) = aggregate {
+                    self.check_data_expression(schema, aggregate)?;
+                }
                 if let Some(predicate) = predicate {
                     self.check_data_expression(schema, predicate)?;
                 }
@@ -1127,7 +1131,12 @@ impl<'a> Analyzer<'a> {
                 }
                 let value = match kind {
                     DataQueryKind::Rows => Ty::List(Box::new(Ty::Owned(schema.clone()))),
-                    DataQueryKind::Count | DataQueryKind::Exists => Ty::Copy,
+                    DataQueryKind::Count
+                    | DataQueryKind::Exists
+                    | DataQueryKind::Sum
+                    | DataQueryKind::Average
+                    | DataQueryKind::Min
+                    | DataQueryKind::Max => Ty::Copy,
                 };
                 Ok(Ty::Result(
                     Box::new(value),
@@ -4721,12 +4730,16 @@ fn collect_expr_names(expression: &Expr, names: &mut HashSet<String>) {
             }
         }
         Expression::DataQuery {
+            aggregate,
             store,
             predicate,
             order,
             limit,
             ..
         } => {
+            if let Some(aggregate) = aggregate {
+                collect_expr_names(aggregate, names);
+            }
             collect_expr_names(store, names);
             if let Some(predicate) = predicate {
                 collect_expr_names(predicate, names);

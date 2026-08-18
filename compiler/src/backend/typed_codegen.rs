@@ -5775,7 +5775,11 @@ fn data_call(
                 sql.len()
             )
         }
-        hir::DataOperation::Aggregate { kind, predicate } => {
+        hir::DataOperation::Aggregate {
+            kind,
+            value,
+            predicate,
+        } => {
             let mut sql = format!(
                 "SELECT {} FROM {}",
                 data_select_sql(schema),
@@ -5813,6 +5817,9 @@ fn data_call(
                     )
                 },
             );
+            let native_value = value.as_ref().map(|value| {
+                data_expr_native(program, function, value, "_row", arguments, substitutions)
+            });
             let decoders = schema
                 .fields
                 .iter()
@@ -5836,7 +5843,9 @@ fn data_call(
                 .and_then(|predicate| data_index_lookup(predicate, schema, &indices))
                 .map_or_else(
                     || {
-                        if predicate.is_none() {
+                        if predicate.is_none()
+                            && matches!(kind, ast::DataQueryKind::Count | ast::DataQueryKind::Exists)
+                        {
                             format!(
                                 "disp_data_native_length(({database})->state,\"{}\",{},&_count,&_error)",
                                 escape(&schema.name),
@@ -5874,20 +5883,87 @@ fn data_call(
                         }
                     },
                 );
-            let stop = if *kind == ast::DataQueryKind::Exists {
-                "if(_count)break;"
-            } else {
-                ""
+            let value_step = match kind {
+                ast::DataQueryKind::Count => "_count++;".into(),
+                ast::DataQueryKind::Exists => "_count++;if(_count)break;".into(),
+                ast::DataQueryKind::Sum => format!(
+                    "DV _next={};if(!_has)_aggregate=_next;else _aggregate=dv_binary(0,_aggregate,_next,{},{});_has=true;_count++;",
+                    native_value.as_ref().expect("sum has a value"),
+                    value.as_ref().unwrap().span.start.line,
+                    value.as_ref().unwrap().span.start.column
+                ),
+                ast::DataQueryKind::Average => format!(
+                    "DV _next={};_average+=_next.tag==DV_FLOAT?_next.as.fp:_next.tag==DV_SIGNED?(double)_next.as.si:(double)_next.as.ui;_has=true;_count++;",
+                    native_value.as_ref().expect("average has a value")
+                ),
+                ast::DataQueryKind::Min | ast::DataQueryKind::Max => {
+                    let comparison = if *kind == ast::DataQueryKind::Min {
+                        8
+                    } else {
+                        10
+                    };
+                    format!(
+                        "DV _next={};if(!_has||dv_truth(dv_binary({comparison},_next,_aggregate,{},{})))_aggregate=_next;_has=true;_count++;",
+                        native_value.as_ref().expect("min/max has a value"),
+                        value.as_ref().unwrap().span.start.line,
+                        value.as_ref().unwrap().span.start.column
+                    )
+                }
+                ast::DataQueryKind::Rows => unreachable!("row query uses Find"),
             };
-            let success = match kind {
-                ast::DataQueryKind::Count => "_count",
-                ast::DataQueryKind::Exists => "(_count!=0)",
+            let hir::Type::Result(output_ty, _) = destination else {
+                unreachable!("data aggregate returns Result")
+            };
+            let output_c = native_types::c_type(output_ty);
+            let (success_setup, success) = match kind {
+                ast::DataQueryKind::Count => (String::new(), "_count".into()),
+                ast::DataQueryKind::Exists => (String::new(), "(_count!=0)".into()),
+                ast::DataQueryKind::Sum => {
+                    let aggregate_ty = &value.as_ref().expect("sum has a value").ty;
+                    let zero = match aggregate_ty {
+                        hir::Type::Float { width } => format!("dv_f(0.0,{width})"),
+                        hir::Type::Int {
+                            signed: true,
+                            width,
+                        } => {
+                            format!("dv_i(0,{})", width.unwrap_or(64))
+                        }
+                        hir::Type::Int {
+                            signed: false,
+                            width,
+                        } => {
+                            format!("dv_u(0,{})", width.unwrap_or(64))
+                        }
+                        _ => unreachable!("type checker restricts aggregates to numeric values"),
+                    };
+                    (
+                        format!("if(!_has)_aggregate={zero};"),
+                        from_dv("_aggregate", aggregate_ty),
+                    )
+                }
+                ast::DataQueryKind::Average => (
+                    format!(
+                        "{output_c} _aggregate_result={{0}};if(_has){{_aggregate_result.tag=1;_aggregate_result.payload.v1.f0=_average/(double)_count;}}"
+                    ),
+                    "_aggregate_result".into(),
+                ),
+                ast::DataQueryKind::Min | ast::DataQueryKind::Max => {
+                    let aggregate_ty = &value.as_ref().expect("min/max has a value").ty;
+                    (
+                        format!(
+                            "{output_c} _aggregate_result={{0}};if(_has){{_aggregate_result.tag=1;_aggregate_result.payload.v1.f0={};}}",
+                            from_dv("_aggregate", aggregate_ty)
+                        ),
+                        "_aggregate_result".into(),
+                    )
+                }
                 ast::DataQueryKind::Rows => unreachable!("row query uses Find"),
             };
             let parameter_count = indices.len();
-            let direct_native = predicate.is_none();
+            let direct_native = predicate.is_none()
+                && matches!(kind, ast::DataQueryKind::Count | ast::DataQueryKind::Exists);
             format!(
-                "({{{result_c} _r={{0}};disp_native_string _error={{0}};bool _ok={guard};bool _native=_ok&&({database})->state->native;disp_native_json _params[{}]={{{{0}}}};size_t _encoded=0;{encoders}disp_native_json *_rows=NULL;size_t _rows_len=0,_rows_cap=0;uint64_t _count=0;if(_ok){{if(_native)_ok={native_rows};else _ok=disp_database_query(({database})->state,\"{}\",{},_params,{parameter_count},&_rows,&_rows_len,&_rows_cap,&_error);}}if(_ok&&!(_native&&{direct_native})){{for(size_t _i=0;_i<_rows_len;_i++){{{element_c} _row_value={{0}};size_t _field_done=0;{decoders}if(!_ok){{{partial_drops}break;}}{element_c} *_row=&_row_value;if(!_native||dv_truth({native_predicate}))_count++;{drop_row}{stop}}}}}disp_database_rows_drop(_rows,_rows_len);for(size_t _i=0;_i<_encoded;_i++)disp_json_drop(&_params[_i]);if(_ok){{_r.tag=0;_r.payload.v0.f0={success};}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})",
+                "({{{result_c} _r={{0}};disp_native_string _error={{0}};bool _ok={guard};bool _native=_ok&&({database})->state->native;disp_native_json _params[{}]={{{{0}}}};size_t _encoded=0;{encoders}disp_native_json *_rows=NULL;size_t _rows_len=0,_rows_cap=0;uint64_t _count=0;bool _has=false;double _average=0.0;DV _aggregate=dv_i(0,64);if(_ok){{if(_native)_ok={native_rows};else _ok=disp_database_query(({database})->state,\"{}\",{},_params,{parameter_count},&_rows,&_rows_len,&_rows_cap,&_error);}}if(_ok&&!(_native&&{direct_native})){{for(size_t _i=0;_i<_rows_len;_i++){{{element_c} _row_value={{0}};size_t _field_done=0;{decoders}if(!_ok){{{partial_drops}break;}}{element_c} *_row=&_row_value;if(!_native||dv_truth({native_predicate})){{{value_step}}}{drop_row}}}}}disp_database_rows_drop(_rows,_rows_len);for(size_t _i=0;_i<_encoded;_i++)disp_json_drop(&_params[_i]);{success_setup}if(_ok){{_r.tag=0;_r.payload.v0.f0={success};}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})",
                 parameter_count.max(1),
                 escape(&sql),
                 sql.len()

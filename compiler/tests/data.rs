@@ -817,6 +817,96 @@ fn main() {{ print(match seed() {{ Ok(value) => value, Err(_) => false }}) }}
 }
 
 #[test]
+fn value_aggregates_are_typed_checked_durable_and_differential() {
+    let path = data_path("value-aggregates");
+    let path = source_path(&path);
+    let source = format!(
+        r#"
+data Reading {{
+    id: int primary
+    sensor: String index
+    value: int
+}}
+
+fn summarize() -> Result<bool, DataError> {{
+    var store = data open Path("{path}")?
+    data add Reading {{ id: 1, sensor: "a", value: 10 }} in store?
+    data add Reading {{ id: 2, sensor: "a", value: 20 }} in store?
+    data add Reading {{ id: 3, sensor: "b", value: 90 }} in store?
+    total = data sum Reading.value in store where sensor == "a"?
+    empty_total = data sum Reading.value in store where sensor == "missing"?
+    average = data average Reading.value in store where sensor == "a"?
+    minimum = data min Reading.value in store?
+    maximum = data max Reading.value in store where sensor == "missing"?
+    return Ok(total == 30 && empty_total == 0
+        && match average {{ Some(value) => value == 15.0 None => false }}
+        && match minimum {{ Some(value) => value == 10 None => false }}
+        && match maximum {{ Some(_) => false None => true }})
+}}
+
+fn main() {{ print(match summarize() {{ Ok(value) => value Err(_) => false }}) }}
+"#
+    );
+    let (hir, mir) = lower_source(&source).unwrap();
+    let aggregate_plans = hir
+        .data_plans
+        .iter()
+        .filter(|plan| matches!(plan.operation, disp::hir::DataOperation::Aggregate { .. }))
+        .count();
+    assert_eq!(aggregate_plans, 5);
+    assert_eq!(mir.data_plans.len(), hir.data_plans.len());
+    assert_eq!(run_source(&source).unwrap(), ["true"]);
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(format!("{path}.lock"));
+    if let Some(output) = native_output("value-aggregates", &source) {
+        assert_eq!(output, "true\n");
+    }
+
+    let empty_source = r#"
+data Metric { id: int primary samples: u32 ratio: f32 }
+fn check() -> Result<bool, DataError> {
+    var store = data memory?
+    samples = data sum Metric.samples in store?
+    ratio = data average Metric.ratio in store?
+    return Ok(samples == u32(0) && match ratio { Some(_) => false None => true })
+}
+fn main() { print(match check() { Ok(value) => value Err(_) => false }) }
+"#;
+    assert_eq!(run_source(empty_source).unwrap(), ["true"]);
+    if let Some(output) = native_output("empty-value-aggregates", empty_source) {
+        assert_eq!(output, "true\n");
+    }
+
+    for (source, message, line, column) in [
+        (
+            "data A { id: int primary name: String }\nfn f() -> Result<bool, DataError> { var s=data memory?; x=data sum A.name in s? return Ok(true) } fn main(){}",
+            "`sum` requires a numeric field, found String",
+            2,
+            70,
+        ),
+        (
+            "data A { id: int primary }\nfn f() -> Result<bool, DataError> { var s=data memory?; x=data min A.missing in s? return Ok(true) } fn main(){}",
+            "unknown name `missing`",
+            2,
+            70,
+        ),
+        (
+            "data A { id: int primary }\nfn f() -> Result<bool, DataError> { var s=data memory?; x=data average A in s? return Ok(true) } fn main(){}",
+            "expected `.` and a field after the aggregate schema",
+            2,
+            74,
+        ),
+    ] {
+        let error = check_source(source).unwrap_err();
+        assert!(error.message.contains(message), "{error}");
+        assert_eq!(
+            (error.span.start.line, error.span.start.column),
+            (line, column)
+        );
+    }
+}
+
+#[test]
 fn named_composite_constraints_are_transactional_durable_and_indexed() {
     let path = data_path("composite-constraints");
     let path = source_path(&path);

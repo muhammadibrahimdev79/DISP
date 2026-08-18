@@ -1681,13 +1681,17 @@ impl Parser {
             "find" => self.parse_data_query(start, DataQueryKind::Rows),
             "count" => self.parse_data_query(start, DataQueryKind::Count),
             "exists" => self.parse_data_query(start, DataQueryKind::Exists),
+            "sum" => self.parse_data_query(start, DataQueryKind::Sum),
+            "average" => self.parse_data_query(start, DataQueryKind::Average),
+            "min" => self.parse_data_query(start, DataQueryKind::Min),
+            "max" => self.parse_data_query(start, DataQueryKind::Max),
             "remove" => self.parse_data_remove(start),
             _ => Err(Diagnostic::new(
                 DiagnosticKind::Parse,
                 format!("unknown DISP Data operation `{operation}`"),
                 operation_span,
             )
-            .with_help("use `data memory`, `data open`, `data add`, `data save`, `data find`, `data count`, `data exists`, or `data remove`")),
+            .with_help("use `data memory`, `data open`, `data add`, `data save`, `data find`, `data count`, `data exists`, `data sum`, `data average`, `data min`, `data max`, or `data remove`")),
         }
     }
 
@@ -1708,6 +1712,22 @@ impl Parser {
     fn parse_data_query(&mut self, start: Span, kind: DataQueryKind) -> Result<Expr, Diagnostic> {
         let (schema, schema_span) =
             self.expect_identifier("expected a data schema after the query operation")?;
+        let aggregate = if matches!(
+            kind,
+            DataQueryKind::Sum | DataQueryKind::Average | DataQueryKind::Min | DataQueryKind::Max
+        ) {
+            self.expect(
+                TokenKind::Dot,
+                "expected `.` and a field after the aggregate schema",
+            )?;
+            let (field, field_span) = self.expect_identifier("expected a field to aggregate")?;
+            Some(Box::new(Spanned {
+                node: Expression::Identifier(field),
+                span: field_span,
+            }))
+        } else {
+            None
+        };
         self.expect(TokenKind::In, "expected `in` and a data store")?;
         let store = self.parse_data_part()?;
         let predicate = if self.match_data_word("where") {
@@ -1720,7 +1740,7 @@ impl Parser {
         {
             return Err(Diagnostic::new(
                 DiagnosticKind::Parse,
-                "`data count` and `data exists` accept `where` but not `order` or `limit`",
+                "DISP Data aggregates accept `where` but not `order` or `limit`",
                 self.peek().span,
             ));
         }
@@ -1757,6 +1777,7 @@ impl Parser {
                 kind,
                 schema,
                 schema_span,
+                aggregate,
                 store: Box::new(store),
                 predicate,
                 order,

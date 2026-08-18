@@ -557,6 +557,11 @@ const RULE_EVIDENCE: &[(&str, &str, &str)] = &[
         "tests/data.rs",
         "count_and_exists_are_typed_indexed_durable_and_differential",
     ),
+    (
+        "DISP-CORE-0112",
+        "tests/data.rs",
+        "value_aggregates_are_typed_checked_durable_and_differential",
+    ),
 ];
 
 fn compiler_root() -> &'static Path {

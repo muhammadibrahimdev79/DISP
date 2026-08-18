@@ -495,7 +495,9 @@ effects. Interpreter and native execution MUST agree at the documented scheduler
 A `data` declaration is a nominal schema. It has exactly one `primary` field whose supported type
 is a non-optional signed integer or `String`. `data memory` creates an ephemeral `DataStore` and
 `data open path` opens a durable one. `data add`, `data save`, `data find`, `data count`,
-`data exists`, and guarded `data remove ... where ...` are compiler-owned typed expressions.
+`data exists`, `data sum Schema.field`, `data average Schema.field`, `data min Schema.field`,
+`data max Schema.field`, and guarded `data remove ... where ...` are compiler-owned typed
+expressions.
 Schema fields, store, predicate, order key, limit, and written value are checked before lowering to
 HIR/MIR plans. `count` returns `Result<uint, DataError>` and `exists` returns
 `Result<bool, DataError>`; both accept `where` and reject meaningless `order` and `limit` clauses.
@@ -552,6 +554,13 @@ typed plans rather than materializing a source-level `List`. Native execution MU
 field or composite indexes automatically; unfiltered native queries MUST read table cardinality
 directly, and `exists` MAY stop after the first matching row. Interpreter and native results and
 errors MUST agree.
+
+**DISP-CORE-0112 — typed value aggregates.** `sum`, `average`, `min`, and `max` MUST lower to
+typed scalar Data plans over numeric fields and MUST NOT construct a source-level row `List`.
+`sum` preserves the field type, uses checked arithmetic, and returns its typed zero for an empty
+selection. `average` returns `Option<f64>`; `min` and `max` return `Option<T>`, using `None` for an
+empty selection. Predicates retain evaluated-once parameters and eligible index selection.
+Interpreter and native results, overflow behavior, durable behavior, and errors MUST agree.
 
 ## 13. Editions, feature gates, and compatibility
 
@@ -1900,6 +1909,7 @@ test demonstrates the rule but does not freeze incidental implementation details
 | DISP-CORE-0109 | `compiler/tests/c_header.rs` | `generated_header_compiles_as_c_and_cpp_and_is_written_transactionally` |
 | DISP-CORE-0110 | `compiler/tests/c_exports.rs` | `contained_export_failure_rolls_back_handle_resources_in_reverse_order` |
 | DISP-CORE-0111 | `compiler/tests/data.rs` | `count_and_exists_are_typed_indexed_durable_and_differential` |
+| DISP-CORE-0112 | `compiler/tests/data.rs` | `value_aggregates_are_typed_checked_durable_and_differential` |
 
 ## 16. Explicitly non-normative or incomplete areas
 

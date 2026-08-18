@@ -218,12 +218,16 @@ impl Expander {
                 self.expand_expr(store, depth)?;
             }
             Expression::DataQuery {
+                aggregate,
                 store,
                 predicate,
                 order,
                 limit,
                 ..
             } => {
+                if let Some(aggregate) = aggregate {
+                    self.expand_expr(aggregate, depth)?;
+                }
                 self.expand_expr(store, depth)?;
                 if let Some(predicate) = predicate {
                     self.expand_expr(predicate, depth)?;
@@ -507,12 +511,16 @@ fn substitute_bound_identifier(expression: &mut Expr, name: &str, value: u128, s
             substitute_bound_identifier(store, name, value, span);
         }
         Expression::DataQuery {
+            aggregate,
             store,
             predicate,
             order,
             limit,
             ..
         } => {
+            if let Some(aggregate) = aggregate {
+                substitute_bound_identifier(aggregate, name, value, span);
+            }
             substitute_bound_identifier(store, name, value, span);
             if let Some(predicate) = predicate {
                 substitute_bound_identifier(predicate, name, value, span);
@@ -750,13 +758,15 @@ fn expression_nodes(expression: &Expr) -> usize {
             expression_nodes(value) + expression_nodes(store)
         }
         Expression::DataQuery {
+            aggregate,
             store,
             predicate,
             order,
             limit,
             ..
         } => {
-            expression_nodes(store)
+            aggregate.as_deref().map_or(0, expression_nodes)
+                + expression_nodes(store)
                 + predicate.as_deref().map_or(0, expression_nodes)
                 + order
                     .as_ref()
