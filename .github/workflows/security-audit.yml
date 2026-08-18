@@ -181,6 +181,15 @@ jobs:
       - name: Install Linux native dependencies
         run: sudo apt-get update && sudo apt-get install --yes build-essential pkg-config libssl-dev
 
+      - name: Build the sanitized native cryptography runtime
+        run: |
+          CARGO_TARGET_DIR=target/crypto-native-sanitized \
+            cargo +${SECURITY_NIGHTLY} build --locked --target x86_64-unknown-linux-gnu \
+              --manifest-path crypto-native/Cargo.toml
+          install -D \
+            target/crypto-native-sanitized/x86_64-unknown-linux-gnu/debug/libdisp_crypto_native.so \
+            target/x86_64-unknown-linux-gnu/debug/deps/libdisp_crypto_native.so
+
       - name: Run high-risk Rust regression suites under ASan and LSan
         run: |
           cargo +${SECURITY_NIGHTLY} test --locked --target x86_64-unknown-linux-gnu --all-features \

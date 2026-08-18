@@ -84,6 +84,10 @@ fn rust_asan_regressions_are_pinned_and_fail_closed() {
     assert!(workflow.contains("detect_leaks=1:halt_on_error=1:abort_on_error=1"));
     assert!(workflow.contains("--target x86_64-unknown-linux-gnu --all-features"));
     assert!(workflow.contains("build-essential pkg-config libssl-dev"));
+    assert!(workflow.contains("target/crypto-native-sanitized"));
+    assert!(
+        workflow.contains("target/x86_64-unknown-linux-gnu/debug/deps/libdisp_crypto_native.so")
+    );
     for suite in [
         "--lib",
         "--test crypto",
