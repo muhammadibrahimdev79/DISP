@@ -45,15 +45,11 @@ pub fn locate() -> Result<PathBuf, Diagnostic> {
             "could not locate the running DISP compiler: {cause}"
         ))
     })?;
-    let directory = executable
-        .parent()
-        .ok_or_else(|| error("the running DISP compiler has no parent directory"))?;
-    let mut candidates = vec![directory.join(FILE_NAME)];
-    if directory.file_name().is_some_and(|name| name == "deps")
-        && let Some(profile) = directory.parent()
-    {
-        candidates.push(profile.join(FILE_NAME));
-    }
+    locate_from(&executable)
+}
+
+fn locate_from(executable: &Path) -> Result<PathBuf, Diagnostic> {
+    let candidates = runtime_candidates(executable)?;
     for candidate in &candidates {
         if candidate.is_file() {
             return resolve(candidate);
@@ -67,6 +63,30 @@ pub fn locate() -> Result<PathBuf, Diagnostic> {
             .collect::<Vec<_>>()
             .join(", ")
     )))
+}
+
+fn runtime_candidates(executable: &Path) -> Result<Vec<PathBuf>, Diagnostic> {
+    let directory = executable
+        .parent()
+        .ok_or_else(|| error("the running DISP compiler has no parent directory"))?;
+    let mut candidates = vec![directory.join(FILE_NAME)];
+    if directory.file_name().is_some_and(|name| name == "deps")
+        && let Some(profile) = directory.parent()
+    {
+        candidates.push(profile.join(FILE_NAME));
+    }
+    #[cfg(debug_assertions)]
+    if let Some(profile) = directory
+        .ancestors()
+        .find(|ancestor| ancestor.file_name().is_some_and(|name| name == "build"))
+        .and_then(Path::parent)
+    {
+        let candidate = profile.join("deps").join(FILE_NAME);
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    Ok(candidates)
 }
 
 fn digest(path: &Path) -> Result<[u8; 32], Diagnostic> {
@@ -199,6 +219,22 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         panic!("timed out waiting for the native cryptography staging test gate");
+    }
+
+    #[test]
+    fn sanitizer_test_layout_searches_the_profile_dependency_directory() {
+        let profile = PathBuf::from("target")
+            .join("x86_64-unknown-linux-gnu")
+            .join("debug");
+        let executable = profile
+            .join("build")
+            .join("disp")
+            .join("artifact-hash")
+            .join("out")
+            .join("disp-test");
+        let expected = profile.join("deps").join(FILE_NAME);
+        let candidates = runtime_candidates(&executable).unwrap();
+        assert!(candidates.contains(&expected));
     }
 
     #[test]
