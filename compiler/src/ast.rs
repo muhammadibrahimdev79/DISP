@@ -63,6 +63,7 @@ pub struct FieldDeclaration {
     pub ty: TypeName,
     pub primary: bool,
     pub unique: bool,
+    pub indexed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -1,0 +1,23 @@
+data Event {
+    id: int primary
+    category: String index
+    message: String
+}
+
+fn demonstrate() -> Result<bool, DataError> {
+    var events = data memory?
+    data add Event { id: 1, category: "system", message: "boot" } in events?
+    data add Event { id: 2, category: "system", message: "ready" } in events?
+    data add Event { id: 3, category: "user", message: "login" } in events?
+
+    wanted = "system"
+    system_events = data find Event in events where category == wanted order id ascending?
+    return Ok(system_events.len() == 2)
+}
+
+fn main() {
+    print(match demonstrate() {
+        Ok(value) => value,
+        Err(_) => false,
+    })
+}

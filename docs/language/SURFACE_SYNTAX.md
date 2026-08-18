@@ -589,6 +589,7 @@ Persistent nominal records use `data`. Exactly one non-optional signed integer o
 data User {
     id: int primary
     name: String unique
+    group: String index
     active: bool
     note: Option<String>
 }
@@ -622,6 +623,9 @@ catalog and executes checked plans directly, including filtering, ordering, limi
 primary-key insertion/upsert, and guarded removal. External values are evaluated once.
 Required fields may be marked `unique`; collisions return `DataError` and roll back the complete
 operation. Optional unique fields are rejected until their absent-value semantics are standardized.
+Fields marked `index` maintain non-unique equality indexes, so repeated values are valid and matching
+queries return every row. These indexes share the same transactional mutation, validation, and
+durable-reopen guarantees as primary and unique indexes.
 `DataStore` and `Database` are distinct nominal types, so a data store cannot invoke raw
 SQL methods.
 

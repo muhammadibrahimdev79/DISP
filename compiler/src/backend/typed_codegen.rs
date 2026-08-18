@@ -5161,7 +5161,7 @@ fn data_index_lookup(
         _ => return None,
     };
     let field = schema.fields.get(field)?;
-    if !field.primary && !field.unique {
+    if !field.primary && !field.unique && !field.indexed {
         return None;
     }
     parameters
@@ -5363,8 +5363,14 @@ fn data_schema_guard(schema: &hir::Struct, database: &str) -> String {
         .map(|field| field.unique.to_string())
         .collect::<Vec<_>>()
         .join(",");
+    let indexed = schema
+        .fields
+        .iter()
+        .map(|field| field.indexed.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
-        "disp_data_ensure_schema(({database})->state,\"{}\",{},\"{}\",{},\"{}\",{},(const char*[]){{{names}}},(const char*[]){{{types}}},(bool[]){{{required}}},(bool[]){{{primary}}},(bool[]){{{unique}}},{},&_error)",
+        "disp_data_ensure_schema(({database})->state,\"{}\",{},\"{}\",{},\"{}\",{},(const char*[]){{{names}}},(const char*[]){{{types}}},(bool[]){{{required}}},(bool[]){{{primary}}},(bool[]){{{unique}}},(bool[]){{{indexed}}},{},&_error)",
         escape(&schema.name),
         schema.name.len(),
         escape(&create),

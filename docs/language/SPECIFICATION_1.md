@@ -110,7 +110,7 @@ generic       = IDENT (":" type ("+" type)*)? ;
 struct-decl   = "struct" IDENT generic-list? "{" field* "}" ;
 data-decl     = "data" IDENT generic-list? "{" data-field* "}" ;
 field         = IDENT ":" type ","? ;
-data-field    = IDENT ":" type (("primary" | "unique")*) ","? ;
+data-field    = IDENT ":" type (("primary" | "unique" | "index")*) ","? ;
 enum-decl     = "enum" IDENT generic-list? "{" variant* "}" ;
 variant       = IDENT ("(" type ("," type)* ")")? ","? ;
 
@@ -496,6 +496,11 @@ MUST preserve that constraint atomically. A collision is a typed `DataError`, le
 table unchanged, and has identical interpreter, native-memory, and durable-store behavior.
 Optional unique fields are rejected because Candidate 1 does not yet define whether absent values
 participate in uniqueness.
+
+A field may be marked `index` to maintain a non-unique secondary equality index. Duplicate values,
+including absent optional values, are permitted. Equality predicates against an external value may
+use the index; other predicates safely fall back to scanning. Indexes are rebuilt and validated as
+part of every mutation and durable open, so they cannot expose rows that were removed or replaced.
 
 The language does not translate these plans into SQL. Interpreter and native execution use the
 same DISP-owned logical plans and durable format. The separate `Database` compatibility type does

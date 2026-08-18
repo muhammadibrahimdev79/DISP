@@ -3650,6 +3650,7 @@ struct NativeDataField {
     optional: bool,
     primary: bool,
     unique: bool,
+    indexed: bool,
 }
 
 #[derive(Clone)]
@@ -3657,7 +3658,7 @@ struct NativeDataTable {
     fields: Vec<NativeDataField>,
     primary: usize,
     rows: Vec<Value>,
-    indexes: Vec<HashMap<String, usize>>,
+    indexes: Vec<HashMap<String, Vec<usize>>>,
 }
 
 #[derive(Clone, Default)]
@@ -4306,6 +4307,7 @@ fn native_data_fields(schema: &crate::ast::StructDeclaration) -> Vec<NativeDataF
             optional: data_inner_type(&field.ty).1,
             primary: field.primary,
             unique: field.unique,
+            indexed: field.indexed,
         })
         .collect()
 }
@@ -4332,6 +4334,7 @@ fn native_data_snapshot(
                     optional: field.optional,
                     primary: field.primary,
                     unique: field.unique,
+                    indexed: field.indexed,
                 })
                 .collect(),
             rows,
@@ -4371,8 +4374,8 @@ fn native_data_indexes(
     program: &Program,
     fields: &[NativeDataField],
     rows: &[Value],
-) -> io::Result<Vec<HashMap<String, usize>>> {
-    let mut indexes = vec![HashMap::new(); fields.len()];
+) -> io::Result<Vec<HashMap<String, Vec<usize>>>> {
+    let mut indexes: Vec<HashMap<String, Vec<usize>>> = vec![HashMap::new(); fields.len()];
     for (row_index, row) in rows.iter().enumerate() {
         let Value::Struct { fields: values, .. } = row else {
             return Err(io::Error::other(
@@ -4380,19 +4383,21 @@ fn native_data_indexes(
             ));
         };
         for (field_index, field) in fields.iter().enumerate() {
-            if !field.primary && !field.unique {
+            if !field.primary && !field.unique && !field.indexed {
                 continue;
             }
             let value = values.get(&field.name).ok_or_else(|| {
                 io::Error::other(format!("stored row is missing `{}`", field.name))
             })?;
             let key = encode_json_value(program, value)?.text;
-            if indexes[field_index].insert(key, row_index).is_some() {
+            let matches = indexes[field_index].entry(key).or_default();
+            if (field.primary || field.unique) && !matches.is_empty() {
                 return Err(io::Error::other(format!(
                     "stored table contains a duplicate indexed value for `{}`",
                     field.name
                 )));
             }
+            matches.push(row_index);
         }
     }
     Ok(indexes)
@@ -4425,6 +4430,7 @@ fn data_ensure_schema(
                         optional: field.optional,
                         primary: field.primary,
                         unique: field.unique,
+                        indexed: field.indexed,
                     })
                     .collect::<Vec<_>>();
                 if stored_fields != fields {
@@ -4540,7 +4546,10 @@ fn native_data_write(
                 .get(primary_name)
                 .ok_or_else(|| io::Error::other("data value is missing its primary field"))?;
             let primary_key = encode_json_value(program, key)?.text;
-            let existing = table.indexes[table.primary].get(&primary_key).copied();
+            let existing = table.indexes[table.primary]
+                .get(&primary_key)
+                .and_then(|rows| rows.first())
+                .copied();
             for (field_index, field) in table
                 .fields
                 .iter()
@@ -4553,6 +4562,7 @@ fn native_data_write(
                 let candidate = encode_json_value(program, candidate)?.text;
                 if table.indexes[field_index]
                     .get(&candidate)
+                    .and_then(|rows| rows.first())
                     .is_some_and(|index| Some(*index) != existing)
                 {
                     return Err(io::Error::other(format!(
@@ -4611,11 +4621,9 @@ fn native_data_indexed_rows(
         return native_data_rows(database, schema);
     };
     let indexed = |field_name: &str, parameter: &Expr| {
-        let field = schema
-            .fields
-            .iter()
-            .enumerate()
-            .find(|(_, field)| field.name == field_name && (field.primary || field.unique));
+        let field = schema.fields.iter().enumerate().find(|(_, field)| {
+            field.name == field_name && (field.primary || field.unique || field.indexed)
+        });
         field.and_then(|(index, _)| parameters.get(&parameter.span).map(|value| (index, value)))
     };
     let lookup = match (&left.node, &right.node) {
@@ -4634,7 +4642,7 @@ fn native_data_indexed_rows(
             .ok_or_else(|| io::Error::other("DISP Data schema was not registered"))?;
         Ok(table.indexes[field]
             .get(&key)
-            .map(|row| vec![table.rows[*row].clone()])
+            .map(|rows| rows.iter().map(|row| table.rows[*row].clone()).collect())
             .unwrap_or_default())
     })
 }

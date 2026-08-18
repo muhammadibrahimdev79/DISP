@@ -216,6 +216,7 @@ pub struct Field {
     pub ty: Type,
     pub primary: bool,
     pub unique: bool,
+    pub indexed: bool,
     pub span: Span,
 }
 
@@ -576,6 +577,7 @@ impl<'a> Lowering<'a> {
                         ty: self.lower_type(&field.ty),
                         primary: field.primary,
                         unique: field.unique,
+                        indexed: field.indexed,
                         span: field.name_span,
                     })
                     .collect(),

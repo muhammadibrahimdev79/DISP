@@ -259,6 +259,7 @@ impl Parser {
             let ty = self.parse_type_name()?;
             let mut primary = false;
             let mut unique = false;
+            let mut indexed = false;
             if data {
                 loop {
                     match &self.peek().kind {
@@ -284,6 +285,17 @@ impl Parser {
                             unique = true;
                             self.advance();
                         }
+                        TokenKind::Identifier(modifier) if modifier == "index" => {
+                            if indexed {
+                                return Err(Diagnostic::new(
+                                    DiagnosticKind::Parse,
+                                    "duplicate `index` data-field constraint",
+                                    self.peek().span,
+                                ));
+                            }
+                            indexed = true;
+                            self.advance();
+                        }
                         _ => break,
                     }
                 }
@@ -294,6 +306,7 @@ impl Parser {
                 ty,
                 primary,
                 unique,
+                indexed,
             });
             self.match_token(&TokenKind::Comma);
         }

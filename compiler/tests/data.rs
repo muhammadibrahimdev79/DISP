@@ -101,6 +101,7 @@ fn data_schemas_are_nominal_and_reach_hir_mir() {
 data User {
     id: int primary
     name: String unique
+    group: String index
     active: bool
     bio: Option<String>
 }
@@ -122,6 +123,7 @@ fn main() {}
     );
     assert_eq!(mir.structs.iter().filter(|item| item.data).count(), 1);
     assert!(mir.structs[0].fields.iter().any(|field| field.unique));
+    assert!(mir.structs[0].fields.iter().any(|field| field.indexed));
 }
 
 #[test]
@@ -222,7 +224,7 @@ fn main() {{ print(match seed() {{ Ok(value) => value, Err(error) => 0 }}) }}
 
     let bytes = fs::read(&path).unwrap();
     assert_eq!(&bytes[..8], b"DISPDB\x1a\n");
-    assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 3);
+    assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 4);
     assert_eq!(bytes.len() % 4096, 0);
     assert!(!bytes.starts_with(b"SQLite format 3"));
 
@@ -269,7 +271,7 @@ fn main() {{ match migrate() {{ Ok(value) => print(value), Err(error) => print(e
     let interpreted_bytes = fs::read(&interpreted).unwrap();
     assert_eq!(
         u32::from_le_bytes(interpreted_bytes[8..12].try_into().unwrap()),
-        3
+        4
     );
     assert_eq!(interpreted_bytes.len() % 4096, 0);
 
@@ -620,6 +622,85 @@ fn main() {{ print(match verify() {{ Ok(value) => value, Err(_) => false }}) }}
             .unwrap_err();
     assert!(
         duplicate.message.contains("duplicate `unique`"),
+        "{duplicate}"
+    );
+    assert_eq!(
+        (duplicate.span.start.line, duplicate.span.start.column),
+        (1, 53)
+    );
+}
+
+#[test]
+fn secondary_indexes_allow_duplicate_keys_and_track_mutations() {
+    let path = data_path("secondary-index");
+    let path = source_path(&path);
+    let source = format!(
+        r#"
+data Event {{
+    id: int primary
+    category: String index
+    message: String
+}}
+
+fn seed() -> Result<bool, DataError> {{
+    var store = data open Path("{path}")?
+    data add Event {{ id: 1, category: "system", message: "boot" }} in store?
+    data add Event {{ id: 2, category: "system", message: "ready" }} in store?
+    data add Event {{ id: 3, category: "user", message: "login" }} in store?
+    wanted = "system"
+    before = data find Event in store where category == wanted order id ascending?
+    data remove Event in store where id == 1?
+    data save Event {{ id: 3, category: "system", message: "login" }} in store?
+    after = data find Event in store where category == wanted order id ascending?
+    return Ok(before.len() == 2 && after.len() == 2)
+}}
+
+fn reopen() -> Result<bool, DataError> {{
+    var store = data open Path("{path}")?
+    wanted = "system"
+    rows = data find Event in store where category == wanted order id ascending?
+    return Ok(rows.len() == 2)
+}}
+
+fn main() {{
+    seeded = match seed() {{ Ok(value) => value, Err(_) => false }}
+    reopened = match reopen() {{ Ok(value) => value, Err(_) => false }}
+    print(seeded && reopened)
+}}
+"#
+    );
+    assert_eq!(run_source(&source).unwrap(), ["true"]);
+    let bytes = fs::read(&path).unwrap();
+    assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 4);
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(format!("{path}.lock"));
+    if let Some(output) = native_output("secondary-index", &source) {
+        assert_eq!(output, "true\n");
+    }
+    let plan_source = std::env::temp_dir().join(format!(
+        "disp-data-secondary-index-plan-{}.disp",
+        std::process::id()
+    ));
+    fs::write(&plan_source, &source).unwrap();
+    let (hir, mir) = lower_source(&source).unwrap();
+    let artifacts = backend::build(
+        &hir,
+        &mir,
+        &plan_source,
+        BuildOptions {
+            emit_c: true,
+            ..BuildOptions::default()
+        },
+    )
+    .unwrap();
+    let generated = fs::read_to_string(artifacts.backend_ir.unwrap()).unwrap();
+    assert!(generated.matches("disp_data_native_lookup(").count() >= 3);
+
+    let duplicate =
+        check_source("data Event { id: int primary category: String index index } fn main() {}")
+            .unwrap_err();
+    assert!(
+        duplicate.message.contains("duplicate `index`"),
         "{duplicate}"
     );
     assert_eq!(
