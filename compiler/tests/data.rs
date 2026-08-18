@@ -652,7 +652,8 @@ fn seed() -> Result<bool, DataError> {{
     data remove Event in store where id == 1?
     data save Event {{ id: 3, category: "system", message: "login" }} in store?
     after = data find Event in store where category == wanted order id ascending?
-    return Ok(before.len() == 2 && after.len() == 2)
+    literal = data find Event in store where category == "system" order id ascending?
+    return Ok(before.len() == 2 && after.len() == 2 && literal.len() == 2)
 }}
 
 fn reopen() -> Result<bool, DataError> {{
@@ -694,7 +695,7 @@ fn main() {{
     )
     .unwrap();
     let generated = fs::read_to_string(artifacts.backend_ir.unwrap()).unwrap();
-    assert!(generated.matches("disp_data_native_lookup(").count() >= 3);
+    assert!(generated.matches("disp_data_native_lookup(").count() >= 4);
 
     let duplicate =
         check_source("data Event { id: int primary category: String index index } fn main() {}")

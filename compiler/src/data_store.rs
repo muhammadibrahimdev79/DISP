@@ -850,6 +850,14 @@ mod tests {
         version_three[56..64].copy_from_slice(&header_checksum.to_le_bytes());
         assert_eq!(decode(&version_three).unwrap(), snapshot);
 
+        let mut indexed_snapshot = sample();
+        indexed_snapshot.tables[0].fields[1].indexed = true;
+        let mut indexed_as_version_three = encode(&indexed_snapshot).unwrap();
+        indexed_as_version_three[8..12].copy_from_slice(&UNIQUE_VERSION.to_le_bytes());
+        let header_checksum = fnv1a(&indexed_as_version_three[..56]);
+        indexed_as_version_three[56..64].copy_from_slice(&header_checksum.to_le_bytes());
+        assert!(decode(&indexed_as_version_three).is_err());
+
         let mut corrupt = first;
         *corrupt.last_mut().unwrap() ^= 1;
         assert!(decode(&corrupt).is_err());

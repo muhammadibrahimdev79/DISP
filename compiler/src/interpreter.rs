@@ -4620,11 +4620,20 @@ fn native_data_indexed_rows(
     else {
         return native_data_rows(database, schema);
     };
+    let indexed_value = |expression: &Expr| match &expression.node {
+        Expression::Integer(value) if *value <= i64::MAX as u128 => Some(Value::Int(*value as i64)),
+        Expression::Integer(value) => Some(Value::Unsigned(*value, 128)),
+        Expression::Float(value) => Some(Value::Float(*value)),
+        Expression::String(value) => Some(Value::String(RuntimeString::literal(value.clone()))),
+        Expression::Character(value) => Some(Value::Char(*value)),
+        Expression::Bool(value) => Some(Value::Bool(*value)),
+        _ => parameters.get(&expression.span).cloned(),
+    };
     let indexed = |field_name: &str, parameter: &Expr| {
         let field = schema.fields.iter().enumerate().find(|(_, field)| {
             field.name == field_name && (field.primary || field.unique || field.indexed)
         });
-        field.and_then(|(index, _)| parameters.get(&parameter.span).map(|value| (index, value)))
+        field.and_then(|(index, _)| indexed_value(parameter).map(|value| (index, value)))
     };
     let lookup = match (&left.node, &right.node) {
         (Expression::Identifier(field), _) => indexed(field, right),
@@ -4634,7 +4643,7 @@ fn native_data_indexed_rows(
     let Some((field, value)) = lookup else {
         return native_data_rows(database, schema);
     };
-    let key = encode_json_value(program, value)?.text;
+    let key = encode_json_value(program, &value)?.text;
     database.with_native(|store| {
         let table = store
             .tables

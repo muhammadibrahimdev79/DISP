@@ -498,8 +498,8 @@ Optional unique fields are rejected because Candidate 1 does not yet define whet
 participate in uniqueness.
 
 A field may be marked `index` to maintain a non-unique secondary equality index. Duplicate values,
-including absent optional values, are permitted. Equality predicates against an external value may
-use the index; other predicates safely fall back to scanning. Indexes are rebuilt and validated as
+including absent optional values, are permitted. Equality predicates against a literal or external
+value may use the index; other predicates safely fall back to scanning. Indexes are rebuilt and validated as
 part of every mutation and durable open, so they cannot expose rows that were removed or replaced.
 
 The language does not translate these plans into SQL. Interpreter and native execution use the

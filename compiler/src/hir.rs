@@ -2044,10 +2044,10 @@ impl FunctionLowering<'_, '_> {
             | ast::Expression::Character(_)
             | ast::Expression::Bool(_) => {
                 let value = self.lower_expr(expression)?;
-                let ExprKind::Constant(constant) = value.kind else {
-                    unreachable!()
-                };
-                (DataExprKind::Constant(constant), value.ty)
+                let ty = value.ty.clone();
+                let index = arguments.len();
+                arguments.push(value);
+                (DataExprKind::Parameter(index), ty)
             }
             ast::Expression::Unary { operator, operand } => {
                 let operand = self.lower_data_expr(schema, operand, arguments)?;
