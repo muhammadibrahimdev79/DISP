@@ -9,7 +9,8 @@ use std::{
 const MAGIC: &[u8; 8] = b"DISPDB\x1a\n";
 const WAL_MAGIC: &[u8; 8] = b"DISPWAL\n";
 const LEGACY_VERSION: u32 = 1;
-const VERSION: u32 = 2;
+const PAGE_VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const LEGACY_HEADER_SIZE: usize = 32;
 const PAGE_SIZE: usize = 4096;
 const PAGE_HEADER_SIZE: usize = 32;
@@ -45,6 +46,7 @@ pub(crate) struct Field {
     pub storage: String,
     pub optional: bool,
     pub primary: bool,
+    pub unique: bool,
 }
 
 impl Snapshot {
@@ -232,7 +234,11 @@ fn encode_payload(snapshot: &Snapshot) -> io::Result<Vec<u8>> {
                 MAX_TYPE_BYTES,
                 "field storage type",
             )?;
-            payload.push(u8::from(field.optional) | (u8::from(field.primary) << 1));
+            payload.push(
+                u8::from(field.optional)
+                    | (u8::from(field.primary) << 1)
+                    | (u8::from(field.unique) << 2),
+            );
             primary_count += usize::from(field.primary);
         }
         if primary_count != 1 {
@@ -349,7 +355,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-fn decode_payload(payload: &[u8]) -> io::Result<Snapshot> {
+fn decode_payload(payload: &[u8], supports_unique: bool) -> io::Result<Snapshot> {
     let mut reader = Reader {
         bytes: payload,
         at: 0,
@@ -381,7 +387,8 @@ fn decode_payload(payload: &[u8]) -> io::Result<Snapshot> {
             }
             let storage = reader.text(MAX_TYPE_BYTES, "field storage type")?;
             let flags = reader.u8("field flags")?;
-            if flags & !0b11 != 0 {
+            let allowed = if supports_unique { 0b111 } else { 0b11 };
+            if flags & !allowed != 0 {
                 return Err(invalid("DISP Data field uses unknown required flags"));
             }
             let primary = flags & 0b10 != 0;
@@ -391,6 +398,7 @@ fn decode_payload(payload: &[u8]) -> io::Result<Snapshot> {
                 storage,
                 optional: flags & 0b01 != 0,
                 primary,
+                unique: flags & 0b100 != 0,
             });
         }
         if primary_count != 1 {
@@ -440,10 +448,10 @@ fn decode_legacy(bytes: &[u8]) -> io::Result<Snapshot> {
     if fnv1a(payload) != read_u64(bytes, 24) {
         return Err(invalid("DISP Data snapshot integrity check failed"));
     }
-    decode_payload(payload)
+    decode_payload(payload, false)
 }
 
-fn decode_pages(bytes: &[u8]) -> io::Result<Snapshot> {
+fn decode_pages(bytes: &[u8], supports_unique: bool) -> io::Result<Snapshot> {
     if bytes.len() < PAGE_SIZE {
         return Err(invalid("DISP Data page header is truncated"));
     }
@@ -507,7 +515,7 @@ fn decode_pages(bytes: &[u8]) -> io::Result<Snapshot> {
     if fnv1a(&payload) != read_u64(bytes, 40) {
         return Err(invalid("DISP Data payload integrity check failed"));
     }
-    decode_payload(&payload)
+    decode_payload(&payload, supports_unique)
 }
 
 pub(crate) fn decode(bytes: &[u8]) -> io::Result<Snapshot> {
@@ -522,7 +530,8 @@ pub(crate) fn decode(bytes: &[u8]) -> io::Result<Snapshot> {
     }
     match read_u32(bytes, 8) {
         LEGACY_VERSION => decode_legacy(bytes),
-        VERSION => decode_pages(bytes),
+        PAGE_VERSION => decode_pages(bytes, false),
+        VERSION => decode_pages(bytes, true),
         version => Err(invalid(format!(
             "unsupported DISP Data snapshot version {version}"
         ))),
@@ -770,12 +779,14 @@ mod tests {
                         storage: "INTEGER".into(),
                         optional: false,
                         primary: true,
+                        unique: false,
                     },
                     Field {
                         name: "name".into(),
                         storage: "TEXT".into(),
                         optional: false,
                         primary: false,
+                        unique: false,
                     },
                 ],
                 rows: vec![note.to_vec()],
@@ -820,6 +831,12 @@ mod tests {
         assert_eq!(read_u32(&first, 8), VERSION);
         assert_eq!(decode(&first).unwrap(), snapshot);
         assert_eq!(decode(&encode_legacy(&snapshot)).unwrap(), snapshot);
+
+        let mut version_two = first.clone();
+        version_two[8..12].copy_from_slice(&PAGE_VERSION.to_le_bytes());
+        let header_checksum = fnv1a(&version_two[..56]);
+        version_two[56..64].copy_from_slice(&header_checksum.to_le_bytes());
+        assert_eq!(decode(&version_two).unwrap(), snapshot);
 
         let mut corrupt = first;
         *corrupt.last_mut().unwrap() ^= 1;

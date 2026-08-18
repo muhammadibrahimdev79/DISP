@@ -257,19 +257,43 @@ impl Parser {
             let (field_name, field_span) = self.expect_identifier("expected field name")?;
             self.expect(TokenKind::Colon, "expected `:` after field name")?;
             let ty = self.parse_type_name()?;
-            let primary = if data
-                && matches!(&self.peek().kind, TokenKind::Identifier(modifier) if modifier == "primary")
-            {
-                self.advance();
-                true
-            } else {
-                false
-            };
+            let mut primary = false;
+            let mut unique = false;
+            if data {
+                loop {
+                    match &self.peek().kind {
+                        TokenKind::Identifier(modifier) if modifier == "primary" => {
+                            if primary {
+                                return Err(Diagnostic::new(
+                                    DiagnosticKind::Parse,
+                                    "duplicate `primary` data-field constraint",
+                                    self.peek().span,
+                                ));
+                            }
+                            primary = true;
+                            self.advance();
+                        }
+                        TokenKind::Identifier(modifier) if modifier == "unique" => {
+                            if unique {
+                                return Err(Diagnostic::new(
+                                    DiagnosticKind::Parse,
+                                    "duplicate `unique` data-field constraint",
+                                    self.peek().span,
+                                ));
+                            }
+                            unique = true;
+                            self.advance();
+                        }
+                        _ => break,
+                    }
+                }
+            }
             fields.push(FieldDeclaration {
                 name: field_name,
                 name_span: field_span,
                 ty,
                 primary,
+                unique,
             });
             self.match_token(&TokenKind::Comma);
         }

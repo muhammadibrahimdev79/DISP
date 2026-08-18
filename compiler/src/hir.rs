@@ -215,6 +215,7 @@ pub struct Field {
     pub name: String,
     pub ty: Type,
     pub primary: bool,
+    pub unique: bool,
     pub span: Span,
 }
 
@@ -574,6 +575,7 @@ impl<'a> Lowering<'a> {
                         name: field.name.clone(),
                         ty: self.lower_type(&field.ty),
                         primary: field.primary,
+                        unique: field.unique,
                         span: field.name_span,
                     })
                     .collect(),

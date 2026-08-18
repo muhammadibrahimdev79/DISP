@@ -110,7 +110,7 @@ generic       = IDENT (":" type ("+" type)*)? ;
 struct-decl   = "struct" IDENT generic-list? "{" field* "}" ;
 data-decl     = "data" IDENT generic-list? "{" data-field* "}" ;
 field         = IDENT ":" type ","? ;
-data-field    = IDENT ":" type ("primary")? ","? ;
+data-field    = IDENT ":" type (("primary" | "unique")*) ","? ;
 enum-decl     = "enum" IDENT generic-list? "{" variant* "}" ;
 variant       = IDENT ("(" type ("," type)* ")")? ","? ;
 
@@ -490,6 +490,12 @@ is a non-optional signed integer or `String`. `data memory` creates an ephemeral
 `data remove ... where ...` are compiler-owned typed expressions. Schema fields, store, predicate,
 order key, limit, and written value are checked before lowering to HIR/MIR plans. `remove` without
 `where` is syntactically invalid.
+
+A required field may additionally be marked `unique`. Every successful `data add` or `data save`
+MUST preserve that constraint atomically. A collision is a typed `DataError`, leaves the prior
+table unchanged, and has identical interpreter, native-memory, and durable-store behavior.
+Optional unique fields are rejected because Candidate 1 does not yet define whether absent values
+participate in uniqueness.
 
 The language does not translate these plans into SQL. Interpreter and native execution use the
 same DISP-owned logical plans and durable format. The separate `Database` compatibility type does

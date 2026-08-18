@@ -1,0 +1,28 @@
+data Account {
+    id: int primary
+    email: String unique
+    name: String
+}
+
+fn demonstrate() -> Result<bool, DataError> {
+    var accounts = data memory?
+    data add Account { id: 1, email: "ada@disp.dev", name: "Ada" } in accounts?
+
+    duplicate = data add Account {
+        id: 2,
+        email: "ada@disp.dev",
+        name: "Another Ada",
+    } in accounts
+
+    return Ok(match duplicate {
+        Err(_) => true,
+        Ok(_) => false,
+    })
+}
+
+fn main() {
+    print(match demonstrate() {
+        Ok(value) => value,
+        Err(_) => false,
+    })
+}

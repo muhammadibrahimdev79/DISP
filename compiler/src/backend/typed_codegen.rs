@@ -5063,6 +5063,8 @@ fn data_create_sql(schema: &hir::Struct) -> String {
             }
             if field.primary {
                 value.push_str(" PRIMARY KEY");
+            } else if field.unique {
+                value.push_str(" UNIQUE");
             }
             value
         })
@@ -5329,8 +5331,14 @@ fn data_schema_guard(schema: &hir::Struct, database: &str) -> String {
         .map(|field| field.primary.to_string())
         .collect::<Vec<_>>()
         .join(",");
+    let unique = schema
+        .fields
+        .iter()
+        .map(|field| field.unique.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
-        "disp_data_ensure_schema(({database})->state,\"{}\",{},\"{}\",{},\"{}\",{},(const char*[]){{{names}}},(const char*[]){{{types}}},(bool[]){{{required}}},(bool[]){{{primary}}},{},&_error)",
+        "disp_data_ensure_schema(({database})->state,\"{}\",{},\"{}\",{},\"{}\",{},(const char*[]){{{names}}},(const char*[]){{{types}}},(bool[]){{{required}}},(bool[]){{{primary}}},(bool[]){{{unique}}},{},&_error)",
         escape(&schema.name),
         schema.name.len(),
         escape(&create),

@@ -314,6 +314,16 @@ impl TypeChecker {
                         }
                         primary = Some(ty.clone());
                     }
+                    if field.unique && matches!(ty, Type::Option(_)) {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            "a unique data field cannot be optional",
+                            field.ty.span,
+                        )
+                        .with_help(
+                            "use a required field so uniqueness has one unambiguous value domain",
+                        ));
+                    }
                 }
                 if type_contains_task(&ty) {
                     return Err(Diagnostic::new(

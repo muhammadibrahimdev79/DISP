@@ -588,7 +588,7 @@ Persistent nominal records use `data`. Exactly one non-optional signed integer o
 ```disp
 data User {
     id: int primary
-    name: String
+    name: String unique
     active: bool
     note: Option<String>
 }
@@ -620,6 +620,8 @@ delete in ordinary syntax. Limits are restricted to 100,000 rows.
 `data memory` creates an ephemeral `DataStore`. It uses DISP's own native typed row
 catalog and executes checked plans directly, including filtering, ordering, limits,
 primary-key insertion/upsert, and guarded removal. External values are evaluated once.
+Required fields may be marked `unique`; collisions return `DataError` and roll back the complete
+operation. Optional unique fields are rejected until their absent-value semantics are standardized.
 `DataStore` and `Database` are distinct nominal types, so a data store cannot invoke raw
 SQL methods.
 
@@ -627,12 +629,12 @@ PostgreSQL support belongs to an optional typed connector rather than `DataStore
 Connector use requires explicit database/network capabilities; native `DataStore` programs retain
 identical semantics when PostgreSQL and every other external database connector are absent.
 
-`data open Path(...)` creates or opens a durable `DataStore` backed by DISP's native v2
+`data open Path(...)` creates or opens a durable `DataStore` backed by DISP's native v3
 storage format. The file is split into fixed 4096-byte pages with header, page, and payload
 integrity checks. Each mutation commits only changed pages through a synced write-ahead log;
 opening the store rolls a committed log forward after interruption. An operating-system lock
 prevents a second process or store from mutating the same path concurrently, and the lock is
-released deterministically when the store is dropped. Version 1 snapshots remain readable and
+released deterministically when the store is dropped. Version 1 and version 2 snapshots remain readable and
 migrate on their next successful mutation. Interpreter and native execution share the exact
 format and recovery behavior.
 

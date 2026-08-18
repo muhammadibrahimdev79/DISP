@@ -100,7 +100,7 @@ fn data_schemas_are_nominal_and_reach_hir_mir() {
     let source = r#"
 data User {
     id: int primary
-    name: String
+    name: String unique
     active: bool
     bio: Option<String>
 }
@@ -114,7 +114,14 @@ fn main() {}
         schema.fields.iter().filter(|field| field.primary).count(),
         1
     );
+    assert!(
+        schema
+            .fields
+            .iter()
+            .any(|field| field.name == "name" && field.unique)
+    );
     assert_eq!(mir.structs.iter().filter(|item| item.data).count(), 1);
+    assert!(mir.structs[0].fields.iter().any(|field| field.unique));
 }
 
 #[test]
@@ -215,7 +222,7 @@ fn main() {{ print(match seed() {{ Ok(value) => value, Err(error) => 0 }}) }}
 
     let bytes = fs::read(&path).unwrap();
     assert_eq!(&bytes[..8], b"DISPDB\x1a\n");
-    assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 2);
+    assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 3);
     assert_eq!(bytes.len() % 4096, 0);
     assert!(!bytes.starts_with(b"SQLite format 3"));
 
@@ -262,7 +269,7 @@ fn main() {{ match migrate() {{ Ok(value) => print(value), Err(error) => print(e
     let interpreted_bytes = fs::read(&interpreted).unwrap();
     assert_eq!(
         u32::from_le_bytes(interpreted_bytes[8..12].try_into().unwrap()),
-        2
+        3
     );
     assert_eq!(interpreted_bytes.len() % 4096, 0);
 
@@ -534,5 +541,63 @@ fn invalid_data_schemas_have_source_diagnostics() {
     assert!(
         ordinary_struct.message.contains("data schema"),
         "{ordinary_struct}"
+    );
+}
+
+#[test]
+fn unique_constraints_are_typed_durable_and_native() {
+    let path = data_path("unique");
+    let path = source_path(&path);
+    let source = format!(
+        r#"
+data Account {{
+    id: int primary
+    email: String unique
+}}
+
+fn verify() -> Result<bool, DataError> {{
+    var store = data open Path("{path}")?
+    data add Account {{ id: 1, email: "ada@disp.dev" }} in store?
+    duplicate = data add Account {{ id: 2, email: "ada@disp.dev" }} in store
+    data add Account {{ id: 2, email: "grace@disp.dev" }} in store?
+    collision = data save Account {{ id: 2, email: "ada@disp.dev" }} in store
+    rows = data find Account in store order id ascending?
+    return Ok(match duplicate {{ Err(_) => true, Ok(_) => false }}
+        && match collision {{ Err(_) => true, Ok(_) => false }}
+        && rows.len() == 2)
+}}
+
+fn main() {{ print(match verify() {{ Ok(value) => value, Err(_) => false }}) }}
+"#
+    );
+    assert_eq!(run_source(&source).unwrap(), ["true"]);
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(format!("{path}.lock"));
+    if let Some(output) = native_output("unique-constraints", &source) {
+        assert_eq!(output, "true\n");
+    }
+
+    let optional =
+        check_source("data Account { id: int primary email: Option<String> unique } fn main() {}")
+            .unwrap_err();
+    assert!(
+        optional.message.contains("cannot be optional"),
+        "{optional}"
+    );
+    assert_eq!(
+        (optional.span.start.line, optional.span.start.column),
+        (1, 39)
+    );
+
+    let duplicate =
+        check_source("data Account { id: int primary email: String unique unique } fn main() {}")
+            .unwrap_err();
+    assert!(
+        duplicate.message.contains("duplicate `unique`"),
+        "{duplicate}"
+    );
+    assert_eq!(
+        (duplicate.span.start.line, duplicate.span.start.column),
+        (1, 53)
     );
 }

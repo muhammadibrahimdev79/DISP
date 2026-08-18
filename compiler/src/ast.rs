@@ -62,6 +62,7 @@ pub struct FieldDeclaration {
     pub name_span: Span,
     pub ty: TypeName,
     pub primary: bool,
+    pub unique: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

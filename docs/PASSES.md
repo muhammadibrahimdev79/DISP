@@ -86,7 +86,7 @@ applications fully functional.
 
 | Pass | Status | Deliverable | Completion evidence |
 |---:|---|---|---|
-| 031 | planned | DISP-owned catalog, stable schema language, constraints, native indexes, migrations, and schema evolution | Native-format migration compatibility and corruption tests with no external database library |
+| 031 | active | DISP-owned catalog, stable schema language, constraints, native indexes, migrations, and schema evolution | Required-field `unique` constraints now parse, type-check, persist in native v3 catalogs, reject collisions transactionally, preserve v1/v2 readability, and execute identically in interpreter/native storage. Secondary index structures, named/composite constraints, and schema migrations remain |
 | 032 | planned | DISP-native typed relational algebra with joins, grouping, aggregates, subqueries, and null semantics | Query conformance and compile-time type suite executed directly by DISP |
 | 033 | planned | DISP-owned cost-based optimizer, statistics, indexes, query plans, and explain tooling | Correctness corpus and measured plan improvements without SQL translation |
 | 034 | planned | Native transaction isolation, MVCC, concurrent access, recovery, backup, and restore | Crash/fault/concurrency matrix over DISP's own WAL/page engine |

@@ -3649,6 +3649,7 @@ struct NativeDataField {
     storage: String,
     optional: bool,
     primary: bool,
+    unique: bool,
 }
 
 #[derive(Clone)]
@@ -4256,6 +4257,8 @@ fn data_column_sql(field: &crate::ast::FieldDeclaration) -> String {
     }
     if field.primary {
         sql.push_str(" PRIMARY KEY");
+    } else if field.unique {
+        sql.push_str(" UNIQUE");
     }
     sql
 }
@@ -4301,6 +4304,7 @@ fn native_data_fields(schema: &crate::ast::StructDeclaration) -> Vec<NativeDataF
             storage: data_sql_type(&field.ty).to_owned(),
             optional: data_inner_type(&field.ty).1,
             primary: field.primary,
+            unique: field.unique,
         })
         .collect()
 }
@@ -4326,6 +4330,7 @@ fn native_data_snapshot(
                     storage: field.storage.clone(),
                     optional: field.optional,
                     primary: field.primary,
+                    unique: field.unique,
                 })
                 .collect(),
             rows,
@@ -4387,6 +4392,7 @@ fn data_ensure_schema(
                         storage: field.storage.clone(),
                         optional: field.optional,
                         primary: field.primary,
+                        unique: field.unique,
                     })
                     .collect::<Vec<_>>();
                 if stored_fields != fields {
@@ -4500,6 +4506,20 @@ fn native_data_write(
             let existing = table.rows.iter().position(|row| {
                 matches!(row, Value::Struct { fields, .. } if fields.get(primary_name) == Some(key))
             });
+            for field in table.fields.iter().filter(|field| field.unique) {
+                let candidate = fields.get(&field.name).ok_or_else(|| {
+                    io::Error::other(format!("data value is missing `{}`", field.name))
+                })?;
+                if table.rows.iter().enumerate().any(|(index, row)| {
+                    Some(index) != existing
+                        && matches!(row, Value::Struct { fields, .. } if fields.get(&field.name) == Some(candidate))
+                }) {
+                    return Err(io::Error::other(format!(
+                        "duplicate unique value for `{}.{}`",
+                        schema.name, field.name
+                    )));
+                }
+            }
             if let Some(index) = existing {
                 if !replace {
                     return Err(io::Error::other(format!(
