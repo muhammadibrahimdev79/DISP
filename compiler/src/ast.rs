@@ -372,6 +372,7 @@ pub enum Expression {
         replace: bool,
     },
     DataQuery {
+        kind: DataQueryKind,
         schema: String,
         schema_span: Span,
         store: Box<Expr>,
@@ -437,6 +438,13 @@ pub enum Expression {
         callee: Box<Expr>,
         arguments: Vec<Expr>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataQueryKind {
+    Rows,
+    Count,
+    Exists,
 }
 
 #[derive(Debug, Clone, PartialEq)]

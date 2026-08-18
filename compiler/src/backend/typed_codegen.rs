@@ -357,6 +357,11 @@ fn json_codec_types(
                             collect_json_codec_types(program, &field.ty, &mut decoders);
                         }
                     }
+                    hir::DataOperation::Aggregate { .. } => {
+                        for field in &program.structs[plan.schema.0].fields {
+                            collect_json_codec_types(program, &field.ty, &mut decoders);
+                        }
+                    }
                     hir::DataOperation::Remove { .. } => {}
                 }
                 for argument in arguments.iter().skip(1) {
@@ -5765,6 +5770,124 @@ fn data_call(
                 );
             format!(
                 "({{{result_c} _r={{0}};disp_native_string _error={{0}};bool _ok={guard};bool _native=_ok&&({database})->state->native;disp_native_json _params[{}]={{{{0}}}};size_t _encoded=0;{limit_check}{native_limit}{encoders}disp_native_json *_rows=NULL;size_t _rows_len=0,_rows_cap=0;if(_ok){{if(_native)_ok={native_rows};else _ok=disp_database_query(({database})->state,\"{}\",{},_params,{parameter_count},&_rows,&_rows_len,&_rows_cap,&_error);}}{list_c} _values={{0}};if(_ok&&_rows_len){{_values.data=({element_c}*)disp_alloc_zeroed(_rows_len,sizeof({element_c}),_Alignof({element_c}));_values.cap=_rows_len;}}if(_ok){{for(size_t _i=0;_i<_rows_len;_i++){{size_t _target=_values.len,_field_done=0;{decoders}if(!_ok){{{partial_drops}break;}}{element_c} *_row=&_values.data[_target];if(_native&&!dv_truth({native_predicate})){{{drop_target}continue;}}_values.len++;}}}}{native_order}if(_ok&&_native&&_values.len>_native_limit){{for(size_t _i=_native_limit;_i<_values.len;_i++){{{drop_element}}}_values.len=_native_limit;}}disp_database_rows_drop(_rows,_rows_len);for(size_t _i=0;_i<_encoded;_i++)disp_json_drop(&_params[_i]);if(_ok){{_r.tag=0;_r.payload.v0.f0=_values;}}else{{for(size_t _i=0;_i<_values.len;_i++){{{drop_element}}}disp_dealloc(_values.data);_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})",
+                parameter_count.max(1),
+                escape(&sql),
+                sql.len()
+            )
+        }
+        hir::DataOperation::Aggregate { kind, predicate } => {
+            let mut sql = format!(
+                "SELECT {} FROM {}",
+                data_select_sql(schema),
+                data_identifier(&schema.name)
+            );
+            let mut indices = Vec::new();
+            if let Some(predicate) = predicate {
+                sql.push_str(" WHERE ");
+                sql.push_str(&data_expr_sql(predicate, schema));
+                data_parameters(predicate, &mut indices);
+            }
+            let encoders = indices
+                .iter()
+                .enumerate()
+                .map(|(parameter, argument)| {
+                    let (value, ty) =
+                        system_argument(program, function, &arguments[*argument], substitutions);
+                    format!(
+                        "if(_ok){{if(!{}({value},&_params[{parameter}],&_error))_ok=false;else _encoded++;}}",
+                        json_encoder_name(&ty)
+                    )
+                })
+                .collect::<String>();
+            let element_c = native_types::c_type(&schema_ty);
+            let native_predicate = predicate.as_ref().map_or_else(
+                || "dv_bool(true)".into(),
+                |predicate| {
+                    data_expr_native(
+                        program,
+                        function,
+                        predicate,
+                        "_row",
+                        arguments,
+                        substitutions,
+                    )
+                },
+            );
+            let decoders = schema
+                .fields
+                .iter()
+                .map(|field| {
+                    data_decode_field(field, "&_rows[_i]", &format!("_row_value.f{}", field.index))
+                })
+                .collect::<String>();
+            let partial_drops = schema
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    let drop =
+                        drop_value(program, &format!("_row_value.f{}", field.index), &field.ty);
+                    format!("if(_field_done>{index}){{{drop}}}")
+                })
+                .collect::<String>();
+            let drop_row = drop_value(program, "_row_value", &schema_ty);
+            let native_rows = predicate
+                .as_ref()
+                .and_then(|predicate| data_index_lookup(predicate, schema, &indices))
+                .map_or_else(
+                    || {
+                        if predicate.is_none() {
+                            format!(
+                                "disp_data_native_length(({database})->state,\"{}\",{},&_count,&_error)",
+                                escape(&schema.name),
+                                schema.name.len()
+                            )
+                        } else {
+                            format!(
+                                "disp_data_native_snapshot(({database})->state,\"{}\",{},&_rows,&_rows_len,&_rows_cap,&_error)",
+                                escape(&schema.name),
+                                schema.name.len()
+                            )
+                        }
+                    },
+                    |lookup| match lookup {
+                        DataIndexLookup::Field { field, parameter } => format!(
+                            "disp_data_native_lookup(({database})->state,\"{}\",{},{field},&_params[{parameter}],&_rows,&_rows_len,&_rows_cap,&_error)",
+                            escape(&schema.name),
+                            schema.name.len()
+                        ),
+                        DataIndexLookup::Composite {
+                            constraint,
+                            parameters,
+                        } => {
+                            let keys = parameters
+                                .iter()
+                                .map(|parameter| format!("_params[{parameter}]"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            format!(
+                                "disp_data_native_composite_lookup(({database})->state,\"{}\",{},{constraint},(disp_native_json[]){{{keys}}},{},&_rows,&_rows_len,&_rows_cap,&_error)",
+                                escape(&schema.name),
+                                schema.name.len(),
+                                parameters.len()
+                            )
+                        }
+                    },
+                );
+            let stop = if *kind == ast::DataQueryKind::Exists {
+                "if(_count)break;"
+            } else {
+                ""
+            };
+            let success = match kind {
+                ast::DataQueryKind::Count => "_count",
+                ast::DataQueryKind::Exists => "(_count!=0)",
+                ast::DataQueryKind::Rows => unreachable!("row query uses Find"),
+            };
+            let parameter_count = indices.len();
+            let direct_native = predicate.is_none();
+            format!(
+                "({{{result_c} _r={{0}};disp_native_string _error={{0}};bool _ok={guard};bool _native=_ok&&({database})->state->native;disp_native_json _params[{}]={{{{0}}}};size_t _encoded=0;{encoders}disp_native_json *_rows=NULL;size_t _rows_len=0,_rows_cap=0;uint64_t _count=0;if(_ok){{if(_native)_ok={native_rows};else _ok=disp_database_query(({database})->state,\"{}\",{},_params,{parameter_count},&_rows,&_rows_len,&_rows_cap,&_error);}}if(_ok&&!(_native&&{direct_native})){{for(size_t _i=0;_i<_rows_len;_i++){{{element_c} _row_value={{0}};size_t _field_done=0;{decoders}if(!_ok){{{partial_drops}break;}}{element_c} *_row=&_row_value;if(!_native||dv_truth({native_predicate}))_count++;{drop_row}{stop}}}}}disp_database_rows_drop(_rows,_rows_len);for(size_t _i=0;_i<_encoded;_i++)disp_json_drop(&_params[_i]);if(_ok){{_r.tag=0;_r.payload.v0.f0={success};}}else{{_r.tag=1;_r.payload.v1.f0=_error;}}_r;}})",
                 parameter_count.max(1),
                 escape(&sql),
                 sql.len()

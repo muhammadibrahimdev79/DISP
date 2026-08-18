@@ -5899,6 +5899,14 @@ enum Flow {
     Continue,
 }
 
+struct DataQueryRequest<'a> {
+    kind: crate::ast::DataQueryKind,
+    schema_name: &'a str,
+    predicate: Option<&'a Expr>,
+    order: Option<&'a crate::ast::DataOrder>,
+    limit: Option<&'a Expr>,
+}
+
 pub struct Interpreter {
     scopes: Vec<HashMap<String, Value>>,
     scope_orders: Vec<Vec<String>>,
@@ -7339,12 +7347,16 @@ impl Interpreter {
     fn evaluate_data_query(
         &mut self,
         program: &Program,
-        schema_name: &str,
         store: &Expr,
-        predicate: Option<&Expr>,
-        order: Option<&crate::ast::DataOrder>,
-        limit: Option<&Expr>,
+        query: DataQueryRequest<'_>,
     ) -> RuntimeResult<Value> {
+        let DataQueryRequest {
+            kind,
+            schema_name,
+            predicate,
+            order,
+            limit,
+        } = query;
         let Value::Database(database) = self.evaluate(program, store)? else {
             unreachable!("type checking validates the DISP Data store")
         };
@@ -7405,6 +7417,18 @@ impl Interpreter {
                     }
                 }
                 values = retained;
+            }
+            if kind != crate::ast::DataQueryKind::Rows {
+                let value = match kind {
+                    crate::ast::DataQueryKind::Count => Value::UInt(values.len() as u64),
+                    crate::ast::DataQueryKind::Exists => Value::Bool(!values.is_empty()),
+                    crate::ast::DataQueryKind::Rows => unreachable!(),
+                };
+                return Ok(Value::Enum {
+                    type_name: "Result".into(),
+                    variant: "Ok".into(),
+                    payload: vec![value],
+                });
             }
             if let Some(order) = order {
                 for index in 1..values.len() {
@@ -7513,6 +7537,13 @@ impl Interpreter {
                 sql.push_str(&format!(" LIMIT {amount}"));
             }
             let rows = database.query(&sql, &parameters)?;
+            if kind != crate::ast::DataQueryKind::Rows {
+                return Ok(match kind {
+                    crate::ast::DataQueryKind::Count => Value::UInt(rows.len() as u64),
+                    crate::ast::DataQueryKind::Exists => Value::Bool(!rows.is_empty()),
+                    crate::ast::DataQueryKind::Rows => unreachable!(),
+                });
+            }
             let values = data_decode_rows(program, schema, rows)?;
             Ok(Value::List {
                 capacity: values.len(),
@@ -7632,6 +7663,7 @@ impl Interpreter {
                 replace,
             } => self.evaluate_data_write(program, value, store, *replace, expression.span),
             Expression::DataQuery {
+                kind,
                 schema,
                 store,
                 predicate,
@@ -7640,11 +7672,14 @@ impl Interpreter {
                 ..
             } => self.evaluate_data_query(
                 program,
-                schema,
                 store,
-                predicate.as_deref(),
-                order.as_ref(),
-                limit.as_deref(),
+                DataQueryRequest {
+                    kind: *kind,
+                    schema_name: schema,
+                    predicate: predicate.as_deref(),
+                    order: order.as_ref(),
+                    limit: limit.as_deref(),
+                },
             ),
             Expression::DataRemove {
                 schema,

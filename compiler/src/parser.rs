@@ -1,10 +1,11 @@
 use crate::ast::{
     AssignmentOperator, BinaryOperator, BindingKind, Block, Capability, CapabilityUse, ClosureBody,
-    DataConstraintDeclaration, DataConstraintKind, DataOrder, EnumDeclaration, Expr, Expression,
-    ExternalAbi, ExternalFunction, FieldDeclaration, Function, FunctionSignature, GenericParameter,
-    Implementation, ImportDeclaration, ImportItem, MatchArm, ModuleDeclaration, Parameter, Pattern,
-    Program, Spanned, Statement, StructDeclaration, StructFieldValue, StructPatternField,
-    TraitDeclaration, TypeName, TypeQualifier, UnaryOperator, VariantDeclaration,
+    DataConstraintDeclaration, DataConstraintKind, DataOrder, DataQueryKind, EnumDeclaration, Expr,
+    Expression, ExternalAbi, ExternalFunction, FieldDeclaration, Function, FunctionSignature,
+    GenericParameter, Implementation, ImportDeclaration, ImportItem, MatchArm, ModuleDeclaration,
+    Parameter, Pattern, Program, Spanned, Statement, StructDeclaration, StructFieldValue,
+    StructPatternField, TraitDeclaration, TypeName, TypeQualifier, UnaryOperator,
+    VariantDeclaration,
 };
 use crate::diagnostics::{Diagnostic, DiagnosticKind, Position, Span};
 use crate::lexer::{Token, TokenKind};
@@ -1677,14 +1678,16 @@ impl Parser {
             }
             "add" => self.parse_data_write(start, false),
             "save" => self.parse_data_write(start, true),
-            "find" => self.parse_data_query(start),
+            "find" => self.parse_data_query(start, DataQueryKind::Rows),
+            "count" => self.parse_data_query(start, DataQueryKind::Count),
+            "exists" => self.parse_data_query(start, DataQueryKind::Exists),
             "remove" => self.parse_data_remove(start),
             _ => Err(Diagnostic::new(
                 DiagnosticKind::Parse,
                 format!("unknown DISP Data operation `{operation}`"),
                 operation_span,
             )
-            .with_help("use `data memory`, `data open`, `data add`, `data save`, `data find`, or `data remove`")),
+            .with_help("use `data memory`, `data open`, `data add`, `data save`, `data find`, `data count`, `data exists`, or `data remove`")),
         }
     }
 
@@ -1702,9 +1705,9 @@ impl Parser {
         })
     }
 
-    fn parse_data_query(&mut self, start: Span) -> Result<Expr, Diagnostic> {
+    fn parse_data_query(&mut self, start: Span, kind: DataQueryKind) -> Result<Expr, Diagnostic> {
         let (schema, schema_span) =
-            self.expect_identifier("expected a data schema after `find`")?;
+            self.expect_identifier("expected a data schema after the query operation")?;
         self.expect(TokenKind::In, "expected `in` and a data store")?;
         let store = self.parse_data_part()?;
         let predicate = if self.match_data_word("where") {
@@ -1712,7 +1715,16 @@ impl Parser {
         } else {
             None
         };
-        let order = if self.match_data_word("order") {
+        if kind != DataQueryKind::Rows
+            && matches!(&self.peek().kind, TokenKind::Identifier(word) if word == "order" || word == "limit")
+        {
+            return Err(Diagnostic::new(
+                DiagnosticKind::Parse,
+                "`data count` and `data exists` accept `where` but not `order` or `limit`",
+                self.peek().span,
+            ));
+        }
+        let order = if kind == DataQueryKind::Rows && self.match_data_word("order") {
             let order_start = self.previous().span;
             let key = self.parse_data_part()?;
             let descending = if self.match_data_word("descending") {
@@ -1730,7 +1742,7 @@ impl Parser {
         } else {
             None
         };
-        let limit = if self.match_data_word("limit") {
+        let limit = if kind == DataQueryKind::Rows && self.match_data_word("limit") {
             Some(Box::new(self.parse_data_part()?))
         } else {
             None
@@ -1742,6 +1754,7 @@ impl Parser {
         Ok(Spanned {
             span: start.through(end),
             node: Expression::DataQuery {
+                kind,
                 schema,
                 schema_span,
                 store: Box::new(store),

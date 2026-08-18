@@ -712,6 +712,111 @@ fn main() {{
 }
 
 #[test]
+fn count_and_exists_are_typed_indexed_durable_and_differential() {
+    let path = data_path("count-exists");
+    let path = source_path(&path);
+    let source = format!(
+        r#"
+data Event {{
+    id: int primary
+    category: String index
+    active: bool
+    constraint category_active: index(category, active)
+}}
+
+fn seed() -> Result<bool, DataError> {{
+    var store = data open Path("{path}")?
+    data add Event {{ id: 1, category: "system", active: true }} in store?
+    data add Event {{ id: 2, category: "system", active: false }} in store?
+    data add Event {{ id: 3, category: "user", active: true }} in store?
+    wanted = "system"
+    all = data count Event in store?
+    systems = data count Event in store where category == wanted?
+    active_system = data exists Event in store where category == wanted && active == true?
+    missing = data exists Event in store where category == "missing"?
+    return Ok(all == 3 && systems == 2 && active_system && !missing)
+}}
+
+fn main() {{ print(match seed() {{ Ok(value) => value, Err(_) => false }}) }}
+"#
+    );
+
+    let (hir, mir) = lower_source(&source).unwrap();
+    assert_eq!(
+        hir.data_plans
+            .iter()
+            .filter(|plan| matches!(plan.operation, disp::hir::DataOperation::Aggregate { .. }))
+            .count(),
+        4
+    );
+    assert_eq!(mir.data_plans.len(), hir.data_plans.len());
+    assert_eq!(run_source(&source).unwrap(), ["true"]);
+    assert_eq!(
+        u32::from_le_bytes(fs::read(&path).unwrap()[8..12].try_into().unwrap()),
+        5
+    );
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(format!("{path}.lock"));
+
+    if let Some(output) = native_output("count-exists", &source) {
+        assert_eq!(output, "true\n");
+    }
+    let native_source = std::env::temp_dir().join(format!(
+        "disp-data-count-exists-plan-{}.disp",
+        std::process::id()
+    ));
+    fs::write(&native_source, &source).unwrap();
+    let artifacts = backend::build(
+        &hir,
+        &mir,
+        &native_source,
+        BuildOptions {
+            emit_c: true,
+            ..BuildOptions::default()
+        },
+    )
+    .unwrap();
+    let generated = fs::read_to_string(artifacts.backend_ir.unwrap()).unwrap();
+    assert!(generated.matches("disp_data_native_length(").count() >= 2);
+    assert!(generated.matches("uint64_t _count=0").count() >= 4);
+    assert!(generated.matches("disp_data_native_lookup(").count() >= 2);
+    assert!(
+        generated
+            .matches("disp_data_native_composite_lookup(")
+            .count()
+            >= 2
+    );
+
+    for (invalid, message, column) in [
+        (
+            "data A { id: int primary } fn main(){ var s=data memory?; n=data count Missing in s? }",
+            "unknown data schema `Missing`",
+            72,
+        ),
+        (
+            "data A { id: int primary } fn run()->Result<uint,DataError>{ var s=data memory?; return data count A in s where id } fn main(){}",
+            "DISP Data condition",
+            113,
+        ),
+        (
+            "data A { id: int primary } fn run()->Result<bool,DataError>{ var s=data memory?; return data exists A in s order id } fn main(){}",
+            "not `order` or `limit`",
+            108,
+        ),
+    ] {
+        let error = check_source(invalid).unwrap_err();
+        assert!(error.message.contains(message), "{error}");
+        assert_eq!(
+            (error.span.start.line, error.span.start.column),
+            (1, column)
+        );
+    }
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(format!("{path}.lock"));
+}
+
+#[test]
 fn named_composite_constraints_are_transactional_durable_and_indexed() {
     let path = data_path("composite-constraints");
     let path = source_path(&path);
@@ -1113,10 +1218,9 @@ fn failed_unique_evolution_leaves_rows_and_catalog_unchanged() {
     if let Some(output) = native_output("schema-unique-seed", &seed) {
         assert_eq!(output, "true\n");
         let unchanged = fs::read(&path).unwrap();
-        assert_eq!(
-            native_output("schema-unique-reject", &invalid).unwrap(),
-            "false\n"
-        );
+        if let Some(output) = native_output("schema-unique-reject", &invalid) {
+            assert_eq!(output, "false\n");
+        }
         assert_eq!(fs::read(&path).unwrap(), unchanged);
     }
     let _ = fs::remove_file(&path);

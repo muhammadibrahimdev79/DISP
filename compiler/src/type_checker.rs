@@ -1,6 +1,7 @@
 use crate::ast::{
-    AssignmentOperator, BinaryOperator, BindingKind, Block, Capability, CapabilityUse, Expr,
-    Expression, Function, Pattern, Program, Statement, TypeName, TypeQualifier, UnaryOperator,
+    AssignmentOperator, BinaryOperator, BindingKind, Block, Capability, CapabilityUse,
+    DataQueryKind, Expr, Expression, Function, Pattern, Program, Statement, TypeName,
+    TypeQualifier, UnaryOperator,
 };
 use crate::diagnostics::{Diagnostic, DiagnosticKind, Span};
 use std::collections::{HashMap, HashSet};
@@ -1696,6 +1697,7 @@ impl TypeChecker {
                 ))
             }
             Expression::DataQuery {
+                kind,
                 schema,
                 schema_span,
                 store,
@@ -1736,10 +1738,12 @@ impl TypeChecker {
                         ));
                     }
                 }
-                Ok(Type::Result(
-                    Box::new(Type::List(Box::new(Type::Struct(id, vec![])))),
-                    Box::new(Type::DataError),
-                ))
+                let value = match kind {
+                    DataQueryKind::Rows => Type::List(Box::new(Type::Struct(id, vec![]))),
+                    DataQueryKind::Count => Type::UInt,
+                    DataQueryKind::Exists => Type::Bool,
+                };
+                Ok(Type::Result(Box::new(value), Box::new(Type::DataError)))
             }
             Expression::DataRemove {
                 schema,

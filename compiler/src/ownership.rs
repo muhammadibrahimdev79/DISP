@@ -1,6 +1,6 @@
 use crate::ast::{
-    BindingKind, Block, Expr, Expression, Function, Pattern, Program, Statement, TypeName,
-    TypeQualifier,
+    BindingKind, Block, DataQueryKind, Expr, Expression, Function, Pattern, Program, Statement,
+    TypeName, TypeQualifier,
 };
 use crate::diagnostics::{Diagnostic, DiagnosticKind, Span};
 use std::collections::{HashMap, HashSet};
@@ -1107,6 +1107,7 @@ impl<'a> Analyzer<'a> {
                 ))
             }
             Expression::DataQuery {
+                kind,
                 schema,
                 store,
                 predicate,
@@ -1124,8 +1125,12 @@ impl<'a> Analyzer<'a> {
                 if let Some(limit) = limit {
                     self.check_expr(limit, UseMode::Read)?;
                 }
+                let value = match kind {
+                    DataQueryKind::Rows => Ty::List(Box::new(Ty::Owned(schema.clone()))),
+                    DataQueryKind::Count | DataQueryKind::Exists => Ty::Copy,
+                };
                 Ok(Ty::Result(
-                    Box::new(Ty::List(Box::new(Ty::Owned(schema.clone())))),
+                    Box::new(value),
                     Box::new(Ty::Owned("DataError".into())),
                 ))
             }

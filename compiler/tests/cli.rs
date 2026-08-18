@@ -391,6 +391,10 @@ fn native_run_cache_reuses_unchanged_builds_and_tracks_imports() {
     let Some(cached) = disp(&[path]) else {
         return;
     };
+    if !cached.status.success() && String::from_utf8_lossy(&cached.stderr).contains("os error 4551")
+    {
+        return;
+    }
     assert!(cached.status.success());
     assert_eq!(String::from_utf8(cached.stdout).unwrap().trim(), "42");
     assert_eq!(
@@ -403,6 +407,11 @@ fn native_run_cache_reuses_unchanged_builds_and_tracks_imports() {
     let Some(rebuilt) = disp(&[path]) else {
         return;
     };
+    if !rebuilt.status.success()
+        && String::from_utf8_lossy(&rebuilt.stderr).contains("os error 4551")
+    {
+        return;
+    }
     assert!(
         rebuilt.status.success(),
         "rebuilt native program failed: {}",

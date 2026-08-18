@@ -610,6 +610,9 @@ users = data find User in store
     order id descending
     limit 20?
 
+active_count = data count User in store where active?
+has_ada = data exists User in store where name == wanted?
+
 data save User { id: 1, name: "Ada Lovelace", active: true, note: None } in store?
 data remove User in store where id == 1?
 ```
@@ -619,6 +622,11 @@ are checked by the compiler. Conditions become typed HIR data expressions and pl
 MIR carries a `DataPlanId` rather than embedded SQL. External values are evaluated once
 and bound as parameters. `remove` requires `where`, preventing an accidental unbounded
 delete in ordinary syntax. Limits are restricted to 100,000 rows.
+
+`data count` returns the number of matching rows and `data exists` answers whether any row matches
+without constructing a `List`. Both accept the same checked `where` expressions as `find`; native
+execution uses eligible field/composite indexes automatically and reads unfiltered cardinality
+directly.
 
 `data memory` creates an ephemeral `DataStore`. It uses DISP's own native typed row
 catalog and executes checked plans directly, including filtering, ordering, limits,

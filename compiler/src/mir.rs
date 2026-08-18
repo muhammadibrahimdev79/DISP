@@ -2071,6 +2071,12 @@ fn validate_data_plan(
                     .is_none_or(|(value, _)| check(value, arguments, fields))
                 && limit_argument.is_none_or(|index| index < arguments)
         }
+        hir::DataOperation::Aggregate { predicate, .. } => {
+            arguments >= 1
+                && predicate
+                    .as_ref()
+                    .is_none_or(|value| check(value, arguments, fields))
+        }
         hir::DataOperation::Remove { predicate } => {
             arguments >= 1 && check(predicate, arguments, fields)
         }

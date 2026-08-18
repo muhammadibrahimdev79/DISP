@@ -176,6 +176,10 @@ pub enum DataOperation {
         order: Option<(DataExpr, bool)>,
         limit_argument: Option<usize>,
     },
+    Aggregate {
+        kind: ast::DataQueryKind,
+        predicate: Option<DataExpr>,
+    },
     Remove {
         predicate: DataExpr,
     },
@@ -1476,6 +1480,7 @@ impl FunctionLowering<'_, '_> {
                 )
             }
             ast::Expression::DataQuery {
+                kind,
                 schema,
                 store,
                 predicate,
@@ -1503,14 +1508,24 @@ impl FunctionLowering<'_, '_> {
                 } else {
                     None
                 };
-                let id = DataPlanId(self.root.data_plans.borrow().len());
-                self.root.data_plans.borrow_mut().push(DataPlan {
-                    schema: schema_id,
-                    operation: DataOperation::Find {
+                let operation = match kind {
+                    ast::DataQueryKind::Rows => DataOperation::Find {
                         predicate,
                         order,
                         limit_argument,
                     },
+                    ast::DataQueryKind::Count | ast::DataQueryKind::Exists => {
+                        debug_assert!(order.is_none() && limit_argument.is_none());
+                        DataOperation::Aggregate {
+                            kind: *kind,
+                            predicate,
+                        }
+                    }
+                };
+                let id = DataPlanId(self.root.data_plans.borrow().len());
+                self.root.data_plans.borrow_mut().push(DataPlan {
+                    schema: schema_id,
+                    operation,
                     span: expression.span,
                 });
                 (
@@ -1521,7 +1536,16 @@ impl FunctionLowering<'_, '_> {
                         substitutions: vec![],
                     }),
                     Type::Result(
-                        Box::new(Type::List(Box::new(Type::Struct(schema_id, vec![])))),
+                        Box::new(match kind {
+                            ast::DataQueryKind::Rows => {
+                                Type::List(Box::new(Type::Struct(schema_id, vec![])))
+                            }
+                            ast::DataQueryKind::Count => Type::Int {
+                                signed: false,
+                                width: None,
+                            },
+                            ast::DataQueryKind::Exists => Type::Bool,
+                        }),
                         Box::new(Type::Generic("DataError".into())),
                     ),
                 )

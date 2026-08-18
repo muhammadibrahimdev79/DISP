@@ -1,0 +1,25 @@
+data Event {
+    id: int primary
+    category: String index
+    active: bool
+}
+
+fn summarize() -> Result<bool, DataError> {
+    var events = data memory?
+    data add Event { id: 1, category: "system", active: true } in events?
+    data add Event { id: 2, category: "system", active: false } in events?
+    data add Event { id: 3, category: "user", active: true } in events?
+
+    wanted = "system"
+    systems = data count Event in events where category == wanted?
+    has_active_system = data exists Event in events
+        where category == wanted && active?
+    return Ok(systems == 2 && has_active_system)
+}
+
+fn main() {
+    print(match summarize() {
+        Ok(value) => value,
+        Err(_) => false,
+    })
+}

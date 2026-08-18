@@ -450,6 +450,7 @@ impl Resolver {
                 Ok(())
             }
             Expression::DataQuery {
+                kind: _,
                 schema,
                 schema_span,
                 store,

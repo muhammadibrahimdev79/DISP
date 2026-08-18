@@ -552,6 +552,11 @@ const RULE_EVIDENCE: &[(&str, &str, &str)] = &[
         "tests/c_exports.rs",
         "contained_export_failure_rolls_back_handle_resources_in_reverse_order",
     ),
+    (
+        "DISP-CORE-0111",
+        "tests/data.rs",
+        "count_and_exists_are_typed_indexed_durable_and_differential",
+    ),
 ];
 
 fn compiler_root() -> &'static Path {
