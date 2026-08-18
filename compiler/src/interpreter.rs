@@ -4504,6 +4504,115 @@ fn native_data_rebuild_indexes(program: &Program, table: &mut NativeDataTable) -
     Ok(())
 }
 
+fn native_data_schema_evolution(
+    schema: &str,
+    stored_fields: &[NativeDataField],
+    stored_constraints: &[NativeDataConstraint],
+    fields: &[NativeDataField],
+    constraints: &[NativeDataConstraint],
+) -> io::Result<bool> {
+    if stored_fields.len() > fields.len() {
+        return Err(io::Error::other(format!(
+            "stored `{schema}` has fields removed by the current schema"
+        )));
+    }
+    let mut changed = stored_fields.len() != fields.len();
+    for (index, stored) in stored_fields.iter().enumerate() {
+        let current = &fields[index];
+        if stored.name != current.name {
+            return Err(io::Error::other(format!(
+                "stored `{schema}` field order or name changed at `{}`",
+                stored.name
+            )));
+        }
+        if stored.storage != current.storage
+            || stored.optional != current.optional
+            || stored.primary != current.primary
+        {
+            return Err(io::Error::other(format!(
+                "stored `{schema}.{}` changed type, optionality, or primary identity",
+                stored.name
+            )));
+        }
+        if (stored.unique && !current.unique) || (stored.indexed && !current.indexed) {
+            return Err(io::Error::other(format!(
+                "stored `{schema}.{}` removes an existing constraint or index",
+                stored.name
+            )));
+        }
+        changed |= stored.unique != current.unique || stored.indexed != current.indexed;
+    }
+    for field in &fields[stored_fields.len()..] {
+        if !field.optional || field.primary || field.unique {
+            return Err(io::Error::other(format!(
+                "new data field `{schema}.{}` must be optional",
+                field.name
+            )));
+        }
+    }
+    if stored_constraints.len() > constraints.len() {
+        return Err(io::Error::other(format!(
+            "stored `{schema}` has a named constraint removed by the current schema"
+        )));
+    }
+    for (stored, current) in stored_constraints.iter().zip(constraints) {
+        if stored != current {
+            return Err(io::Error::other(format!(
+                "stored `{schema}` constraint `{}` was reordered or changed",
+                stored.name
+            )));
+        }
+    }
+    changed |= stored_constraints.len() != constraints.len();
+    Ok(changed)
+}
+
+fn migrate_native_data_rows(
+    schema: &str,
+    stored_fields: &[NativeDataField],
+    fields: &[NativeDataField],
+    rows: Vec<RuntimeJson>,
+) -> io::Result<Vec<RuntimeJson>> {
+    if stored_fields.len() == fields.len() {
+        return Ok(rows);
+    }
+    rows.into_iter()
+        .map(|row| {
+            let entries = json_object_entries(&row)?;
+            if entries.len() != stored_fields.len() {
+                return Err(io::Error::other(format!(
+                    "stored `{schema}` row does not match its prior schema"
+                )));
+            }
+            let mut migrated = String::from("{");
+            for (index, field) in fields.iter().enumerate() {
+                if index != 0 {
+                    migrated.push(',');
+                }
+                migrated.push_str(&json_escape_string(&field.name)?);
+                migrated.push(':');
+                if index < stored_fields.len() {
+                    let value = entries
+                        .iter()
+                        .find(|(name, _)| name == &field.name)
+                        .map(|(_, value)| value)
+                        .ok_or_else(|| {
+                            io::Error::other(format!(
+                                "stored `{schema}` row is missing `{}`",
+                                field.name
+                            ))
+                        })?;
+                    migrated.push_str(&value.text);
+                } else {
+                    migrated.push_str("null");
+                }
+            }
+            migrated.push('}');
+            runtime_json(migrated)
+        })
+        .collect()
+}
+
 fn data_ensure_schema(
     program: &Program,
     database: &RuntimeDatabase,
@@ -4553,12 +4662,13 @@ fn data_ensure_schema(
                             .collect(),
                     })
                     .collect::<Vec<_>>();
-                if stored_fields != fields || stored_constraints != constraints {
-                    return Err(io::Error::other(format!(
-                        "stored `{}` layout does not match its DISP Data schema",
-                        schema.name
-                    )));
-                }
+                let changed = native_data_schema_evolution(
+                    &schema.name,
+                    &stored_fields,
+                    &stored_constraints,
+                    &fields,
+                    &constraints,
+                )?;
                 let rows = persisted
                     .rows
                     .into_iter()
@@ -4568,6 +4678,7 @@ fn data_ensure_schema(
                             .and_then(runtime_json)
                     })
                     .collect::<io::Result<Vec<_>>>()?;
+                let rows = migrate_native_data_rows(&schema.name, &stored_fields, &fields, rows)?;
                 let rows = data_decode_rows(program, schema, rows)?;
                 let primary = fields
                     .iter()
@@ -4576,18 +4687,24 @@ fn data_ensure_schema(
                 let indexes = native_data_indexes(program, &fields, &rows)?;
                 let composite_indexes =
                     native_data_composite_indexes(program, &fields, &constraints, &rows)?;
-                store.pending.remove(&schema.name);
-                store.tables.insert(
-                    schema.name.clone(),
-                    NativeDataTable {
-                        fields,
-                        primary,
-                        rows,
-                        indexes,
-                        constraints,
-                        composite_indexes,
-                    },
-                );
+                let table = NativeDataTable {
+                    fields,
+                    primary,
+                    rows,
+                    indexes,
+                    constraints,
+                    composite_indexes,
+                };
+                if changed {
+                    mutate_native_data(program, store, |store| {
+                        store.pending.remove(&schema.name);
+                        store.tables.insert(schema.name.clone(), table);
+                        Ok(())
+                    })?;
+                } else {
+                    store.pending.remove(&schema.name);
+                    store.tables.insert(schema.name.clone(), table);
+                }
                 return Ok(());
             }
             let primary = fields

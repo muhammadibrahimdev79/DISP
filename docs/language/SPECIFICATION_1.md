@@ -513,6 +513,21 @@ duplicate keys. A conjunction providing equality values for every constrained fi
 composite index automatically. Constraint enforcement, index replacement, and durable commits form
 one transaction; failure leaves both rows and indexes unchanged.
 
+Opening a stored schema performs a safe additive evolution automatically when the source schema:
+
+- preserves every existing field in its original order with the same name, type, optionality, and
+  primary identity;
+- only appends new optional fields, whose existing-row value becomes `None`;
+- only adds field-level `unique`/`index` modifiers or appends named constraints; and
+- satisfies every newly added uniqueness rule across all stored rows.
+
+The evolution replaces rows, schema metadata, and derived indexes in one durable transaction. A
+failed validation or commit leaves the previous catalog and rows byte-for-byte unchanged. Removing,
+renaming, reordering, or changing an existing field; removing an index or constraint; or adding a
+required field without a defined value fails closed with `DataError`. Required-field defaults,
+renames, and destructive transformations require a future explicit migration declaration and are
+not inferred.
+
 The language does not translate these plans into SQL. Interpreter and native execution use the
 same DISP-owned logical plans and durable format. The separate `Database` compatibility type does
 not become a `DataStore` and cannot inject SQL methods into DISP Data expressions.

@@ -858,3 +858,132 @@ fn main() {{
         assert!(error.message.contains(message), "{error}");
     }
 }
+
+#[test]
+fn safe_schema_evolution_is_additive_transactional_and_differential() {
+    let path = data_path("schema-evolution");
+    let path = source_path(&path);
+    let seed = format!(
+        r#"
+data Profile {{ id: int primary name: String }}
+fn seed() -> Result<bool, DataError> {{
+    var store = data open Path("{path}")?
+    data add Profile {{ id: 1, name: "Ada" }} in store?
+    data add Profile {{ id: 2, name: "Grace" }} in store?
+    return Ok(true)
+}}
+fn main() {{ print(match seed() {{ Ok(value) => value, Err(_) => false }}) }}
+"#
+    );
+    let unsafe_required = format!(
+        r#"
+data Profile {{ id: int primary name: String age: int }}
+fn load() -> Result<bool, DataError> {{
+    var store = data open Path("{path}")?
+    rows = data find Profile in store?
+    return Ok(rows.len() == 2)
+}}
+fn main() {{ print(match load() {{ Ok(_) => true, Err(_) => false }}) }}
+"#
+    );
+    let evolved = format!(
+        r#"
+data Profile {{
+    id: int primary
+    name: String unique
+    note: Option<String> index
+    constraint id_name: unique(id, name)
+    constraint name_note: index(name, note)
+}}
+fn migrate() -> Result<bool, DataError> {{
+    var store = data open Path("{path}")?
+    var missing: Option<String> = None
+    old = data find Profile in store where note == missing?
+    wanted_id = 1
+    wanted_name = "Ada"
+    ada = data find Profile in store where id == wanted_id && name == wanted_name?
+    data add Profile {{ id: 3, name: "Lin", note: Some("systems") }} in store?
+    return Ok(old.len() == 2 && ada.len() == 1)
+}}
+fn reopen() -> Result<bool, DataError> {{
+    var store = data open Path("{path}")?
+    rows = data find Profile in store order id ascending?
+    return Ok(rows.len() == 3)
+}}
+fn main() {{
+    migrated = match migrate() {{ Ok(value) => value, Err(_) => false }}
+    reopened = match reopen() {{ Ok(value) => value, Err(_) => false }}
+    print(migrated && reopened)
+}}
+"#
+    );
+
+    assert_eq!(run_source(&seed).unwrap(), ["true"]);
+    let before_rejection = fs::read(&path).unwrap();
+    assert_eq!(run_source(&unsafe_required).unwrap(), ["false"]);
+    assert_eq!(fs::read(&path).unwrap(), before_rejection);
+    assert_eq!(run_source(&evolved).unwrap(), ["true"]);
+    let evolved_bytes = fs::read(&path).unwrap();
+    assert_ne!(evolved_bytes, before_rejection);
+    for schema in [
+        "id: int primary note: Option<String> index name: String unique constraint id_name: unique(id, name) constraint name_note: index(name, note)",
+        "id: int primary name: int note: Option<String> index constraint id_name: unique(id, name) constraint name_note: index(name, note)",
+        "id: int primary name: String unique note: Option<String> index constraint id_name: unique(id, name)",
+        "id: int primary name: String unique",
+    ] {
+        let rejected = format!(
+            "data Profile {{ {schema} }} fn load()->Result<bool,DataError>{{ var store=data open Path(\"{path}\")?; rows=data find Profile in store?; return Ok(rows.len()>0) }} fn main(){{ print(match load(){{Ok(_)=>true,Err(_)=>false}}) }}"
+        );
+        assert_eq!(run_source(&rejected).unwrap(), ["false"]);
+        assert_eq!(fs::read(&path).unwrap(), evolved_bytes);
+    }
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(format!("{path}.lock"));
+
+    if let Some(output) = native_output("schema-evolution-seed", &seed) {
+        assert_eq!(output, "true\n");
+        let before_rejection = fs::read(&path).unwrap();
+        assert_eq!(
+            native_output("schema-evolution-required", &unsafe_required).unwrap(),
+            "false\n"
+        );
+        assert_eq!(fs::read(&path).unwrap(), before_rejection);
+        assert_eq!(
+            native_output("schema-evolution-apply", &evolved).unwrap(),
+            "true\n"
+        );
+    }
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(format!("{path}.lock"));
+}
+
+#[test]
+fn failed_unique_evolution_leaves_rows_and_catalog_unchanged() {
+    let path = data_path("schema-evolution-unique-failure");
+    let path = source_path(&path);
+    let seed = format!(
+        "data Contact {{ id: int primary name: String }} fn seed()->Result<bool,DataError>{{ var store=data open Path(\"{path}\")?; data add Contact{{id:1,name:\"same\"}} in store?; data add Contact{{id:2,name:\"same\"}} in store?; return Ok(true) }} fn main(){{print(match seed(){{Ok(v)=>v,Err(_)=>false}})}}"
+    );
+    let invalid = format!(
+        "data Contact {{ id: int primary name: String unique }} fn load()->Result<bool,DataError>{{ var store=data open Path(\"{path}\")?; rows=data find Contact in store?; return Ok(rows.len()==2) }} fn main(){{print(match load(){{Ok(_)=>true,Err(_)=>false}})}}"
+    );
+
+    assert_eq!(run_source(&seed).unwrap(), ["true"]);
+    let unchanged = fs::read(&path).unwrap();
+    assert_eq!(run_source(&invalid).unwrap(), ["false"]);
+    assert_eq!(fs::read(&path).unwrap(), unchanged);
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(format!("{path}.lock"));
+
+    if let Some(output) = native_output("schema-unique-seed", &seed) {
+        assert_eq!(output, "true\n");
+        let unchanged = fs::read(&path).unwrap();
+        assert_eq!(
+            native_output("schema-unique-reject", &invalid).unwrap(),
+            "false\n"
+        );
+        assert_eq!(fs::read(&path).unwrap(), unchanged);
+    }
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(format!("{path}.lock"));
+}

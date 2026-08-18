@@ -1,0 +1,21 @@
+data Profile {
+    id: int primary
+    name: String unique
+    note: Option<String> index
+    constraint id_name: unique(id, name)
+}
+
+fn show() -> Result<bool, DataError> {
+    var profiles = data memory?
+    data add Profile { id: 1, name: "Ada", note: None } in profiles?
+    data add Profile { id: 2, name: "Grace", note: Some("compiler") } in profiles?
+    rows = data find Profile in profiles?
+    return Ok(rows.len() == 2)
+}
+
+fn main() {
+    print(match show() {
+        Ok(value) => value,
+        Err(_) => false,
+    })
+}

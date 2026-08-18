@@ -632,6 +632,10 @@ Multi-field rules remain compact: `constraint tenant_handle: unique(tenant, hand
 repeated pair, while `constraint tenant_status: index(tenant, status)` permits duplicates and speeds
 conjunctive equality queries. Named constraints are type-checked, persisted, and maintained directly
 by DISP in interpreter and native execution.
+Safe schema growth requires no migration script: append an `Option<T>` field or add an index or
+constraint, and `data open` upgrades existing rows and catalog metadata transactionally. Existing
+rows receive `None` for appended fields. DISP rejects removals, renames, reordering, type changes,
+required additions, and weakened constraints instead of guessing or losing data.
 `DataStore` and `Database` are distinct nominal types, so a data store cannot invoke raw
 SQL methods.
 
