@@ -11,7 +11,8 @@ const WAL_MAGIC: &[u8; 8] = b"DISPWAL\n";
 const LEGACY_VERSION: u32 = 1;
 const PAGE_VERSION: u32 = 2;
 const UNIQUE_VERSION: u32 = 3;
-const VERSION: u32 = 4;
+const INDEX_VERSION: u32 = 4;
+const VERSION: u32 = 5;
 const LEGACY_HEADER_SIZE: usize = 32;
 const PAGE_SIZE: usize = 4096;
 const PAGE_HEADER_SIZE: usize = 32;
@@ -38,7 +39,15 @@ pub(crate) struct Snapshot {
 pub(crate) struct Table {
     pub name: String,
     pub fields: Vec<Field>,
+    pub constraints: Vec<Constraint>,
     pub rows: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Constraint {
+    pub name: String,
+    pub unique: bool,
+    pub fields: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,7 +202,10 @@ fn push_bytes(output: &mut Vec<u8>, value: &[u8], limit: usize, context: &str) -
     Ok(())
 }
 
-fn encode_payload(snapshot: &Snapshot) -> io::Result<Vec<u8>> {
+fn encode_payload_with_constraints(
+    snapshot: &Snapshot,
+    supports_constraints: bool,
+) -> io::Result<Vec<u8>> {
     if snapshot.tables.len() > MAX_TABLES {
         return Err(invalid("DISP Data snapshot exceeds 4096 tables"));
     }
@@ -252,6 +264,60 @@ fn encode_payload(snapshot: &Snapshot) -> io::Result<Vec<u8>> {
         if table.rows.len() > MAX_ROWS {
             return Err(invalid("DISP Data table exceeds 100000 rows"));
         }
+        if supports_constraints {
+            push_u32(&mut payload, table.constraints.len(), "constraint count")?;
+            let field_names = table
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<HashSet<_>>();
+            let mut constraint_names = HashSet::new();
+            for constraint in &table.constraints {
+                push_bytes(
+                    &mut payload,
+                    constraint.name.as_bytes(),
+                    MAX_NAME_BYTES,
+                    "constraint name",
+                )?;
+                if !constraint_names.insert(constraint.name.as_str())
+                    || field_names.contains(constraint.name.as_str())
+                {
+                    return Err(invalid(
+                        "DISP Data table contains a duplicate field or constraint name",
+                    ));
+                }
+                payload.push(u8::from(constraint.unique));
+                if constraint.fields.len() < 2 || constraint.fields.len() > table.fields.len() {
+                    return Err(invalid(
+                        "DISP Data composite constraint has an invalid field count",
+                    ));
+                }
+                push_u32(
+                    &mut payload,
+                    constraint.fields.len(),
+                    "constraint field count",
+                )?;
+                let mut constrained = HashSet::new();
+                for field in &constraint.fields {
+                    if !field_names.contains(field.as_str()) || !constrained.insert(field.as_str())
+                    {
+                        return Err(invalid(
+                            "DISP Data composite constraint references invalid fields",
+                        ));
+                    }
+                    push_bytes(
+                        &mut payload,
+                        field.as_bytes(),
+                        MAX_NAME_BYTES,
+                        "constraint field",
+                    )?;
+                }
+            }
+        } else if !table.constraints.is_empty() {
+            return Err(invalid(
+                "legacy DISP Data formats cannot encode composite constraints",
+            ));
+        }
         push_u64(&mut payload, table.rows.len(), "row count")?;
         for row in &table.rows {
             push_bytes(&mut payload, row, MAX_ROW_BYTES, "stored row")?;
@@ -263,8 +329,13 @@ fn encode_payload(snapshot: &Snapshot) -> io::Result<Vec<u8>> {
     Ok(payload)
 }
 
-fn encode_pages(snapshot: &Snapshot, generation: u64) -> io::Result<Vec<u8>> {
-    let payload = encode_payload(snapshot)?;
+fn encode_pages_version(
+    snapshot: &Snapshot,
+    generation: u64,
+    version: u32,
+    supports_constraints: bool,
+) -> io::Result<Vec<u8>> {
+    let payload = encode_payload_with_constraints(snapshot, supports_constraints)?;
     let data_pages = payload.len().div_ceil(PAGE_PAYLOAD_SIZE).max(1);
     let page_count = data_pages
         .checked_add(1)
@@ -272,7 +343,7 @@ fn encode_pages(snapshot: &Snapshot, generation: u64) -> io::Result<Vec<u8>> {
         .ok_or_else(|| invalid("DISP Data page count exceeds its storage limit"))?;
     let mut output = vec![0_u8; page_count * PAGE_SIZE];
     output[..8].copy_from_slice(MAGIC);
-    output[8..12].copy_from_slice(&VERSION.to_le_bytes());
+    output[8..12].copy_from_slice(&version.to_le_bytes());
     output[12..16].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
     output[16..24].copy_from_slice(&generation.to_le_bytes());
     output[24..32].copy_from_slice(&(payload.len() as u64).to_le_bytes());
@@ -301,6 +372,10 @@ fn encode_pages(snapshot: &Snapshot, generation: u64) -> io::Result<Vec<u8>> {
             .copy_from_slice(data);
     }
     Ok(output)
+}
+
+fn encode_pages(snapshot: &Snapshot, generation: u64) -> io::Result<Vec<u8>> {
+    encode_pages_version(snapshot, generation, VERSION, true)
 }
 
 #[cfg(test)]
@@ -358,7 +433,11 @@ impl<'a> Reader<'a> {
     }
 }
 
-fn decode_payload(payload: &[u8], allowed_flags: u8) -> io::Result<Snapshot> {
+fn decode_payload(
+    payload: &[u8],
+    allowed_flags: u8,
+    supports_constraints: bool,
+) -> io::Result<Snapshot> {
     let mut reader = Reader {
         bytes: payload,
         at: 0,
@@ -409,6 +488,54 @@ fn decode_payload(payload: &[u8], allowed_flags: u8) -> io::Result<Snapshot> {
                 "DISP Data table must contain exactly one primary field",
             ));
         }
+        let constraint_count = if supports_constraints {
+            reader.u32("constraint count")?
+        } else {
+            0
+        };
+        if constraint_count > MAX_FIELDS {
+            return Err(invalid("DISP Data table exceeds 4096 constraints"));
+        }
+        let field_names = fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<HashSet<_>>();
+        let mut constraint_names = HashSet::new();
+        let mut constraints = Vec::with_capacity(constraint_count);
+        for _ in 0..constraint_count {
+            let name = reader.text(MAX_NAME_BYTES, "constraint name")?;
+            if field_names.contains(name.as_str()) || !constraint_names.insert(name.clone()) {
+                return Err(invalid(
+                    "DISP Data table contains a duplicate field or constraint name",
+                ));
+            }
+            let flags = reader.u8("constraint flags")?;
+            if flags & !1 != 0 {
+                return Err(invalid("DISP Data constraint uses unknown required flags"));
+            }
+            let field_count = reader.u32("constraint field count")?;
+            if field_count < 2 || field_count > fields.len() {
+                return Err(invalid(
+                    "DISP Data composite constraint has an invalid field count",
+                ));
+            }
+            let mut names = Vec::with_capacity(field_count);
+            let mut constrained = HashSet::new();
+            for _ in 0..field_count {
+                let field = reader.text(MAX_NAME_BYTES, "constraint field")?;
+                if !field_names.contains(field.as_str()) || !constrained.insert(field.clone()) {
+                    return Err(invalid(
+                        "DISP Data composite constraint references invalid fields",
+                    ));
+                }
+                names.push(field);
+            }
+            constraints.push(Constraint {
+                name,
+                unique: flags & 1 != 0,
+                fields: names,
+            });
+        }
         let row_count = reader.u64("row count")?;
         if row_count > MAX_ROWS {
             return Err(invalid("DISP Data table exceeds 100000 rows"));
@@ -417,7 +544,12 @@ fn decode_payload(payload: &[u8], allowed_flags: u8) -> io::Result<Snapshot> {
         for _ in 0..row_count {
             rows.push(reader.data(MAX_ROW_BYTES, "stored row")?);
         }
-        tables.push(Table { name, fields, rows });
+        tables.push(Table {
+            name,
+            fields,
+            constraints,
+            rows,
+        });
     }
     if reader.at != payload.len() {
         return Err(invalid(
@@ -451,10 +583,14 @@ fn decode_legacy(bytes: &[u8]) -> io::Result<Snapshot> {
     if fnv1a(payload) != read_u64(bytes, 24) {
         return Err(invalid("DISP Data snapshot integrity check failed"));
     }
-    decode_payload(payload, 0b11)
+    decode_payload(payload, 0b11, false)
 }
 
-fn decode_pages(bytes: &[u8], allowed_flags: u8) -> io::Result<Snapshot> {
+fn decode_pages(
+    bytes: &[u8],
+    allowed_flags: u8,
+    supports_constraints: bool,
+) -> io::Result<Snapshot> {
     if bytes.len() < PAGE_SIZE {
         return Err(invalid("DISP Data page header is truncated"));
     }
@@ -518,7 +654,7 @@ fn decode_pages(bytes: &[u8], allowed_flags: u8) -> io::Result<Snapshot> {
     if fnv1a(&payload) != read_u64(bytes, 40) {
         return Err(invalid("DISP Data payload integrity check failed"));
     }
-    decode_payload(&payload, allowed_flags)
+    decode_payload(&payload, allowed_flags, supports_constraints)
 }
 
 pub(crate) fn decode(bytes: &[u8]) -> io::Result<Snapshot> {
@@ -533,9 +669,10 @@ pub(crate) fn decode(bytes: &[u8]) -> io::Result<Snapshot> {
     }
     match read_u32(bytes, 8) {
         LEGACY_VERSION => decode_legacy(bytes),
-        PAGE_VERSION => decode_pages(bytes, 0b11),
-        UNIQUE_VERSION => decode_pages(bytes, 0b111),
-        VERSION => decode_pages(bytes, 0b1111),
+        PAGE_VERSION => decode_pages(bytes, 0b11, false),
+        UNIQUE_VERSION => decode_pages(bytes, 0b111, false),
+        INDEX_VERSION => decode_pages(bytes, 0b1111, false),
+        VERSION => decode_pages(bytes, 0b1111, true),
         version => Err(invalid(format!(
             "unsupported DISP Data snapshot version {version}"
         ))),
@@ -795,6 +932,7 @@ mod tests {
                         indexed: false,
                     },
                 ],
+                constraints: vec![],
                 rows: vec![note.to_vec()],
             }],
         }
@@ -816,7 +954,7 @@ mod tests {
     }
 
     fn encode_legacy(snapshot: &Snapshot) -> Vec<u8> {
-        let payload = encode_payload(snapshot).unwrap();
+        let payload = encode_payload_with_constraints(snapshot, false).unwrap();
         let mut output = Vec::new();
         output.extend_from_slice(MAGIC);
         output.extend_from_slice(&LEGACY_VERSION.to_le_bytes());
@@ -838,24 +976,19 @@ mod tests {
         assert_eq!(decode(&first).unwrap(), snapshot);
         assert_eq!(decode(&encode_legacy(&snapshot)).unwrap(), snapshot);
 
-        let mut version_two = first.clone();
-        version_two[8..12].copy_from_slice(&PAGE_VERSION.to_le_bytes());
-        let header_checksum = fnv1a(&version_two[..56]);
-        version_two[56..64].copy_from_slice(&header_checksum.to_le_bytes());
+        let version_two = encode_pages_version(&snapshot, 1, PAGE_VERSION, false).unwrap();
         assert_eq!(decode(&version_two).unwrap(), snapshot);
 
-        let mut version_three = second;
-        version_three[8..12].copy_from_slice(&UNIQUE_VERSION.to_le_bytes());
-        let header_checksum = fnv1a(&version_three[..56]);
-        version_three[56..64].copy_from_slice(&header_checksum.to_le_bytes());
+        let version_three = encode_pages_version(&snapshot, 1, UNIQUE_VERSION, false).unwrap();
         assert_eq!(decode(&version_three).unwrap(), snapshot);
+
+        let version_four = encode_pages_version(&snapshot, 1, INDEX_VERSION, false).unwrap();
+        assert_eq!(decode(&version_four).unwrap(), snapshot);
 
         let mut indexed_snapshot = sample();
         indexed_snapshot.tables[0].fields[1].indexed = true;
-        let mut indexed_as_version_three = encode(&indexed_snapshot).unwrap();
-        indexed_as_version_three[8..12].copy_from_slice(&UNIQUE_VERSION.to_le_bytes());
-        let header_checksum = fnv1a(&indexed_as_version_three[..56]);
-        indexed_as_version_three[56..64].copy_from_slice(&header_checksum.to_le_bytes());
+        let indexed_as_version_three =
+            encode_pages_version(&indexed_snapshot, 1, UNIQUE_VERSION, false).unwrap();
         assert!(decode(&indexed_as_version_three).is_err());
 
         let mut corrupt = first;

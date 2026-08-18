@@ -86,7 +86,7 @@ applications fully functional.
 
 | Pass | Status | Deliverable | Completion evidence |
 |---:|---|---|---|
-| 031 | active | DISP-owned catalog, stable schema language, constraints, native indexes, migrations, and schema evolution | Required-field `unique` constraints and non-unique `index` declarations parse, type-check, persist in native v4 catalogs, preserve v1/v2/v3 readability, and execute identically in interpreter/native storage. Primary, unique, and secondary indexes are validated on durable open, rebuilt transactionally after writes, and selected for eligible equality predicates; named/composite constraints and schema migrations remain |
+| 031 | active | DISP-owned catalog, stable schema language, constraints, native indexes, migrations, and schema evolution | Field and named composite `unique`/`index` constraints parse, type-check, persist in native v5 catalogs, preserve v1-v4 readability, and execute identically in interpreter/native storage. Primary, unique, secondary, and composite indexes are validated on durable open, rebuilt transactionally after writes, and selected for eligible literal, external-value, and conjunctive equality predicates; explicit schema migrations remain |
 | 032 | planned | DISP-native typed relational algebra with joins, grouping, aggregates, subqueries, and null semantics | Query conformance and compile-time type suite executed directly by DISP |
 | 033 | planned | DISP-owned cost-based optimizer, statistics, indexes, query plans, and explain tooling | Correctness corpus and measured plan improvements without SQL translation |
 | 034 | planned | Native transaction isolation, MVCC, concurrent access, recovery, backup, and restore | Crash/fault/concurrency matrix over DISP's own WAL/page engine |

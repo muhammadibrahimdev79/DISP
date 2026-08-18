@@ -335,6 +335,66 @@ impl TypeChecker {
                 }
                 fields.insert(field.name.clone(), ty);
             }
+            if declaration.data {
+                let mut constraint_names = HashSet::new();
+                for constraint in &declaration.data_constraints {
+                    if fields.contains_key(&constraint.name)
+                        || !constraint_names.insert(constraint.name.clone())
+                    {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            format!(
+                                "duplicate data field or constraint name `{}`",
+                                constraint.name
+                            ),
+                            constraint.name_span,
+                        ));
+                    }
+                    if constraint.fields.len() < 2 {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            "a composite data constraint requires at least two fields",
+                            constraint.span,
+                        )
+                        .with_help(
+                            "use a field-level `unique` or `index` modifier for one field",
+                        ));
+                    }
+                    let mut constrained = HashSet::new();
+                    for field in &constraint.fields {
+                        if !constrained.insert(field.node.clone()) {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Type,
+                                format!(
+                                    "composite constraint `{}` repeats field `{}`",
+                                    constraint.name, field.node
+                                ),
+                                field.span,
+                            ));
+                        }
+                        let Some(ty) = fields.get(&field.node) else {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Type,
+                                format!(
+                                    "composite constraint `{}` references unknown field `{}`",
+                                    constraint.name, field.node
+                                ),
+                                field.span,
+                            ));
+                        };
+                        if matches!(constraint.kind, crate::ast::DataConstraintKind::Unique)
+                            && matches!(ty, Type::Option(_))
+                        {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Type,
+                                "a composite unique constraint cannot contain an optional field",
+                                field.span,
+                            )
+                            .with_help("use required fields so uniqueness has one unambiguous value domain"));
+                        }
+                    }
+                }
+            }
             if declaration.data && primary.is_none() {
                 return Err(Diagnostic::new(
                     DiagnosticKind::Type,

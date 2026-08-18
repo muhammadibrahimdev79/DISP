@@ -1,0 +1,27 @@
+data Membership {
+    id: int primary
+    tenant: String
+    handle: String
+    status: String
+    constraint tenant_handle: unique(tenant, handle)
+    constraint tenant_status: index(tenant, status)
+}
+
+fn demonstrate() -> Result<bool, DataError> {
+    var memberships = data memory?
+    data add Membership { id: 1, tenant: "one", handle: "ada", status: "active" } in memberships?
+    data add Membership { id: 2, tenant: "one", handle: "grace", status: "active" } in memberships?
+    data add Membership { id: 3, tenant: "two", handle: "ada", status: "active" } in memberships?
+
+    wanted_tenant = "one"
+    wanted_status = "active"
+    active = data find Membership in memberships where tenant == wanted_tenant && status == wanted_status?
+    return Ok(active.len() == 2)
+}
+
+fn main() {
+    print(match demonstrate() {
+        Ok(value) => value,
+        Err(_) => false,
+    })
+}

@@ -205,8 +205,17 @@ pub struct Struct {
     pub data: bool,
     pub c_abi: bool,
     pub fields: Vec<Field>,
+    pub data_constraints: Vec<DataConstraint>,
     pub span: Span,
     pub generic_parameters: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DataConstraint {
+    pub name: String,
+    pub unique: bool,
+    pub fields: Vec<usize>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -579,6 +588,26 @@ impl<'a> Lowering<'a> {
                         unique: field.unique,
                         indexed: field.indexed,
                         span: field.name_span,
+                    })
+                    .collect(),
+                data_constraints: declaration
+                    .data_constraints
+                    .iter()
+                    .map(|constraint| DataConstraint {
+                        name: constraint.name.clone(),
+                        unique: matches!(constraint.kind, ast::DataConstraintKind::Unique),
+                        fields: constraint
+                            .fields
+                            .iter()
+                            .map(|field| {
+                                declaration
+                                    .fields
+                                    .iter()
+                                    .position(|candidate| candidate.name == field.node)
+                                    .expect("type checking validates constrained fields")
+                            })
+                            .collect(),
+                        span: constraint.span,
                     })
                     .collect(),
                 span: declaration.span,

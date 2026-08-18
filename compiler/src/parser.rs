@@ -1,10 +1,10 @@
 use crate::ast::{
     AssignmentOperator, BinaryOperator, BindingKind, Block, Capability, CapabilityUse, ClosureBody,
-    DataOrder, EnumDeclaration, Expr, Expression, ExternalAbi, ExternalFunction, FieldDeclaration,
-    Function, FunctionSignature, GenericParameter, Implementation, ImportDeclaration, ImportItem,
-    MatchArm, ModuleDeclaration, Parameter, Pattern, Program, Spanned, Statement,
-    StructDeclaration, StructFieldValue, StructPatternField, TraitDeclaration, TypeName,
-    TypeQualifier, UnaryOperator, VariantDeclaration,
+    DataConstraintDeclaration, DataConstraintKind, DataOrder, EnumDeclaration, Expr, Expression,
+    ExternalAbi, ExternalFunction, FieldDeclaration, Function, FunctionSignature, GenericParameter,
+    Implementation, ImportDeclaration, ImportItem, MatchArm, ModuleDeclaration, Parameter, Pattern,
+    Program, Spanned, Statement, StructDeclaration, StructFieldValue, StructPatternField,
+    TraitDeclaration, TypeName, TypeQualifier, UnaryOperator, VariantDeclaration,
 };
 use crate::diagnostics::{Diagnostic, DiagnosticKind, Position, Span};
 use crate::lexer::{Token, TokenKind};
@@ -253,7 +253,12 @@ impl Parser {
             },
         )?;
         let mut fields = Vec::new();
+        let mut data_constraints = Vec::new();
         while !self.check(&TokenKind::RightBrace) && !self.check(&TokenKind::Eof) {
+            if data && self.check_identifier("constraint") && !self.check_next(&TokenKind::Colon) {
+                data_constraints.push(self.parse_data_constraint()?);
+                continue;
+            }
             let (field_name, field_span) = self.expect_identifier("expected field name")?;
             self.expect(TokenKind::Colon, "expected `:` after field name")?;
             let ty = self.parse_type_name()?;
@@ -319,6 +324,48 @@ impl Parser {
             data,
             c_abi: false,
             generics,
+            fields,
+            data_constraints,
+            span: start.through(end),
+        })
+    }
+
+    fn parse_data_constraint(&mut self) -> Result<DataConstraintDeclaration, Diagnostic> {
+        let start = self.advance().span;
+        let (name, name_span) = self.expect_identifier("expected constraint name")?;
+        self.expect(TokenKind::Colon, "expected `:` after constraint name")?;
+        let (kind, kind_span) = self.expect_identifier("expected `unique` or `index`")?;
+        let kind = match kind.as_str() {
+            "unique" => DataConstraintKind::Unique,
+            "index" => DataConstraintKind::Index,
+            _ => {
+                return Err(Diagnostic::new(
+                    DiagnosticKind::Parse,
+                    "expected `unique` or `index` constraint kind",
+                    kind_span,
+                ));
+            }
+        };
+        self.expect(TokenKind::LeftParen, "expected `(` after constraint kind")?;
+        let mut fields = Vec::new();
+        loop {
+            let (field, span) = self.expect_identifier("expected constrained field name")?;
+            fields.push(Spanned { node: field, span });
+            if !self.match_token(&TokenKind::Comma) {
+                break;
+            }
+        }
+        let end = self
+            .expect(
+                TokenKind::RightParen,
+                "expected `)` after constrained fields",
+            )?
+            .span;
+        self.match_token(&TokenKind::Comma);
+        Ok(DataConstraintDeclaration {
+            name,
+            name_span,
+            kind,
             fields,
             span: start.through(end),
         })
@@ -2052,6 +2099,15 @@ impl Parser {
 
     fn check(&self, expected: &TokenKind) -> bool {
         same_variant(&self.peek().kind, expected)
+    }
+
+    fn check_next(&self, expected: &TokenKind) -> bool {
+        let index = (self.current + 1).min(self.tokens.len().saturating_sub(1));
+        same_variant(&self.tokens[index].kind, expected)
+    }
+
+    fn check_identifier(&self, expected: &str) -> bool {
+        matches!(&self.peek().kind, TokenKind::Identifier(value) if value == expected)
     }
 
     fn advance(&mut self) -> Token {

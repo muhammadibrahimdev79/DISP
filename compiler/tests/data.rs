@@ -85,7 +85,8 @@ fn native_output(name: &str, source: &str) -> Option<String> {
     };
     assert!(
         output.status.success(),
-        "{}",
+        "native process status {:?}: {}",
+        output.status.code(),
         String::from_utf8_lossy(&output.stderr)
     );
     Some(
@@ -224,7 +225,7 @@ fn main() {{ print(match seed() {{ Ok(value) => value, Err(error) => 0 }}) }}
 
     let bytes = fs::read(&path).unwrap();
     assert_eq!(&bytes[..8], b"DISPDB\x1a\n");
-    assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 4);
+    assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 5);
     assert_eq!(bytes.len() % 4096, 0);
     assert!(!bytes.starts_with(b"SQLite format 3"));
 
@@ -271,7 +272,7 @@ fn main() {{ match migrate() {{ Ok(value) => print(value), Err(error) => print(e
     let interpreted_bytes = fs::read(&interpreted).unwrap();
     assert_eq!(
         u32::from_le_bytes(interpreted_bytes[8..12].try_into().unwrap()),
-        4
+        5
     );
     assert_eq!(interpreted_bytes.len() % 4096, 0);
 
@@ -672,7 +673,7 @@ fn main() {{
     );
     assert_eq!(run_source(&source).unwrap(), ["true"]);
     let bytes = fs::read(&path).unwrap();
-    assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 4);
+    assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 5);
     let _ = fs::remove_file(&path);
     let _ = fs::remove_file(format!("{path}.lock"));
     if let Some(output) = native_output("secondary-index", &source) {
@@ -708,4 +709,152 @@ fn main() {{
         (duplicate.span.start.line, duplicate.span.start.column),
         (1, 53)
     );
+}
+
+#[test]
+fn named_composite_constraints_are_transactional_durable_and_indexed() {
+    let path = data_path("composite-constraints");
+    let path = source_path(&path);
+    let source = format!(
+        r#"
+data Membership {{
+    id: int primary
+    tenant: String
+    handle: String
+    status: String
+    region: Option<String>
+    constraint tenant_handle: unique(tenant, handle)
+    constraint tenant_status: index(tenant, status)
+    constraint tenant_region: index(tenant, region)
+}}
+
+fn seed() -> Result<bool, DataError> {{
+    var store = data open Path("{path}")?
+    data add Membership {{ id: 1, tenant: "one", handle: "ada", status: "active", region: None }} in store?
+    data add Membership {{ id: 2, tenant: "one", handle: "grace", status: "active", region: None }} in store?
+    data add Membership {{ id: 3, tenant: "two", handle: "ada", status: "active", region: Some("eu") }} in store?
+    duplicate = data add Membership {{ id: 4, tenant: "one", handle: "ada", status: "idle", region: Some("us") }} in store
+    collision = data save Membership {{ id: 3, tenant: "one", handle: "ada", status: "active", region: Some("eu") }} in store
+    wanted_tenant = "one"
+    wanted_status = "active"
+    active = data find Membership in store where tenant == wanted_tenant && status == wanted_status?
+    var wanted_region: Option<String> = None
+    local = data find Membership in store where tenant == wanted_tenant && region == wanted_region?
+    data remove Membership in store where id == 1?
+    data save Membership {{ id: 3, tenant: "one", handle: "ada", status: "active", region: Some("eu") }} in store?
+    wanted_handle = "ada"
+    moved = data find Membership in store where tenant == wanted_tenant && handle == wanted_handle?
+    return Ok(match duplicate {{ Err(_) => true, Ok(_) => false }}
+        && match collision {{ Err(_) => true, Ok(_) => false }}
+        && active.len() == 2 && local.len() == 2 && moved.len() == 1)
+}}
+
+fn reopen() -> Result<bool, DataError> {{
+    var store = data open Path("{path}")?
+    wanted_tenant = "one"
+    wanted_status = "active"
+    rows = data find Membership in store where tenant == wanted_tenant && status == wanted_status?
+    return Ok(rows.len() == 2)
+}}
+
+fn main() {{
+    seeded = match seed() {{ Ok(value) => value, Err(_) => false }}
+    reopened = match reopen() {{ Ok(value) => value, Err(_) => false }}
+    print(seeded && reopened)
+}}
+"#
+    );
+    let (hir, mir) = lower_source(&source).unwrap();
+    let schema = hir
+        .structs
+        .iter()
+        .find(|schema| schema.name == "Membership")
+        .unwrap();
+    assert_eq!(schema.data_constraints.len(), 3);
+    assert!(schema.data_constraints[0].unique);
+    assert_eq!(schema.data_constraints[0].fields, [1, 2]);
+    assert_eq!(mir.structs[0].data_constraints.len(), 3);
+    assert_eq!(run_source(&source).unwrap(), ["true"]);
+    assert_eq!(
+        u32::from_le_bytes(fs::read(&path).unwrap()[8..12].try_into().unwrap()),
+        5
+    );
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(format!("{path}.lock"));
+    if let Some(output) = native_output("composite-constraints", &source) {
+        assert_eq!(output, "true\n");
+    }
+
+    let plan_source = std::env::temp_dir().join(format!(
+        "disp-data-composite-plan-{}.disp",
+        std::process::id()
+    ));
+    fs::write(&plan_source, &source).unwrap();
+    let artifacts = backend::build(
+        &hir,
+        &mir,
+        &plan_source,
+        BuildOptions {
+            emit_c: true,
+            ..BuildOptions::default()
+        },
+    )
+    .unwrap();
+    let generated = fs::read_to_string(artifacts.backend_ir.unwrap()).unwrap();
+    assert!(
+        generated
+            .matches("disp_data_native_composite_lookup(")
+            .count()
+            >= 4
+    );
+
+    for (source, message, column) in [
+        (
+            "data A { id: int primary x: String constraint c: index(x) } fn main() {}",
+            "at least two fields",
+            36,
+        ),
+        (
+            "data A { id: int primary x: String constraint c: index(x, missing) } fn main() {}",
+            "unknown field `missing`",
+            59,
+        ),
+        (
+            "data A { id: int primary x: String constraint c: index(x, x) } fn main() {}",
+            "repeats field `x`",
+            59,
+        ),
+        (
+            "data A { id: int primary x: Option<String> y: String constraint c: unique(x, y) } fn main() {}",
+            "cannot contain an optional field",
+            75,
+        ),
+    ] {
+        let error = check_source(source).unwrap_err();
+        assert!(error.message.contains(message), "{error}");
+        assert_eq!(
+            (error.span.start.line, error.span.start.column),
+            (1, column)
+        );
+    }
+
+    lower_source("data A { id: int primary constraint: String } fn main() {}").unwrap();
+
+    for (source, message) in [
+        (
+            "data A { id: int primary x: String constraint c: hash(id, x) } fn main() {}",
+            "expected `unique` or `index`",
+        ),
+        (
+            "data A { id: int primary x: String constraint x: index(id, x) } fn main() {}",
+            "duplicate data field or constraint name `x`",
+        ),
+        (
+            "data A { id: int primary x: String constraint c: index(id, x) constraint c: unique(id, x) } fn main() {}",
+            "duplicate data field or constraint name `c`",
+        ),
+    ] {
+        let error = check_source(source).unwrap_err();
+        assert!(error.message.contains(message), "{error}");
+    }
 }

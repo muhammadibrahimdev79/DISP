@@ -53,6 +53,7 @@ pub struct StructDeclaration {
     pub c_abi: bool,
     pub generics: Vec<GenericParameter>,
     pub fields: Vec<FieldDeclaration>,
+    pub data_constraints: Vec<DataConstraintDeclaration>,
     pub span: Span,
 }
 
@@ -64,6 +65,21 @@ pub struct FieldDeclaration {
     pub primary: bool,
     pub unique: bool,
     pub indexed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataConstraintKind {
+    Unique,
+    Index,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DataConstraintDeclaration {
+    pub name: String,
+    pub name_span: Span,
+    pub kind: DataConstraintKind,
+    pub fields: Vec<Spanned<String>>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]

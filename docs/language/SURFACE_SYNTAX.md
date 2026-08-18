@@ -592,6 +592,8 @@ data User {
     group: String index
     active: bool
     note: Option<String>
+    constraint user_name: unique(group, name)
+    constraint active_group: index(group, active)
 }
 ```
 
@@ -626,6 +628,10 @@ operation. Optional unique fields are rejected until their absent-value semantic
 Fields marked `index` maintain non-unique equality indexes, so repeated values are valid and matching
 queries return every row. These indexes share the same transactional mutation, validation, and
 durable-reopen guarantees as primary and unique indexes.
+Multi-field rules remain compact: `constraint tenant_handle: unique(tenant, handle)` rejects only a
+repeated pair, while `constraint tenant_status: index(tenant, status)` permits duplicates and speeds
+conjunctive equality queries. Named constraints are type-checked, persisted, and maintained directly
+by DISP in interpreter and native execution.
 `DataStore` and `Database` are distinct nominal types, so a data store cannot invoke raw
 SQL methods.
 

@@ -5144,30 +5144,69 @@ fn data_parameters(expression: &hir::DataExpr, output: &mut Vec<usize>) {
     }
 }
 
+enum DataIndexLookup {
+    Field {
+        field: usize,
+        parameter: usize,
+    },
+    Composite {
+        constraint: usize,
+        parameters: Vec<usize>,
+    },
+}
+
+fn data_equality_parameters(expression: &hir::DataExpr, output: &mut HashMap<usize, usize>) {
+    let hir::DataExprKind::Binary(operator, left, right) = &expression.kind else {
+        return;
+    };
+    if matches!(operator, ast::BinaryOperator::And) {
+        data_equality_parameters(left, output);
+        data_equality_parameters(right, output);
+    } else if matches!(operator, ast::BinaryOperator::Equal) {
+        match (&left.kind, &right.kind) {
+            (hir::DataExprKind::Field(field), hir::DataExprKind::Parameter(parameter))
+            | (hir::DataExprKind::Parameter(parameter), hir::DataExprKind::Field(field)) => {
+                output.entry(*field).or_insert(*parameter);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn data_index_lookup(
     expression: &hir::DataExpr,
     schema: &hir::Struct,
     parameters: &[usize],
-) -> Option<(usize, usize)> {
-    let hir::DataExprKind::Binary(ast::BinaryOperator::Equal, left, right) = &expression.kind
-    else {
-        return None;
+) -> Option<DataIndexLookup> {
+    let mut equalities = HashMap::new();
+    data_equality_parameters(expression, &mut equalities);
+    let parameter_slot = |parameter: &usize| {
+        parameters
+            .iter()
+            .position(|candidate| candidate == parameter)
     };
-    let (field, parameter) = match (&left.kind, &right.kind) {
-        (hir::DataExprKind::Field(field), hir::DataExprKind::Parameter(parameter))
-        | (hir::DataExprKind::Parameter(parameter), hir::DataExprKind::Field(field)) => {
-            (*field, *parameter)
+    for (constraint, declaration) in schema.data_constraints.iter().enumerate() {
+        let slots = declaration
+            .fields
+            .iter()
+            .map(|field| equalities.get(field).and_then(parameter_slot))
+            .collect::<Option<Vec<_>>>();
+        if let Some(parameters) = slots {
+            return Some(DataIndexLookup::Composite {
+                constraint,
+                parameters,
+            });
         }
-        _ => return None,
-    };
-    let field = schema.fields.get(field)?;
-    if !field.primary && !field.unique && !field.indexed {
-        return None;
     }
-    parameters
-        .iter()
-        .position(|candidate| *candidate == parameter)
-        .map(|slot| (field.index, slot))
+    schema.fields.iter().find_map(|declaration| {
+        let parameter = equalities.get(&declaration.index)?;
+        (declaration.primary || declaration.unique || declaration.indexed).then(|| {
+            parameter_slot(parameter).map(|parameter| DataIndexLookup::Field {
+                field: declaration.index,
+                parameter,
+            })
+        })?
+    })
 }
 
 fn data_constant_native(constant: &hir::Constant) -> String {
@@ -5369,15 +5408,43 @@ fn data_schema_guard(schema: &hir::Struct, database: &str) -> String {
         .map(|field| field.indexed.to_string())
         .collect::<Vec<_>>()
         .join(",");
+    let constraint_names = schema
+        .data_constraints
+        .iter()
+        .map(|constraint| format!("\"{}\"", escape(&constraint.name)))
+        .chain(schema.data_constraints.is_empty().then_some("NULL".into()))
+        .collect::<Vec<_>>()
+        .join(",");
+    let constraint_unique = schema
+        .data_constraints
+        .iter()
+        .map(|constraint| constraint.unique.to_string())
+        .chain(schema.data_constraints.is_empty().then_some("false".into()))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut offset = 0;
+    let mut constraint_offsets = vec!["0".into()];
+    let mut constraint_fields = Vec::new();
+    for constraint in &schema.data_constraints {
+        offset += constraint.fields.len();
+        constraint_offsets.push(offset.to_string());
+        constraint_fields.extend(constraint.fields.iter().map(ToString::to_string));
+    }
+    if constraint_fields.is_empty() {
+        constraint_fields.push("0".into());
+    }
+    let constraint_offsets = constraint_offsets.join(",");
+    let constraint_fields = constraint_fields.join(",");
     format!(
-        "disp_data_ensure_schema(({database})->state,\"{}\",{},\"{}\",{},\"{}\",{},(const char*[]){{{names}}},(const char*[]){{{types}}},(bool[]){{{required}}},(bool[]){{{primary}}},(bool[]){{{unique}}},(bool[]){{{indexed}}},{},&_error)",
+        "disp_data_ensure_schema(({database})->state,\"{}\",{},\"{}\",{},\"{}\",{},(const char*[]){{{names}}},(const char*[]){{{types}}},(bool[]){{{required}}},(bool[]){{{primary}}},(bool[]){{{unique}}},(bool[]){{{indexed}}},{},(const char*[]){{{constraint_names}}},(bool[]){{{constraint_unique}}},(size_t[]){{{constraint_offsets}}},(size_t[]){{{constraint_fields}}},{},&_error)",
         escape(&schema.name),
         schema.name.len(),
         escape(&create),
         create.len(),
         escape(&inspect),
         inspect.len(),
-        schema.fields.len()
+        schema.fields.len(),
+        schema.data_constraints.len()
     )
 }
 
@@ -5605,12 +5672,28 @@ fn data_call(
                             schema.name.len()
                         )
                     },
-                    |(field, parameter)| {
-                        format!(
+                    |lookup| match lookup {
+                        DataIndexLookup::Field { field, parameter } => format!(
                             "disp_data_native_lookup(({database})->state,\"{}\",{},{field},&_params[{parameter}],&_rows,&_rows_len,&_rows_cap,&_error)",
                             escape(&schema.name),
                             schema.name.len()
-                        )
+                        ),
+                        DataIndexLookup::Composite {
+                            constraint,
+                            parameters,
+                        } => {
+                            let keys = parameters
+                                .iter()
+                                .map(|parameter| format!("_params[{parameter}]"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            format!(
+                                "disp_data_native_composite_lookup(({database})->state,\"{}\",{},{constraint},(disp_native_json[]){{{keys}}},{},&_rows,&_rows_len,&_rows_cap,&_error)",
+                                escape(&schema.name),
+                                schema.name.len(),
+                                parameters.len()
+                            )
+                        }
                     },
                 );
             format!(

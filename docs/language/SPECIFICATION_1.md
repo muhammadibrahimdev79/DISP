@@ -108,9 +108,12 @@ import-item   = IDENT ("as" IDENT)? ;
 generic-list  = "<" generic ("," generic)* ">" ;
 generic       = IDENT (":" type ("+" type)*)? ;
 struct-decl   = "struct" IDENT generic-list? "{" field* "}" ;
-data-decl     = "data" IDENT generic-list? "{" data-field* "}" ;
+data-decl     = "data" IDENT generic-list? "{" data-item* "}" ;
+data-item     = data-field | data-constraint ;
 field         = IDENT ":" type ","? ;
 data-field    = IDENT ":" type (("primary" | "unique" | "index")*) ","? ;
+data-constraint = "constraint" IDENT ":" ("unique" | "index")
+                  "(" IDENT "," IDENT ("," IDENT)* ")" ","? ;
 enum-decl     = "enum" IDENT generic-list? "{" variant* "}" ;
 variant       = IDENT ("(" type ("," type)* ")")? ","? ;
 
@@ -501,6 +504,14 @@ A field may be marked `index` to maintain a non-unique secondary equality index.
 including absent optional values, are permitted. Equality predicates against a literal or external
 value may use the index; other predicates safely fall back to scanning. Indexes are rebuilt and validated as
 part of every mutation and durable open, so they cannot expose rows that were removed or replaced.
+
+Named composite constraints use `constraint name: unique(field, field, ...)` or
+`constraint name: index(field, field, ...)`. Names are distinct within the schema, every referenced
+field must exist and appear once, and at least two fields are required. Composite `unique`
+constraints require non-optional fields; composite `index` constraints permit optional fields and
+duplicate keys. A conjunction providing equality values for every constrained field may use the
+composite index automatically. Constraint enforcement, index replacement, and durable commits form
+one transaction; failure leaves both rows and indexes unchanged.
 
 The language does not translate these plans into SQL. Interpreter and native execution use the
 same DISP-owned logical plans and durable format. The separate `Database` compatibility type does

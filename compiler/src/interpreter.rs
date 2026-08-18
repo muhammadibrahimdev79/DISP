@@ -3653,12 +3653,21 @@ struct NativeDataField {
     indexed: bool,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct NativeDataConstraint {
+    name: String,
+    unique: bool,
+    fields: Vec<usize>,
+}
+
 #[derive(Clone)]
 struct NativeDataTable {
     fields: Vec<NativeDataField>,
     primary: usize,
     rows: Vec<Value>,
     indexes: Vec<HashMap<String, Vec<usize>>>,
+    constraints: Vec<NativeDataConstraint>,
+    composite_indexes: Vec<HashMap<String, Vec<usize>>>,
 }
 
 #[derive(Clone, Default)]
@@ -4312,6 +4321,28 @@ fn native_data_fields(schema: &crate::ast::StructDeclaration) -> Vec<NativeDataF
         .collect()
 }
 
+fn native_data_constraints(schema: &crate::ast::StructDeclaration) -> Vec<NativeDataConstraint> {
+    schema
+        .data_constraints
+        .iter()
+        .map(|constraint| NativeDataConstraint {
+            name: constraint.name.clone(),
+            unique: matches!(constraint.kind, crate::ast::DataConstraintKind::Unique),
+            fields: constraint
+                .fields
+                .iter()
+                .map(|field| {
+                    schema
+                        .fields
+                        .iter()
+                        .position(|candidate| candidate.name == field.node)
+                        .expect("type checking validates composite constraint fields")
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 fn native_data_snapshot(
     program: &Program,
     store: &NativeDataStore,
@@ -4335,6 +4366,19 @@ fn native_data_snapshot(
                     primary: field.primary,
                     unique: field.unique,
                     indexed: field.indexed,
+                })
+                .collect(),
+            constraints: table
+                .constraints
+                .iter()
+                .map(|constraint| data_store::Constraint {
+                    name: constraint.name.clone(),
+                    unique: constraint.unique,
+                    fields: constraint
+                        .fields
+                        .iter()
+                        .map(|field| table.fields[*field].name.clone())
+                        .collect(),
                 })
                 .collect(),
             rows,
@@ -4403,16 +4447,74 @@ fn native_data_indexes(
     Ok(indexes)
 }
 
+fn native_data_composite_key(
+    program: &Program,
+    fields: &[NativeDataField],
+    constraint: &NativeDataConstraint,
+    values: &HashMap<String, Value>,
+) -> io::Result<String> {
+    let mut key = String::new();
+    for field in &constraint.fields {
+        let name = &fields[*field].name;
+        let value = values
+            .get(name)
+            .ok_or_else(|| io::Error::other(format!("stored row is missing `{name}`")))?;
+        let encoded = encode_json_value(program, value)?.text;
+        key.push_str(&encoded.len().to_string());
+        key.push(':');
+        key.push_str(&encoded);
+    }
+    Ok(key)
+}
+
+fn native_data_composite_indexes(
+    program: &Program,
+    fields: &[NativeDataField],
+    constraints: &[NativeDataConstraint],
+    rows: &[Value],
+) -> io::Result<Vec<HashMap<String, Vec<usize>>>> {
+    let mut indexes: Vec<HashMap<String, Vec<usize>>> = vec![HashMap::new(); constraints.len()];
+    for (row_index, row) in rows.iter().enumerate() {
+        let Value::Struct { fields: values, .. } = row else {
+            return Err(io::Error::other(
+                "stored row does not match its DISP Data schema",
+            ));
+        };
+        for (index, constraint) in constraints.iter().enumerate() {
+            let key = native_data_composite_key(program, fields, constraint, values)?;
+            let matches = indexes[index].entry(key).or_default();
+            if constraint.unique && !matches.is_empty() {
+                return Err(io::Error::other(format!(
+                    "stored table violates composite constraint `{}`",
+                    constraint.name
+                )));
+            }
+            matches.push(row_index);
+        }
+    }
+    Ok(indexes)
+}
+
+fn native_data_rebuild_indexes(program: &Program, table: &mut NativeDataTable) -> io::Result<()> {
+    let indexes = native_data_indexes(program, &table.fields, &table.rows)?;
+    let composite_indexes =
+        native_data_composite_indexes(program, &table.fields, &table.constraints, &table.rows)?;
+    table.indexes = indexes;
+    table.composite_indexes = composite_indexes;
+    Ok(())
+}
+
 fn data_ensure_schema(
     program: &Program,
     database: &RuntimeDatabase,
     schema: &crate::ast::StructDeclaration,
 ) -> io::Result<()> {
     let fields = native_data_fields(schema);
+    let constraints = native_data_constraints(schema);
     if database
         .with_native(|store| {
             if let Some(table) = store.tables.get(&schema.name) {
-                if table.fields != fields {
+                if table.fields != fields || table.constraints != constraints {
                     return Err(io::Error::other(format!(
                         "stored `{}` layout does not match its DISP Data schema",
                         schema.name
@@ -4433,7 +4535,25 @@ fn data_ensure_schema(
                         indexed: field.indexed,
                     })
                     .collect::<Vec<_>>();
-                if stored_fields != fields {
+                let stored_constraints = persisted
+                    .constraints
+                    .iter()
+                    .map(|constraint| NativeDataConstraint {
+                        name: constraint.name.clone(),
+                        unique: constraint.unique,
+                        fields: constraint
+                            .fields
+                            .iter()
+                            .map(|field| {
+                                stored_fields
+                                    .iter()
+                                    .position(|candidate| candidate.name == *field)
+                                    .expect("durable decoder validates constrained fields")
+                            })
+                            .collect(),
+                    })
+                    .collect::<Vec<_>>();
+                if stored_fields != fields || stored_constraints != constraints {
                     return Err(io::Error::other(format!(
                         "stored `{}` layout does not match its DISP Data schema",
                         schema.name
@@ -4454,6 +4574,8 @@ fn data_ensure_schema(
                     .position(|field| field.primary)
                     .expect("validated data schema has one primary field");
                 let indexes = native_data_indexes(program, &fields, &rows)?;
+                let composite_indexes =
+                    native_data_composite_indexes(program, &fields, &constraints, &rows)?;
                 store.pending.remove(&schema.name);
                 store.tables.insert(
                     schema.name.clone(),
@@ -4462,6 +4584,8 @@ fn data_ensure_schema(
                         primary,
                         rows,
                         indexes,
+                        constraints,
+                        composite_indexes,
                     },
                 );
                 return Ok(());
@@ -4471,6 +4595,8 @@ fn data_ensure_schema(
                 .position(|field| field.primary)
                 .expect("validated data schema has one primary field");
             let indexes = native_data_indexes(program, &fields, &[])?;
+            let composite_indexes =
+                native_data_composite_indexes(program, &fields, &constraints, &[])?;
             mutate_native_data(program, store, |store| {
                 store.tables.insert(
                     schema.name.clone(),
@@ -4479,6 +4605,8 @@ fn data_ensure_schema(
                         primary,
                         rows: Vec::new(),
                         indexes,
+                        constraints,
+                        composite_indexes,
                     },
                 );
                 Ok(())
@@ -4571,6 +4699,25 @@ fn native_data_write(
                     )));
                 }
             }
+            for (constraint_index, constraint) in table
+                .constraints
+                .iter()
+                .enumerate()
+                .filter(|(_, constraint)| constraint.unique)
+            {
+                let candidate =
+                    native_data_composite_key(program, &table.fields, constraint, fields)?;
+                if table.composite_indexes[constraint_index]
+                    .get(&candidate)
+                    .and_then(|rows| rows.first())
+                    .is_some_and(|index| Some(*index) != existing)
+                {
+                    return Err(io::Error::other(format!(
+                        "duplicate value for composite constraint `{}.{}`",
+                        schema.name, constraint.name
+                    )));
+                }
+            }
             if let Some(index) = existing {
                 if !replace {
                     return Err(io::Error::other(format!(
@@ -4579,14 +4726,14 @@ fn native_data_write(
                     )));
                 }
                 table.rows[index] = value;
-                table.indexes = native_data_indexes(program, &table.fields, &table.rows)?;
+                native_data_rebuild_indexes(program, table)?;
                 return Ok(1);
             }
             if table.rows.len() >= DATABASE_ROW_LIMIT {
                 return Err(io::Error::other("data table exceeds the 100000-row limit"));
             }
             table.rows.push(value);
-            table.indexes = native_data_indexes(program, &table.fields, &table.rows)?;
+            native_data_rebuild_indexes(program, table)?;
             Ok(1)
         })
     })
@@ -4605,22 +4752,8 @@ fn native_data_rows(
     })
 }
 
-fn native_data_indexed_rows(
-    program: &Program,
-    database: &RuntimeDatabase,
-    schema: &crate::ast::StructDeclaration,
-    predicate: &Expr,
-    parameters: &HashMap<Span, Value>,
-) -> io::Result<Option<Vec<Value>>> {
-    let Expression::Binary {
-        left,
-        operator: BinaryOperator::Equal,
-        right,
-    } = &predicate.node
-    else {
-        return native_data_rows(database, schema);
-    };
-    let indexed_value = |expression: &Expr| match &expression.node {
+fn native_data_index_value(expression: &Expr, parameters: &HashMap<Span, Value>) -> Option<Value> {
+    match &expression.node {
         Expression::Integer(value) if *value <= i64::MAX as u128 => Some(Value::Int(*value as i64)),
         Expression::Integer(value) => Some(Value::Unsigned(*value, 128)),
         Expression::Float(value) => Some(Value::Float(*value)),
@@ -4628,22 +4761,94 @@ fn native_data_indexed_rows(
         Expression::Character(value) => Some(Value::Char(*value)),
         Expression::Bool(value) => Some(Value::Bool(*value)),
         _ => parameters.get(&expression.span).cloned(),
+    }
+}
+
+fn native_data_equality_values(
+    schema: &crate::ast::StructDeclaration,
+    expression: &Expr,
+    parameters: &HashMap<Span, Value>,
+    output: &mut HashMap<String, Value>,
+) {
+    let Expression::Binary {
+        left,
+        operator,
+        right,
+    } = &expression.node
+    else {
+        return;
     };
-    let indexed = |field_name: &str, parameter: &Expr| {
-        let field = schema.fields.iter().enumerate().find(|(_, field)| {
-            field.name == field_name && (field.primary || field.unique || field.indexed)
+    if matches!(operator, BinaryOperator::And) {
+        native_data_equality_values(schema, left, parameters, output);
+        native_data_equality_values(schema, right, parameters, output);
+        return;
+    }
+    if !matches!(operator, BinaryOperator::Equal) {
+        return;
+    }
+    let field_value = |field: &Expr, value: &Expr| {
+        let Expression::Identifier(name) = &field.node else {
+            return None;
+        };
+        if parameters.contains_key(&field.span)
+            || !schema
+                .fields
+                .iter()
+                .any(|candidate| candidate.name == *name)
+        {
+            return None;
+        }
+        native_data_index_value(value, parameters).map(|value| (name.clone(), value))
+    };
+    if let Some((field, value)) = field_value(left, right).or_else(|| field_value(right, left)) {
+        output.entry(field).or_insert(value);
+    }
+}
+
+fn native_data_indexed_rows(
+    program: &Program,
+    database: &RuntimeDatabase,
+    schema: &crate::ast::StructDeclaration,
+    predicate: &Expr,
+    parameters: &HashMap<Span, Value>,
+) -> io::Result<Option<Vec<Value>>> {
+    let mut equality_values = HashMap::new();
+    native_data_equality_values(schema, predicate, parameters, &mut equality_values);
+
+    if let Some((constraint_index, _)) =
+        schema
+            .data_constraints
+            .iter()
+            .enumerate()
+            .find(|(_, constraint)| {
+                constraint
+                    .fields
+                    .iter()
+                    .all(|field| equality_values.contains_key(&field.node))
+            })
+    {
+        return database.with_native(|store| {
+            let table = store
+                .tables
+                .get(&schema.name)
+                .ok_or_else(|| io::Error::other("DISP Data schema was not registered"))?;
+            let constraint = &table.constraints[constraint_index];
+            let key =
+                native_data_composite_key(program, &table.fields, constraint, &equality_values)?;
+            Ok(table.composite_indexes[constraint_index]
+                .get(&key)
+                .map(|rows| rows.iter().map(|row| table.rows[*row].clone()).collect())
+                .unwrap_or_default())
         });
-        field.and_then(|(index, _)| indexed_value(parameter).map(|value| (index, value)))
-    };
-    let lookup = match (&left.node, &right.node) {
-        (Expression::Identifier(field), _) => indexed(field, right),
-        (_, Expression::Identifier(field)) => indexed(field, left),
-        _ => None,
-    };
-    let Some((field, value)) = lookup else {
+    }
+
+    let Some((field, value)) = schema.fields.iter().enumerate().find_map(|(index, field)| {
+        (field.primary || field.unique || field.indexed)
+            .then(|| equality_values.get(&field.name).map(|value| (index, value)))?
+    }) else {
         return native_data_rows(database, schema);
     };
-    let key = encode_json_value(program, &value)?.text;
+    let key = encode_json_value(program, value)?.text;
     database.with_native(|store| {
         let table = store
             .tables
@@ -4655,7 +4860,6 @@ fn native_data_indexed_rows(
             .unwrap_or_default())
     })
 }
-
 fn native_data_replace_rows(
     program: &Program,
     database: &RuntimeDatabase,
@@ -4669,7 +4873,7 @@ fn native_data_replace_rows(
                 .get_mut(&schema.name)
                 .ok_or_else(|| io::Error::other("DISP Data schema was not registered"))?;
             table.rows = rows;
-            table.indexes = native_data_indexes(program, &table.fields, &table.rows)?;
+            native_data_rebuild_indexes(program, table)?;
             Ok(())
         })
     })
