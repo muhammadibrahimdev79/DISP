@@ -5369,6 +5369,39 @@ fn data_decode_field(field: &hir::Field, row: &str, target: &str) -> String {
     )
 }
 
+fn data_migration_json(constant: &hir::Constant) -> String {
+    fn quoted(value: &str) -> String {
+        let mut output = String::from("\"");
+        for character in value.chars() {
+            match character {
+                '\"' => output.push_str("\\\""),
+                '\\' => output.push_str("\\\\"),
+                '\u{08}' => output.push_str("\\b"),
+                '\u{0c}' => output.push_str("\\f"),
+                '\n' => output.push_str("\\n"),
+                '\r' => output.push_str("\\r"),
+                '\t' => output.push_str("\\t"),
+                character if character < '\u{20}' => {
+                    write!(output, "\\u{:04x}", character as u32).unwrap();
+                }
+                character => output.push(character),
+            }
+        }
+        output.push('\"');
+        output
+    }
+
+    match constant {
+        hir::Constant::Signed(value, _) => value.to_string(),
+        hir::Constant::Unsigned(value, _) => value.to_string(),
+        hir::Constant::Float(value, _) => format!("{value:?}"),
+        hir::Constant::Bool(value) => value.to_string(),
+        hir::Constant::Char(value) => quoted(&value.to_string()),
+        hir::Constant::String(value) => quoted(value),
+        hir::Constant::Unit => unreachable!("migration defaults cannot be unit"),
+    }
+}
+
 fn data_schema_guard(schema: &hir::Struct, database: &str) -> String {
     let create = data_create_sql(schema);
     let inspect = format!("PRAGMA table_info({})", data_identifier(&schema.name));
@@ -5408,6 +5441,40 @@ fn data_schema_guard(schema: &hir::Struct, database: &str) -> String {
         .map(|field| field.indexed.to_string())
         .collect::<Vec<_>>()
         .join(",");
+    let migration_from = schema
+        .fields
+        .iter()
+        .map(|field| {
+            field
+                .migration_from
+                .as_ref()
+                .map_or_else(|| "NULL".into(), |name| format!("\"{}\"", escape(name)))
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let migration_defaults = schema
+        .fields
+        .iter()
+        .map(|field| {
+            field.migration_default.as_ref().map_or_else(
+                || "NULL".into(),
+                |value| format!("\"{}\"", escape(&data_migration_json(value))),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let migration_default_lens = schema
+        .fields
+        .iter()
+        .map(|field| {
+            field
+                .migration_default
+                .as_ref()
+                .map_or(0, |value| data_migration_json(value).len())
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     let constraint_names = schema
         .data_constraints
         .iter()
@@ -5436,7 +5503,7 @@ fn data_schema_guard(schema: &hir::Struct, database: &str) -> String {
     let constraint_offsets = constraint_offsets.join(",");
     let constraint_fields = constraint_fields.join(",");
     format!(
-        "disp_data_ensure_schema(({database})->state,\"{}\",{},\"{}\",{},\"{}\",{},(const char*[]){{{names}}},(const char*[]){{{types}}},(bool[]){{{required}}},(bool[]){{{primary}}},(bool[]){{{unique}}},(bool[]){{{indexed}}},{},(const char*[]){{{constraint_names}}},(bool[]){{{constraint_unique}}},(size_t[]){{{constraint_offsets}}},(size_t[]){{{constraint_fields}}},{},&_error)",
+        "disp_data_ensure_schema(({database})->state,\"{}\",{},\"{}\",{},\"{}\",{},(const char*[]){{{names}}},(const char*[]){{{types}}},(bool[]){{{required}}},(bool[]){{{primary}}},(bool[]){{{unique}}},(bool[]){{{indexed}}},(const char*[]){{{migration_from}}},(const char*[]){{{migration_defaults}}},(size_t[]){{{migration_default_lens}}},{},(const char*[]){{{constraint_names}}},(bool[]){{{constraint_unique}}},(size_t[]){{{constraint_offsets}}},(size_t[]){{{constraint_fields}}},{},&_error)",
         escape(&schema.name),
         schema.name.len(),
         escape(&create),

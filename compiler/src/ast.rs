@@ -65,6 +65,8 @@ pub struct FieldDeclaration {
     pub primary: bool,
     pub unique: bool,
     pub indexed: bool,
+    pub migration_from: Option<Spanned<String>>,
+    pub migration_default: Option<Expr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

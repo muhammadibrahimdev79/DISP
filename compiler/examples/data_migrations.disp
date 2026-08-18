@@ -1,0 +1,20 @@
+data Profile {
+    id: int primary
+    display_name: String from(name)
+    active: bool default(true)
+}
+
+fn demonstrate() -> Result<bool, DataError> {
+    var profiles = data memory?
+    data add Profile { id: 1, display_name: "Ada", active: true } in profiles?
+    wanted = "Ada"
+    rows = data find Profile in profiles where display_name == wanted && active?
+    return Ok(rows.len() == 1)
+}
+
+fn main() {
+    print(match demonstrate() {
+        Ok(value) => value,
+        Err(_) => false,
+    })
+}

@@ -265,6 +265,8 @@ impl Parser {
             let mut primary = false;
             let mut unique = false;
             let mut indexed = false;
+            let mut migration_from = None;
+            let mut migration_default = None;
             if data {
                 loop {
                     match &self.peek().kind {
@@ -301,6 +303,40 @@ impl Parser {
                             indexed = true;
                             self.advance();
                         }
+                        TokenKind::Identifier(modifier) if modifier == "from" => {
+                            if migration_from.is_some() {
+                                return Err(Diagnostic::new(
+                                    DiagnosticKind::Parse,
+                                    "duplicate `from` data-field migration",
+                                    self.peek().span,
+                                ));
+                            }
+                            self.advance();
+                            self.expect(TokenKind::LeftParen, "expected `(` after `from`")?;
+                            let (name, span) =
+                                self.expect_identifier("expected prior field name")?;
+                            self.expect(
+                                TokenKind::RightParen,
+                                "expected `)` after prior field name",
+                            )?;
+                            migration_from = Some(Spanned { node: name, span });
+                        }
+                        TokenKind::Identifier(modifier) if modifier == "default" => {
+                            if migration_default.is_some() {
+                                return Err(Diagnostic::new(
+                                    DiagnosticKind::Parse,
+                                    "duplicate `default` data-field migration",
+                                    self.peek().span,
+                                ));
+                            }
+                            self.advance();
+                            self.expect(TokenKind::LeftParen, "expected `(` after `default`")?;
+                            migration_default = Some(self.parse_expression()?);
+                            self.expect(
+                                TokenKind::RightParen,
+                                "expected `)` after migration default",
+                            )?;
+                        }
                         _ => break,
                     }
                 }
@@ -312,6 +348,8 @@ impl Parser {
                 primary,
                 unique,
                 indexed,
+                migration_from,
+                migration_default,
             });
             self.match_token(&TokenKind::Comma);
         }

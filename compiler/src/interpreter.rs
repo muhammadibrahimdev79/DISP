@@ -4504,8 +4504,28 @@ fn native_data_rebuild_indexes(program: &Program, table: &mut NativeDataTable) -
     Ok(())
 }
 
+fn native_data_migration_default(expression: &Expr) -> io::Result<RuntimeJson> {
+    let text = match &expression.node {
+        Expression::Integer(value) => value.to_string(),
+        Expression::Float(value) => format!("{value:?}"),
+        Expression::String(value) => json_escape_string(value)?,
+        Expression::Character(value) => json_escape_string(&value.to_string())?,
+        Expression::Bool(value) => value.to_string(),
+        Expression::Unary {
+            operator: UnaryOperator::Negate,
+            operand,
+        } => match &operand.node {
+            Expression::Integer(value) => format!("-{value}"),
+            Expression::Float(value) => format!("{:?}", -value),
+            _ => unreachable!("type checking restricts migration defaults"),
+        },
+        _ => unreachable!("type checking restricts migration defaults"),
+    };
+    runtime_json(text)
+}
+
 fn native_data_schema_evolution(
-    schema: &str,
+    schema: &crate::ast::StructDeclaration,
     stored_fields: &[NativeDataField],
     stored_constraints: &[NativeDataConstraint],
     fields: &[NativeDataField],
@@ -4513,53 +4533,63 @@ fn native_data_schema_evolution(
 ) -> io::Result<bool> {
     if stored_fields.len() > fields.len() {
         return Err(io::Error::other(format!(
-            "stored `{schema}` has fields removed by the current schema"
+            "stored `{}` has fields removed by the current schema",
+            schema.name
         )));
     }
     let mut changed = stored_fields.len() != fields.len();
     for (index, stored) in stored_fields.iter().enumerate() {
         let current = &fields[index];
         if stored.name != current.name {
-            return Err(io::Error::other(format!(
-                "stored `{schema}` field order or name changed at `{}`",
-                stored.name
-            )));
+            let renamed_from = schema.fields[index]
+                .migration_from
+                .as_ref()
+                .map(|previous| previous.node.as_str());
+            if renamed_from != Some(stored.name.as_str()) {
+                return Err(io::Error::other(format!(
+                    "stored `{}` field `{}` requires an explicit `from({})` rename",
+                    schema.name, stored.name, stored.name
+                )));
+            }
+            changed = true;
         }
         if stored.storage != current.storage
             || stored.optional != current.optional
             || stored.primary != current.primary
         {
             return Err(io::Error::other(format!(
-                "stored `{schema}.{}` changed type, optionality, or primary identity",
-                stored.name
+                "stored `{}.{}` changed type, optionality, or primary identity",
+                schema.name, stored.name
             )));
         }
         if (stored.unique && !current.unique) || (stored.indexed && !current.indexed) {
             return Err(io::Error::other(format!(
-                "stored `{schema}.{}` removes an existing constraint or index",
-                stored.name
+                "stored `{}.{}` removes an existing constraint or index",
+                schema.name, stored.name
             )));
         }
         changed |= stored.unique != current.unique || stored.indexed != current.indexed;
     }
-    for field in &fields[stored_fields.len()..] {
-        if !field.optional || field.primary || field.unique {
+    for (index, field) in fields.iter().enumerate().skip(stored_fields.len()) {
+        let declaration = &schema.fields[index];
+        if (!field.optional && declaration.migration_default.is_none()) || field.primary {
             return Err(io::Error::other(format!(
-                "new data field `{schema}.{}` must be optional",
-                field.name
+                "new data field `{}.{}` must be optional or declare `default(...)`",
+                schema.name, field.name
             )));
         }
     }
     if stored_constraints.len() > constraints.len() {
         return Err(io::Error::other(format!(
-            "stored `{schema}` has a named constraint removed by the current schema"
+            "stored `{}` has a named constraint removed by the current schema",
+            schema.name
         )));
     }
     for (stored, current) in stored_constraints.iter().zip(constraints) {
         if stored != current {
             return Err(io::Error::other(format!(
-                "stored `{schema}` constraint `{}` was reordered or changed",
-                stored.name
+                "stored `{}` constraint `{}` was reordered or changed",
+                schema.name, stored.name
             )));
         }
     }
@@ -4568,20 +4598,38 @@ fn native_data_schema_evolution(
 }
 
 fn migrate_native_data_rows(
-    schema: &str,
+    schema: &crate::ast::StructDeclaration,
     stored_fields: &[NativeDataField],
     fields: &[NativeDataField],
     rows: Vec<RuntimeJson>,
 ) -> io::Result<Vec<RuntimeJson>> {
-    if stored_fields.len() == fields.len() {
+    let rewrites_rows = stored_fields.len() != fields.len()
+        || stored_fields
+            .iter()
+            .zip(fields)
+            .any(|(stored, current)| stored.name != current.name);
+    if !rewrites_rows {
         return Ok(rows);
     }
+    let defaults = schema
+        .fields
+        .iter()
+        .map(|field| {
+            field
+                .migration_default
+                .as_ref()
+                .map(native_data_migration_default)
+                .transpose()
+                .map(|value| value.map(|value| value.text))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
     rows.into_iter()
         .map(|row| {
             let entries = json_object_entries(&row)?;
             if entries.len() != stored_fields.len() {
                 return Err(io::Error::other(format!(
-                    "stored `{schema}` row does not match its prior schema"
+                    "stored `{}` row does not match its prior schema",
+                    schema.name
                 )));
             }
             let mut migrated = String::from("{");
@@ -4592,17 +4640,20 @@ fn migrate_native_data_rows(
                 migrated.push_str(&json_escape_string(&field.name)?);
                 migrated.push(':');
                 if index < stored_fields.len() {
+                    let previous_name = &stored_fields[index].name;
                     let value = entries
                         .iter()
-                        .find(|(name, _)| name == &field.name)
+                        .find(|(name, _)| name == previous_name)
                         .map(|(_, value)| value)
                         .ok_or_else(|| {
                             io::Error::other(format!(
-                                "stored `{schema}` row is missing `{}`",
-                                field.name
+                                "stored `{}` row is missing `{}`",
+                                schema.name, previous_name
                             ))
                         })?;
                     migrated.push_str(&value.text);
+                } else if let Some(default) = &defaults[index] {
+                    migrated.push_str(default);
                 } else {
                     migrated.push_str("null");
                 }
@@ -4663,7 +4714,7 @@ fn data_ensure_schema(
                     })
                     .collect::<Vec<_>>();
                 let changed = native_data_schema_evolution(
-                    &schema.name,
+                    schema,
                     &stored_fields,
                     &stored_constraints,
                     &fields,
@@ -4678,7 +4729,7 @@ fn data_ensure_schema(
                             .and_then(runtime_json)
                     })
                     .collect::<io::Result<Vec<_>>>()?;
-                let rows = migrate_native_data_rows(&schema.name, &stored_fields, &fields, rows)?;
+                let rows = migrate_native_data_rows(schema, &stored_fields, &fields, rows)?;
                 let rows = data_decode_rows(program, schema, rows)?;
                 let primary = fields
                     .iter()

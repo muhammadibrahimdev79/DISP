@@ -324,6 +324,49 @@ impl TypeChecker {
                             "use a required field so uniqueness has one unambiguous value domain",
                         ));
                     }
+                    if field.migration_from.is_some() && field.migration_default.is_some() {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            "a data field migration cannot use both `from` and `default`",
+                            field.name_span,
+                        ));
+                    }
+                    if let Some(previous) = &field.migration_from
+                        && previous.node == field.name
+                    {
+                        return Err(Diagnostic::new(
+                            DiagnosticKind::Type,
+                            "a data-field rename must name a different prior field",
+                            previous.span,
+                        ));
+                    }
+                    if let Some(default) = &field.migration_default {
+                        if matches!(ty, Type::Option(_)) {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Type,
+                                "optional data fields already migrate with `None`",
+                                default.span,
+                            ));
+                        }
+                        if !is_data_migration_literal(default) {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Type,
+                                "a data migration default must be a scalar literal",
+                                default.span,
+                            ));
+                        }
+                        let actual = self.check_expression(default)?;
+                        if !types_compatible(&ty, &actual) {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Type,
+                                format!(
+                                    "migration default does not match data field `{}`",
+                                    field.name
+                                ),
+                                default.span,
+                            ));
+                        }
+                    }
                 }
                 if type_contains_task(&ty) {
                     return Err(Diagnostic::new(
@@ -336,6 +379,36 @@ impl TypeChecker {
                 fields.insert(field.name.clone(), ty);
             }
             if declaration.data {
+                let current_names = declaration
+                    .fields
+                    .iter()
+                    .map(|field| field.name.as_str())
+                    .collect::<HashSet<_>>();
+                let mut prior_names = HashSet::new();
+                for field in &declaration.fields {
+                    if let Some(previous) = &field.migration_from {
+                        if current_names.contains(previous.node.as_str()) {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Type,
+                                format!(
+                                    "prior field name `{}` is still used by the current schema",
+                                    previous.node
+                                ),
+                                previous.span,
+                            ));
+                        }
+                        if !prior_names.insert(previous.node.as_str()) {
+                            return Err(Diagnostic::new(
+                                DiagnosticKind::Type,
+                                format!(
+                                    "prior field `{}` is used by more than one rename",
+                                    previous.node
+                                ),
+                                previous.span,
+                            ));
+                        }
+                    }
+                }
                 let mut constraint_names = HashSet::new();
                 for constraint in &declaration.data_constraints {
                     if fields.contains_key(&constraint.name)
@@ -7501,6 +7574,21 @@ fn specialize_matrix(
             CoveragePattern::Constructor(_, _) => None,
         })
         .collect()
+}
+
+fn is_data_migration_literal(expression: &Expr) -> bool {
+    match &expression.node {
+        Expression::Integer(_)
+        | Expression::Float(_)
+        | Expression::String(_)
+        | Expression::Character(_)
+        | Expression::Bool(_) => true,
+        Expression::Unary {
+            operator: UnaryOperator::Negate,
+            operand,
+        } => matches!(operand.node, Expression::Integer(_) | Expression::Float(_)),
+        _ => false,
+    }
 }
 
 fn types_compatible(expected: &Type, actual: &Type) -> bool {

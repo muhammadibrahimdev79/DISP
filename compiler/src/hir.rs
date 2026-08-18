@@ -226,6 +226,8 @@ pub struct Field {
     pub primary: bool,
     pub unique: bool,
     pub indexed: bool,
+    pub migration_from: Option<String>,
+    pub migration_default: Option<Constant>,
     pub span: Span,
 }
 
@@ -507,6 +509,32 @@ pub fn lower(program: &ast::Program) -> Result<Program, Diagnostic> {
     Lowering::new(program).lower()
 }
 
+fn lower_data_migration_constant(expression: &ast::Expr) -> Constant {
+    match &expression.node {
+        ast::Expression::Integer(value) => Constant::Unsigned(*value, None),
+        ast::Expression::Float(value) => Constant::Float(*value, 64),
+        ast::Expression::String(value) => Constant::String(value.clone()),
+        ast::Expression::Character(value) => Constant::Char(*value),
+        ast::Expression::Bool(value) => Constant::Bool(*value),
+        ast::Expression::Unary {
+            operator: ast::UnaryOperator::Negate,
+            operand,
+        } => match &operand.node {
+            ast::Expression::Integer(value) => {
+                let value = if *value == (i128::MAX as u128) + 1 {
+                    i128::MIN
+                } else {
+                    -(*value as i128)
+                };
+                Constant::Signed(value, None)
+            }
+            ast::Expression::Float(value) => Constant::Float(-value, 64),
+            _ => unreachable!("type checking restricts migration defaults to scalar literals"),
+        },
+        _ => unreachable!("type checking restricts migration defaults to scalar literals"),
+    }
+}
+
 struct Lowering<'a> {
     ast: &'a ast::Program,
     struct_names: HashMap<String, StructId>,
@@ -587,6 +615,14 @@ impl<'a> Lowering<'a> {
                         primary: field.primary,
                         unique: field.unique,
                         indexed: field.indexed,
+                        migration_from: field
+                            .migration_from
+                            .as_ref()
+                            .map(|previous| previous.node.clone()),
+                        migration_default: field
+                            .migration_default
+                            .as_ref()
+                            .map(lower_data_migration_constant),
                         span: field.name_span,
                     })
                     .collect(),

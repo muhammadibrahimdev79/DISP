@@ -634,8 +634,12 @@ conjunctive equality queries. Named constraints are type-checked, persisted, and
 by DISP in interpreter and native execution.
 Safe schema growth requires no migration script: append an `Option<T>` field or add an index or
 constraint, and `data open` upgrades existing rows and catalog metadata transactionally. Existing
-rows receive `None` for appended fields. DISP rejects removals, renames, reordering, type changes,
-required additions, and weakened constraints instead of guessing or losing data.
+rows receive `None` for appended fields. Intentional changes remain local to the field declaration:
+`display_name: String from(name)` preserves and renames the old value, while
+`active: bool default(true)` initializes existing rows for a new required field. Defaults are
+compile-time scalar literals and ordinary new values still provide the field. DISP rejects removals,
+reordering, type or primary-identity changes, unmarked renames, required additions without a
+default, and weakened constraints instead of guessing or losing data.
 `DataStore` and `Database` are distinct nominal types, so a data store cannot invoke raw
 SQL methods.
 

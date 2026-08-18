@@ -958,6 +958,141 @@ fn main() {{
 }
 
 #[test]
+fn explicit_data_renames_and_defaults_are_typed_transactional_and_differential() {
+    let path = data_path("explicit-schema-migration");
+    let path = source_path(&path);
+    let seed = format!(
+        r#"
+data Profile {{ id: int primary name: String }}
+fn seed() -> Result<bool, DataError> {{
+    var store = data open Path("{path}")?
+    data add Profile {{ id: 1, name: "Ada" }} in store?
+    data add Profile {{ id: 2, name: "Grace" }} in store?
+    return Ok(true)
+}}
+fn main() {{ print(match seed() {{ Ok(value) => value, Err(_) => false }}) }}
+"#
+    );
+    let evolved = format!(
+        r#"
+data Profile {{
+    id: int primary
+    full_name: String from(name)
+    age: int default(18)
+    active: bool default(true)
+    rating: f64 default(-1.5)
+}}
+fn migrate() -> Result<bool, DataError> {{
+    var store = data open Path("{path}")?
+    rows = data find Profile in store order id ascending?
+    wanted_ada = "Ada"
+    wanted_grace = "Grace"
+    ada = data find Profile in store where full_name == wanted_ada && age == 18 && active && rating == -1.5?
+    grace = data find Profile in store where full_name == wanted_grace?
+    old = rows.len() == 2 && ada.len() == 1 && grace.len() == 1
+    data add Profile {{ id: 3, full_name: "Lin", age: 29, active: false, rating: 4.5 }} in store?
+    return Ok(old)
+}}
+fn reopen() -> Result<bool, DataError> {{
+    var store = data open Path("{path}")?
+    rows = data find Profile in store?
+    wanted = "Lin"
+    lin = data find Profile in store where full_name == wanted && age == 29?
+    return Ok(rows.len() == 3 && lin.len() == 1)
+}}
+fn main() {{
+    migrated = match migrate() {{ Ok(value) => value, Err(_) => false }}
+    reopened = match reopen() {{ Ok(value) => value, Err(_) => false }}
+    print(migrated && reopened)
+}}
+"#
+    );
+    let invalid_rename = format!(
+        "data Profile {{ id: int primary display_name: String }} fn load()->Result<bool,DataError>{{ var store=data open Path(\"{path}\")?; rows=data find Profile in store?; return Ok(rows.len()>0) }} fn main(){{print(match load(){{Ok(_)=>true,Err(_)=>false}})}}"
+    );
+
+    let (hir, mir) = lower_source(&evolved).unwrap();
+    let schema = hir
+        .structs
+        .iter()
+        .find(|schema| schema.name == "Profile")
+        .unwrap();
+    assert_eq!(schema.fields[1].migration_from.as_deref(), Some("name"));
+    assert_eq!(
+        schema.fields[2].migration_default,
+        Some(disp::hir::Constant::Unsigned(18, None))
+    );
+    assert_eq!(
+        mir.structs[0].fields[3].migration_default,
+        Some(disp::hir::Constant::Bool(true))
+    );
+
+    assert_eq!(run_source(&seed).unwrap(), ["true"]);
+    assert_eq!(run_source(&evolved).unwrap(), ["true"]);
+    let migrated = fs::read(&path).unwrap();
+    assert_eq!(run_source(&invalid_rename).unwrap(), ["false"]);
+    assert_eq!(fs::read(&path).unwrap(), migrated);
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(format!("{path}.lock"));
+
+    if let Some(output) = native_output("explicit-schema-migration-seed", &seed) {
+        assert_eq!(output, "true\n");
+        assert_eq!(
+            native_output("explicit-schema-migration-apply", &evolved).unwrap(),
+            "true\n"
+        );
+        let migrated = fs::read(&path).unwrap();
+        assert_eq!(
+            native_output("explicit-schema-migration-reject", &invalid_rename).unwrap(),
+            "false\n"
+        );
+        assert_eq!(fs::read(&path).unwrap(), migrated);
+    }
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(format!("{path}.lock"));
+
+    for (source, message, column) in [
+        (
+            "data A { id: int primary age: int default(\"old\") } fn main() {}",
+            "migration default does not match",
+            43,
+        ),
+        (
+            "data A { id: int primary note: Option<String> default(\"none\") } fn main() {}",
+            "optional data fields already migrate",
+            55,
+        ),
+        (
+            "data A { id: int primary name: String from(name) } fn main() {}",
+            "must name a different prior field",
+            44,
+        ),
+        (
+            "data A { id: int primary old: String current: String from(old) } fn main() {}",
+            "is still used",
+            59,
+        ),
+        (
+            "data A { id: int primary age: int default(1 + 2) } fn main() {}",
+            "scalar literal",
+            43,
+        ),
+        (
+            "data A { id: int primary age: int from(old) default(1) } fn main() {}",
+            "cannot use both",
+            26,
+        ),
+    ] {
+        let error = check_source(source).unwrap_err();
+        assert!(error.message.contains(message), "{error}");
+        assert_eq!(
+            (error.span.start.line, error.span.start.column),
+            (1, column)
+        );
+    }
+}
+
+#[test]
 fn failed_unique_evolution_leaves_rows_and_catalog_unchanged() {
     let path = data_path("schema-evolution-unique-failure");
     let path = source_path(&path);

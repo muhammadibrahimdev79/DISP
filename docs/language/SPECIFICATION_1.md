@@ -111,7 +111,10 @@ struct-decl   = "struct" IDENT generic-list? "{" field* "}" ;
 data-decl     = "data" IDENT generic-list? "{" data-item* "}" ;
 data-item     = data-field | data-constraint ;
 field         = IDENT ":" type ","? ;
-data-field    = IDENT ":" type (("primary" | "unique" | "index")*) ","? ;
+data-field    = IDENT ":" type (data-field-modifier*) ","? ;
+data-field-modifier = "primary" | "unique" | "index"
+                    | "from" "(" IDENT ")"
+                    | "default" "(" scalar-literal ")" ;
 data-constraint = "constraint" IDENT ":" ("unique" | "index")
                   "(" IDENT "," IDENT ("," IDENT)* ")" ","? ;
 enum-decl     = "enum" IDENT generic-list? "{" variant* "}" ;
@@ -515,18 +518,22 @@ one transaction; failure leaves both rows and indexes unchanged.
 
 Opening a stored schema performs a safe additive evolution automatically when the source schema:
 
-- preserves every existing field in its original order with the same name, type, optionality, and
-  primary identity;
-- only appends new optional fields, whose existing-row value becomes `None`;
+- preserves every existing field in its original position with the same type, optionality, and
+  primary identity; a renamed field explicitly declares `from(old_name)`;
+- only appends new optional fields, whose existing-row value becomes `None`, or required fields
+  with a compile-time scalar `default(value)`;
 - only adds field-level `unique`/`index` modifiers or appends named constraints; and
 - satisfies every newly added uniqueness rule across all stored rows.
 
 The evolution replaces rows, schema metadata, and derived indexes in one durable transaction. A
-failed validation or commit leaves the previous catalog and rows byte-for-byte unchanged. Removing,
-renaming, reordering, or changing an existing field; removing an index or constraint; or adding a
-required field without a defined value fails closed with `DataError`. Required-field defaults,
-renames, and destructive transformations require a future explicit migration declaration and are
-not inferred.
+failed validation or commit leaves the previous catalog and rows byte-for-byte unchanged.
+`from(old_name)` retains the value while changing its stored key, and `default(value)` initializes
+only rows that predate the appended required field; new values still provide every required field.
+Defaults are type-checked scalar literals, optional fields already use `None`, and a field cannot
+combine `from` with `default`. Removing, reordering, or changing the type, optionality, or primary
+identity of an existing field; weakening an index or constraint; adding a required field without a
+default; or renaming without the matching `from` declaration fails closed with `DataError`.
+Destructive and value-transforming migrations are not inferred.
 
 The language does not translate these plans into SQL. Interpreter and native execution use the
 same DISP-owned logical plans and durable format. The separate `Database` compatibility type does
